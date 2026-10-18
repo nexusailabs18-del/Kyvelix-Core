@@ -1,0 +1,269 @@
+/* ============================================================
+Stage 3: Register Allocation (Chaitin-Briggs Graph Coloring)
+============================================================ */
+
+static void compute_live_intervals(KyX64Backend *b) {
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        KyVReg *vr = b->vregs[i];
+        if (vr && vr->kind == VREG_VIRTUAL) {
+            vr->interval_start = UINT32_MAX;
+            vr->interval_end = 0;
+        }
+    }
+    
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+        
+        KyVReg *operands[3] = { ins->dst, ins->src1, ins->src2 };
+        for (int k = 0; k < 3; k++) {
+            KyVReg *vr = operands[k];
+            if (vr && vr->kind == VREG_VIRTUAL) {
+                if (vr->interval_start > i) vr->interval_start = i;
+                if (vr->interval_end < i) vr->interval_end = i;
+            }
+        }
+    }
+    
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        KyVReg *vr = b->vregs[i];
+        if (vr && vr->kind == VREG_VIRTUAL) {
+            if (vr->interval_start == UINT32_MAX) {
+                vr->interval_start = 0;
+                vr->interval_end = 0;
+            }
+        }
+    }
+}
+
+static int intervals_interfere(KyVReg *a, KyVReg *b) {
+    if (a->interval_end == 0 || b->interval_end == 0) return 0;  /* dead */
+    return !(a->interval_end < b->interval_start ||
+             b->interval_end < a->interval_start);
+}
+
+static void build_interference_graph(KyX64Backend *b, KyVReg **virt_vregs, uint32_t N, uint8_t *adj) {
+    (void)b;
+    for (uint32_t i = 0; i < N; i++) {
+        for (uint32_t j = i + 1; j < N; j++) {
+            if (intervals_interfere(virt_vregs[i], virt_vregs[j])) {
+                adj[i * N + j] = 1;
+                adj[j * N + i] = 1;
+            }
+        }
+    }
+}
+
+static void compute_forbidden_masks(KyX64Backend *b, KyVReg **virt_vregs, uint32_t N, uint32_t *forbidden) {
+    uint32_t caller_saved_mask = 
+        (1u << X64_RAX) | (1u << X64_RCX) | (1u << X64_RDX) |
+        (1u << X64_RSI) | (1u << X64_RDI) | (1u << X64_R8) |
+        (1u << X64_R9)  | (1u << X64_R10) | (1u << X64_R11);
+        
+    for (uint32_t i = 0; i < N; i++) {
+        KyVReg *vr = virt_vregs[i];
+        uint32_t mask = 0;
+        if (vr->interval_end == 0) {
+            forbidden[i] = 0;
+            continue;
+        }
+        for (uint32_t j = vr->interval_start; j <= vr->interval_end; j++) {
+            KyX64Ins *ins = b->insns[j];
+            if (!ins) continue;
+            
+            if (ins->dst && ins->dst->kind == VREG_PHYSICAL) mask |= (1u << ins->dst->phys);
+            if (ins->src1 && ins->src1->kind == VREG_PHYSICAL) mask |= (1u << ins->src1->phys);
+            if (ins->src2 && ins->src2->kind == VREG_PHYSICAL) mask |= (1u << ins->src2->phys);
+            
+            if (ins->op == X64_CALL || ins->op == X64_SYSCALL) {
+                mask |= caller_saved_mask;
+            }
+        }
+        forbidden[i] = mask;
+    }
+}
+
+static int simplify_and_color(KyX64Backend *b, KyVReg **virt_vregs, uint32_t N, uint8_t *adj, 
+                              KyX64Reg *free_regs, uint32_t num_free, uint32_t *forbidden) {
+    if (N == 0) return 0;
+    
+    uint32_t *degree = calloc(N, sizeof(uint32_t));
+    uint8_t *removed = calloc(N, 1);
+    uint32_t *stack = malloc(N * sizeof(uint32_t));
+    uint32_t *spill_stack = malloc(N * sizeof(uint32_t));
+    if (!degree || !removed || !stack || !spill_stack) {
+        free(degree); free(removed); free(stack); free(spill_stack);
+        return -1;
+    }
+    
+    for (uint32_t i = 0; i < N; i++) {
+        for (uint32_t j = 0; j < N; j++) {
+            if (adj[i * N + j]) degree[i]++;
+        }
+    }
+    
+    uint32_t stack_top = 0;
+    uint32_t spill_top = 0;
+    uint32_t remaining = N;
+    uint32_t K = num_free;
+    
+    while (remaining > 0) {
+        int found = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            if (!removed[i] && degree[i] < K) {
+                removed[i] = 1;
+                stack[stack_top++] = i;
+                remaining--;
+                for (uint32_t j = 0; j < N; j++) {
+                    if (adj[i * N + j] && !removed[j]) {
+                        degree[j]--;
+                    }
+                }
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            uint32_t max_deg = 0;
+            uint32_t best = 0;
+            for (uint32_t i = 0; i < N; i++) {
+                if (!removed[i] && degree[i] > max_deg) {
+                    max_deg = degree[i];
+                    best = i;
+                }
+            }
+            removed[best] = 1;
+            spill_stack[spill_top++] = best;
+            remaining--;
+            for (uint32_t j = 0; j < N; j++) {
+                if (adj[best * N + j] && !removed[j]) {
+                    degree[j]--;
+                }
+            }
+        }
+    }
+    
+    for (int i = stack_top - 1; i >= 0; i--) {
+        uint32_t v = stack[i];
+        KyVReg *vr = virt_vregs[v];
+        uint32_t used_mask = forbidden[v];
+        
+        for (uint32_t j = 0; j < N; j++) {
+            if (adj[v * N + j]) {
+                KyVReg *neighbor = virt_vregs[j];
+                if (neighbor->phys != X64_REG_NONE) {
+                    used_mask |= (1u << neighbor->phys);
+                }
+            }
+        }
+        
+        KyX64Reg chosen = X64_REG_NONE;
+        for (uint32_t k = 0; k < num_free; k++) {
+            if (!(used_mask & (1u << free_regs[k]))) {
+                chosen = free_regs[k];
+                break;
+            }
+        }
+        
+        if (chosen != X64_REG_NONE) {
+            vr->phys = chosen;
+            b->vreg_phys[vr->id] = chosen;
+        } else {
+            vr->spilled = 1;
+        }
+    }
+    
+    for (uint32_t i = 0; i < spill_top; i++) {
+        uint32_t v = spill_stack[i];
+        KyVReg *vr = virt_vregs[v];
+        vr->spilled = 1;
+    }
+    
+    free(degree);
+    free(removed);
+    free(stack);
+    free(spill_stack);
+    return 0;
+}
+
+int kyx64_allocate(KyX64Backend *b) {
+    if (!b) return -1;
+    
+    int32_t min_offset = 0;
+    for (uint32_t i = 0; i < b->graph->node_count; i++) {
+        KyNode *n = b->graph->nodes[i];
+        if (!n) continue;
+        if (n->opcode == IR_LOAD_LOCAL || n->opcode == IR_STORE_LOCAL) {
+            int32_t off = (int32_t)n->constant.i64;
+            if (off < min_offset) min_offset = off;
+        }
+    }
+    uint32_t locals_size = (uint32_t)(-min_offset);
+    
+    KyX64Reg all_regs[] = {
+        X64_RAX, X64_RBX, X64_RCX, X64_RDX,
+        X64_RSI, X64_RDI,
+        X64_R8, X64_R9, 
+        X64_R12, X64_R13, X64_R14, X64_R15
+    };
+    uint32_t num_all = sizeof(all_regs) / sizeof(all_regs[0]);
+    KyX64Reg free_regs[16];
+    uint32_t num_free = 0;
+    for (uint32_t k = 0; k < num_all; k++) {
+        KyX64Reg r = all_regs[k];
+        if (r < 32 && (b->reserved_regs & (1u << r))) continue;
+        free_regs[num_free++] = r;
+    }
+    
+    compute_live_intervals(b);
+    
+    uint32_t N = 0;
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        if (b->vregs[i] && b->vregs[i]->kind == VREG_VIRTUAL) N++;
+    }
+    
+    if (N > 0) {
+        KyVReg **virt_vregs = malloc(N * sizeof(KyVReg *));
+        uint8_t *adj = calloc(N, N);
+        uint32_t *forbidden = calloc(N, sizeof(uint32_t));
+        
+        if (!virt_vregs || !adj || !forbidden) {
+            free(virt_vregs); free(adj); free(forbidden);
+            return -1;
+        }
+        
+        uint32_t idx = 0;
+        for (uint32_t i = 0; i < b->num_vregs; i++) {
+            if (b->vregs[i] && b->vregs[i]->kind == VREG_VIRTUAL) {
+                virt_vregs[idx++] = b->vregs[i];
+            }
+        }
+        
+        build_interference_graph(b, virt_vregs, N, adj);
+        compute_forbidden_masks(b, virt_vregs, N, forbidden);
+        
+        int rc = simplify_and_color(b, virt_vregs, N, adj, free_regs, num_free, forbidden);
+        
+        free(virt_vregs);
+        free(adj);
+        free(forbidden);
+        
+        if (rc != 0) return rc;
+    }
+    
+    uint32_t spill_size = 0;
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        KyVReg *vr = b->vregs[i];
+        if (vr && vr->spilled) {
+            vr->spill_slot = -(int32_t)(locals_size + 8 + (spill_size * 8));
+            spill_size++;
+        }
+    }
+    b->num_spills = spill_size;
+    
+    uint32_t total = locals_size + spill_size * 8;
+    total = (total + 15) & ~15u;
+    b->frame.frame_size = total;
+    
+    return 0;
+}

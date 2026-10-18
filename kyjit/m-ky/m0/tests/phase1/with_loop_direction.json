@@ -1,0 +1,58 @@
+{
+  "level": "P1",
+  "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+  "pair": [
+    0,
+    1
+  ],
+  "claim": {
+    "kind": "Direction",
+    "value": [
+      "Lt"
+    ]
+  },
+  "witness": {
+    "type": "WithLoop",
+    "loop_": {
+      "depth": 1,
+      "ivs": [
+        {
+          "name": "i",
+          "lower": 0,
+          "upper": 1000,
+          "step": 1
+        }
+      ],
+      "body": [
+        {
+          "kind": "write",
+          "base": "A",
+          "index": [
+            1
+          ],
+          "elem_size": 8,
+          "offset": 0
+        },
+        {
+          "kind": "read",
+          "base": "A",
+          "index": [
+            1
+          ],
+          "elem_size": 8,
+          "offset": 4
+        }
+      ]
+    },
+    "inner": {
+      "type": "IntSolution",
+      "i": [
+        4
+      ],
+      "j": [
+        0
+      ]
+    }
+  },
+  "checker": "m0-check-v1"
+}

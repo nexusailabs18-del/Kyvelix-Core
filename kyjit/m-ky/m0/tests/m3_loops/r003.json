@@ -1,0 +1,9 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 0, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [1], "elem_size": 8, "offset": 0 },
+    { "kind": "read",  "base": "A", "index": [1], "elem_size": 8, "offset": 2 }
+  ],
+  "recursion": { "func": "sum", "iv_name": "i", "iv_init": 0, "iv_step": 1, "iv_bound": 64, "bound_op": "lt", "other_params": ["n", "a"] }
+}

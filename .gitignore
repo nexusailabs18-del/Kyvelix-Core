@@ -1,0 +1,23 @@
+# Rust
+target/
+**/target/
+
+# Go
+kywright-fetcher
+*.exe
+
+# Data
+*.jsonl.gz
+*.jsonl
+*.gguf
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+scrape-venv/
+
+# OS
+.DS_Store

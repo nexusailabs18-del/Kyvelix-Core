@@ -1,0 +1,32 @@
+# Dependencies (too large for git)
+deps/
+node_modules/
+react-kyjit-test/
+
+# Build artifacts
+*.o
+*.so
+*.a
+build/
+target/
+
+# Temporary files
+/tmp/
+*.tmp
+
+# V8 source (reference only, not needed for build)
+src/kyjit_v8/
+src/kyjit_gc/v8_heap/
+src/kyjit_wasm/v8_wasm/
+src/kyjit_security/v8_sandbox/
+src/kyjit_dpdk_ring/
+src/kyjit_ring/dpdk_ring/
+src/kyjit_eventloop/libuv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

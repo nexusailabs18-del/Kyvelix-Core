@@ -1,0 +1,284 @@
+.
+├── build_jit.sh
+├── build.sh
+├── DOCS.md
+├── include
+│   ├── kyjit_17_optimizations.h
+│   ├── kyjit_access.h
+│   ├── kyjit_ai_bridge.h
+│   ├── kyjit_api.h
+│   ├── kyjit_array.h
+│   ├── kyjit_atomic_track.h
+│   ├── kyjit_auto_loop.h
+│   ├── kyjit_background_full.h
+│   ├── kyjit_background.h
+│   ├── kyjit_base64.h
+│   ├── kyjit_batch_exec.h
+│   ├── kyjit_batch_optimized.h
+│   ├── kyjit_bigint.h
+│   ├── kyjit_blas_jit.h
+│   ├── kyjit_branchless.h
+│   ├── kyjit_builtins.h
+│   ├── kyjit_bytecode.h
+│   ├── kyjit_cache_block.h
+│   ├── kyjit_cfi.h
+│   ├── kyjit_cha.h
+│   ├── kyjit_closure.h
+│   ├── kyjit_complete.h
+│   ├── kyjit_core_pin.h
+│   ├── kyjit_cpu_detect.h
+│   ├── kyjit_crash.h
+│   ├── kyjit_cuda.h
+│   ├── kyjit_date.h
+│   ├── kyjit_deopt_full.h
+│   ├── kyjit_deopt.h
+│   ├── kyjit_descriptor.h
+│   ├── kyjit_devirt.h
+│   ├── kyjit_diagnostics.h
+│   ├── kyjit_dispatch.h
+│   ├── kyjit_dpdk.h
+│   ├── kyjit_dwarf.h
+│   ├── kyjit_escape.h
+│   ├── kyjit_exception.h
+│   ├── kyjit_execpool.h
+│   ├── kyjit_fast.h
+│   ├── kyjit_fast_sum.h
+│   ├── kyjit_feedback_full.h
+│   ├── kyjit_feedback.h
+│   ├── kyjit_final_best.h
+│   ├── kyjit_flags.h
+│   ├── kyjit_frame_full.h
+│   ├── kyjit_frame.h
+│   ├── kyjit_generator.h
+│   ├── kyjit_gpu_detect.h
+│   ├── kyjit_gpu.h
+│   ├── kyjit_graphcolor_full.h
+│   ├── kyjit.h
+│   ├── kyjit_handles.h
+│   ├── kyjit_hash.h
+│   ├── kyjit_hugepages.h
+│   ├── kyjit_ic.h
+│   ├── kyjit_instsel_full.h
+│   ├── kyjit_instsel.h
+│   ├── kyjit_interpreter.h
+│   ├── kyjit_intmath_fast.h
+│   ├── kyjit_intmath.h
+│   ├── kyjit_iouring.h
+│   ├── kyjit_jit9.h
+│   ├── kyjit_jit_fast.h
+│   ├── kyjit_jit.h
+│   ├── kyjit_json.h
+│   ├── kyjit_llvm_jit.h
+│   ├── kyjit_lockfree.h
+│   ├── kyjit_logging.h
+│   ├── kyjit_loop_detect_full.h
+│   ├── kyjit_loopopt.h
+│   ├── kyjit_matmul_ultimate.h
+│   ├── kyjit_metrics.h
+│   ├── kyjit_mfr.h
+│   ├── kyjit_mfr_mt.h
+│   ├── kyjit_native.h
+│   ├── kyjit_numa.h
+│   ├── kyjit_object2.h
+│   ├── kyjit_object.h
+│   ├── kyjit_osr_full.h
+│   ├── kyjit_osr.h
+│   ├── kyjit_pack.h
+│   ├── kyjit_parser.h
+│   ├── kyjit_perf.h
+│   ├── kyjit_phase10.h
+│   ├── kyjit_platform.h
+│   ├── kyjit_prefetch.h
+│   ├── kyjit_profiler.h
+│   ├── kyjit_promise.h
+│   ├── kyjit_property.h
+│   ├── kyjit_regalloc_full.h
+│   ├── kyjit_regalloc.h
+│   ├── kyjit_regexp.h
+│   ├── kyjit_ring_buffer.h
+│   ├── kyjit_roots.h
+│   ├── kyjit_runtime.h
+│   ├── kyjit_ryujit_match.h
+│   ├── kyjit_ryujit_opt.h
+│   ├── kyjit_safepoint_full.h
+│   ├── kyjit_safepoint.h
+│   ├── kyjit_sandbox.h
+│   ├── kyjit_scheduler_full.h
+│   ├── kyjit_security.h
+│   ├── kyjit_selfmod_ic.h
+│   ├── kyjit_serialize.h
+│   ├── kyjit_shape.h
+│   ├── kyjit_simd_dispatch.h
+│   ├── kyjit_simple_loop.h
+│   ├── kyjit_snapshot.h
+│   ├── kyjit_speculative_full.h
+│   ├── kyjit_speculative.h
+│   ├── kyjit_speed.h
+│   ├── kyjit_speed_v3.h
+│   ├── kyjit_stackguard.h
+│   ├── kyjit_stackwalk_full.h
+│   ├── kyjit_stream.h
+│   ├── kyjit_string_100x.h
+│   ├── kyjit_string_cached.h
+│   ├── kyjit_string_fast.h
+│   ├── kyjit_string.h
+│   ├── kyjit_string_max.h
+│   ├── kyjit_string_table.h
+│   ├── kyjit_string_ultra.h
+│   ├── kyjit_string_warp.h
+│   ├── kyjit_svm_fusion.h
+│   ├── kyjit_swar.h
+│   ├── kyjit_tasks.h
+│   ├── kyjit_thread_pool.h
+│   ├── kyjit_tier.h
+│   ├── kyjit_tlab.h
+│   ├── kyjit_tracing.h
+│   ├── kyjit_trap.h
+│   ├── kyjit_type.h
+│   ├── kyjit_type_spec.h
+│   ├── kyjit_ultimate.h
+│   ├── kyjit_universal.h
+│   ├── kyjit_unroll.h
+│   ├── kyjit_uop_cache.h
+│   ├── kyjit_utils.h
+│   ├── kyjit_value.h
+│   ├── kyjit_version.h
+│   ├── kyjit_warmup.h
+│   ├── kyjit_wasi.h
+│   ├── kyjit_wasm_exec.h
+│   ├── kyjit_wasm.h
+│   ├── kyjit_work_steal.h
+│   ├── kyjit_writebarrier_full.h
+│   ├── kyjit_writebarrier.h
+│   ├── kyjit_wx.h
+│   ├── kyjit_zero_copy.h
+│   ├── kyjit_zone.h
+│   └── libbase64.h
+├── kyjit
+├── KYJIT_TREE.txt
+├── models
+│   └── text
+│       ├── mistral-7b-v0.1.Q4_K_M.gguf -> /home/kumarr/ky-proxy/models/text/mistral-7b-v0.1.Q4_K_M.gguf
+│       ├── phi-2.Q4_K_M.gguf -> /home/kumarr/ky-proxy/models/text/phi-2.Q4_K_M.gguf
+│       └── tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -> /home/kumarr/ky-proxy/models/text/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+├── node_addon
+│   ├── binding.gyp
+│   └── kyjit_addon.c
+├── README.md
+└── src
+    ├── gc
+    │   └── kyjit_gc.h
+    ├── jit
+    │   ├── debug_jit.c
+    │   ├── kyjit_core.c
+    │   ├── llvm_jit_v21.c
+    │   ├── llvm_jit_v21.h
+    │   ├── llvm_opt.cpp
+    │   ├── test_jit.c
+    │   └── tiered
+    ├── kyjit_api.c
+    ├── kyjit_array.c
+    ├── kyjit_atomic_track.c
+    ├── kyjit_auto_loop.c
+    ├── kyjit_base64.c
+    ├── kyjit_batch_exec.c
+    ├── kyjit_batch_optimized.c
+    ├── kyjit_bigint.c
+    ├── kyjit_blas_jit.c
+    ├── kyjit_branchless.c
+    ├── kyjit_builtins.c
+    ├── kyjit_bytecode.c
+    ├── kyjit_cache_block.c
+    ├── kyjit_cha.c
+    ├── kyjit_complete.c
+    ├── kyjit_core_pin.c
+    ├── kyjit_cpu_detect.c
+    ├── kyjit_cublas.c
+    ├── kyjit_date.c
+    ├── kyjit_deopt.c
+    ├── kyjit_devirt.c
+    ├── kyjit_diagnostics.c
+    ├── kyjit_dpdk.c
+    ├── kyjit_escape.c
+    ├── kyjit_event
+    │   ├── strscpy.h
+    │   ├── uv-common.c
+    │   └── uv-common.h
+    ├── kyjit_eventloop
+    │   ├── kyjit_eventloop.c
+    │   └── kyjit_eventloop.h
+    ├── kyjit_fast_sum.c
+    ├── kyjit_flags.c
+    ├── kyjit_gc
+    │   ├── kyjit_gc.c
+    │   ├── kyjit_gc_concurrent.c
+    │   └── kyjit_gc.h
+    ├── kyjit_gpu.c
+    ├── kyjit_gpu_detect.c
+    ├── kyjit_handles.c
+    ├── kyjit_hash.c
+    ├── kyjit_hugepages.c
+    ├── kyjit_ic.c
+    ├── kyjit_interpreter.c
+    ├── kyjit_iouring.c
+    ├── kyjit_jit.c
+    ├── kyjit_jit_fast.c
+    ├── kyjit_json.c
+    ├── kyjit_llvm_jit.c
+    ├── kyjit_lockfree.c
+    ├── kyjit_logging.c
+    ├── kyjit_main.c
+    ├── kyjit_mfr.c
+    ├── kyjit_mfr_mt.c
+    ├── kyjit_numa.c
+    ├── kyjit_object.c
+    ├── kyjit_osr.c
+    ├── kyjit_pack.c
+    ├── kyjit_parser.c
+    ├── kyjit_prefetch.c
+    ├── kyjit_profiler.c
+    ├── kyjit_regexp.c
+    ├── kyjit_ring
+    │   ├── kyjit_ring.c
+    │   └── kyjit_ring.h
+    ├── kyjit_ring_buffer.c
+    ├── kyjit_roots.c
+    ├── kyjit_sandbox.c
+    ├── kyjit_security
+    │   ├── code-memory-access.cc
+    │   ├── code-memory-access.h
+    │   └── code-memory-access-inl.h
+    ├── kyjit_security.c
+    ├── kyjit_selfmod_ic.c
+    ├── kyjit_shape.c
+    ├── kyjit_simple_loop.c
+    ├── kyjit_snapshot.c
+    ├── kyjit_speculative.c
+    ├── kyjit_stackguard.c
+    ├── kyjit_stream.c
+    ├── kyjit_string.c
+    ├── kyjit_string_core.c
+    ├── kyjit_string_table.c
+    ├── kyjit_svm_fusion.c
+    ├── kyjit_swar.c
+    ├── kyjit_tasks.c
+    ├── kyjit_thread_pool.c
+    ├── kyjit_tier.c
+    ├── kyjit_tlab.c
+    ├── kyjit_tracing.c
+    ├── kyjit_trap.c
+    ├── kyjit_type_spec.c
+    ├── kyjit_uop_cache.c
+    ├── kyjit_utils.c
+    ├── kyjit_wasi.c
+    ├── kyjit_wasm
+    │   ├── kyjit_wasm.c
+    │   └── kyjit_wasm.h
+    ├── kyjit_wasm.c
+    ├── kyjit_wasm_exec.c
+    ├── kyjit_wasm_stub.c
+    ├── kyjit_work_steal.c
+    ├── kyjit_zero_copy.c
+    └── kyjit_zone.c
+
+15 directories, 267 files

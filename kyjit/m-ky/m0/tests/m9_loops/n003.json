@@ -1,0 +1,39 @@
+{
+  "depth": 1,
+  "ivs": [
+    {
+      "name": "i",
+      "lower": 8000,
+      "upper": 100000,
+      "step": 1
+    }
+  ],
+  "body": [
+    {
+      "kind": "write",
+      "base": "A",
+      "index": [
+        0
+      ],
+      "elem_size": 8,
+      "offset": 0,
+      "range": {
+        "ModParam": {
+          "iv": 0,
+          "modulus": {
+            "Param": "p"
+          }
+        }
+      }
+    },
+    {
+      "kind": "read",
+      "base": "A",
+      "index": [
+        1
+      ],
+      "elem_size": 8,
+      "offset": -6000
+    }
+  ]
+}

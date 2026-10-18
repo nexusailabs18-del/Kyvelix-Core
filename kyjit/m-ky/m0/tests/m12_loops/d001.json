@@ -1,0 +1,8 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": { "Const": 0 }, "upper": { "Param": "N" }, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [1], "elem_size": 8, "offset": 0 },
+    { "kind": "read",  "base": "A", "index": [1], "elem_size": 8, "offset": 1 }
+  ]
+}

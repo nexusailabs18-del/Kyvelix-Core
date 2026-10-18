@@ -1,0 +1,10 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 64, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [0], "elem_size": 8, "offset": 1,
+      "indirect": { "base": "B", "index": [3], "offset": 1, "domain_lo": 0, "domain_hi": 64 } },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 2,
+      "indirect": { "base": "B", "index": [3], "offset": 1, "domain_lo": 0, "domain_hi": 64 } }
+  ]
+}

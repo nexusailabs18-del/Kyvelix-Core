@@ -1,0 +1,840 @@
+#define _GNU_SOURCE
+
+#include "kyjit_ic.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
+
+#ifndef MAP_ANONYMOUS
+#ifdef MAP_ANON
+#define MAP_ANONYMOUS MAP_ANON
+#else
+#define MAP_ANONYMOUS 0
+#endif
+#endif
+
+#define KY_IC_SELF_MAGIC 0x4B594943u
+
+typedef struct KyICSelfModMeta {
+    uint32_t magic;
+    uint32_t shape_id;
+    int32_t offset;
+    uint32_t active;
+    uint32_t code_offset;
+    uint32_t code_size;
+    uint32_t reserved;
+} KyICSelfModMeta;
+
+static size_t ky_ic_cached_page_size = 0;
+
+static size_t ky_ic_page_size(void)
+{
+    if (ky_ic_cached_page_size == 0) {
+        long v = sysconf(_SC_PAGESIZE);
+        ky_ic_cached_page_size = (v > 0) ? (size_t)v : 4096u;
+    }
+    return ky_ic_cached_page_size;
+}
+
+KyICMega *ky_ic_mega_new(void)
+{
+    void *p = NULL;
+    if (posix_memalign(&p, 64, sizeof(KyICMega)) != 0) {
+        return NULL;
+    }
+    KyICMega *m = (KyICMega *)p;
+    for (uint32_t i = 0; i < KY_IC_MEGA_SLOTS; ++i) {
+        m->keys[i] = KY_IC_EMPTY;
+        m->values[i] = 0;
+    }
+    m->count = 0;
+    m->degraded = 0;
+    for (uint32_t i = 0; i < 6; ++i) m->pad[i] = 0;
+    return m;
+}
+
+void ky_ic_mega_free(KyICMega *m)
+{
+    free(m);
+}
+
+uint32_t ky_ic_mega_count(const KyICMega *m)
+{
+    return m ? (uint32_t)m->count : 0u;
+}
+
+static int ky_ic_mega_insert_internal(KyICMega *m, uint32_t shape_id, int32_t offset, int force)
+{
+    if (m == NULL) {
+        return 0;
+    }
+
+    uint32_t idx = ky_ic_mega_hash(shape_id);
+    uint32_t limit = force ? KY_IC_MEGA_SLOTS : KY_IC_MEGA_MAX_PROBES;
+
+    for (uint32_t probe = 0; probe < limit; ++probe) {
+        uint32_t k = m->keys[idx];
+        if (k == shape_id) {
+            /* Existing shape: update offset */
+            m->values[idx] = offset;
+            return 1;
+        }
+        if (k == KY_IC_EMPTY) {
+            /* Empty slot: insert here */
+            m->keys[idx] = shape_id;
+            m->values[idx] = offset;
+            m->count++;
+            if (probe >= KY_IC_MEGA_MAX_PROBES) {
+                m->degraded = 1;
+            }
+            return 1;
+        }
+        idx = (idx + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+    }
+
+    return 0;
+}
+
+int ky_ic_mega_insert(KyICMega *m, uint32_t shape_id, int32_t offset)
+{
+    return ky_ic_mega_insert_internal(m, shape_id, offset, 1);
+}
+
+int ky_ic_mega_remove(KyICMega *m, uint32_t shape_id)
+{
+    if (m == NULL || m->count == 0u) {
+        return 0;
+    }
+
+    /* Find the slot */
+    int found = -1;
+    for (uint32_t i = 0; i < KY_IC_MEGA_SLOTS; ++i) {
+        if (m->keys[i] != KY_IC_EMPTY && m->keys[i] == shape_id) {
+            found = (int)i;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        return 0;
+    }
+
+    uint32_t del = (uint32_t)found;
+    m->keys[del] = KY_IC_EMPTY;
+    m->values[del] = 0;
+    m->count--;
+
+    /* Rehash the cluster that follows (Robin Hood-style cleanup for
+       linear probing) */
+    uint32_t tmp_keys[KY_IC_MEGA_SLOTS];
+    int32_t  tmp_vals[KY_IC_MEGA_SLOTS];
+    uint32_t n = 0;
+
+    uint32_t j = (del + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+    while (m->keys[j] != KY_IC_EMPTY) {
+        tmp_keys[n] = m->keys[j];
+        tmp_vals[n] = m->values[j];
+        n++;
+
+        m->keys[j] = KY_IC_EMPTY;
+        m->values[j] = 0;
+        m->count--;
+
+        j = (j + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        (void)ky_ic_mega_insert_internal(m, tmp_keys[i], tmp_vals[i], 1);
+    }
+
+    if (m->count == 0u) {
+        m->degraded = 0;
+    }
+
+    return 1;
+}
+
+void ky_ic_update(KyIC *ic, uint32_t shape_id, int32_t offset)
+{
+    if (ic == NULL) {
+        return;
+    }
+
+    if (ic->state == KY_IC_MEGAMORPHIC && ic->mega != NULL) {
+        if (ky_ic_mega_insert((KyICMega *)ic->mega, shape_id, offset)) {
+            return;
+        }
+        /* 16-slot mega full — fall through to global overflow */
+        if (ic->overflow == NULL) {
+            ic->overflow = ky_ic_overflow_global();
+        }
+        if (ic->overflow != NULL) {
+            int32_t slot = ky_ic_overflow_insert((KyICOverflow *)ic->overflow, ic, shape_id, offset);
+            if (slot >= 0 && ic->overflow_count < KY_IC_MAX_OVERFLOW_PER_IC) {
+                if (ic->overflow_slots == NULL) {
+                    ic->overflow_slots = malloc(sizeof(uint32_t) * KY_IC_MAX_OVERFLOW_PER_IC);
+                }
+                if (ic->overflow_slots != NULL) {
+                    ic->overflow_slots[ic->overflow_count++] = (uint32_t)slot;
+                }
+            }
+        }
+        return;
+    }
+
+    for (uint32_t i = 0; i < ic->count; ++i) {
+        if (ic->shape_ids[i] == shape_id) {
+            ic->offsets[i] = offset;
+            return;
+        }
+    }
+
+    if (ic->count < 4u) {
+        ic->shape_ids[ic->count] = shape_id;
+        ic->offsets[ic->count] = offset;
+        ic->count++;
+        ic->state = (ic->count == 1u) ? KY_IC_MONOMORPHIC : KY_IC_POLYMORPHIC;
+        return;
+    }
+
+#if KYJIT_IC_USE_MEGA
+    if (ic->mega == NULL) {
+        ic->mega = ky_ic_mega_new();
+        if (ic->mega == NULL) {
+            return;
+        }
+
+        for (uint32_t i = 0; i < 4u; ++i) {
+            (void)ky_ic_mega_insert((KyICMega *)ic->mega, ic->shape_ids[i], ic->offsets[i]);
+        }
+    }
+
+    if (ky_ic_mega_insert((KyICMega *)ic->mega, shape_id, offset)) {
+        ic->state = KY_IC_MEGAMORPHIC;
+        return;
+    }
+
+    /* 16-slot mega is full — fall through to global overflow */
+    if (ic->overflow == NULL) {
+        ic->overflow = ky_ic_overflow_global();
+    }
+    if (ic->overflow != NULL) {
+        int32_t slot = ky_ic_overflow_insert((KyICOverflow *)ic->overflow, ic, shape_id, offset);
+        if (slot >= 0 && ic->overflow_count < KY_IC_MAX_OVERFLOW_PER_IC) {
+            if (ic->overflow_slots == NULL) {
+                ic->overflow_slots = malloc(sizeof(uint32_t) * KY_IC_MAX_OVERFLOW_PER_IC);
+            }
+            if (ic->overflow_slots != NULL) {
+                ic->overflow_slots[ic->overflow_count++] = (uint32_t)slot;
+            }
+        }
+    }
+    ic->state = KY_IC_MEGAMORPHIC;
+#endif
+}
+
+static size_t ky_ic_selfmod_code_size(void)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    return 24u;
+#elif defined(__aarch64__)
+    return 36u;
+#else
+    return 0u;
+#endif
+}
+
+static void ky_ic_flush_icache(void *addr, size_t len)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin___clear_cache((char *)addr, (char *)addr + len);
+#else
+    (void)addr;
+    (void)len;
+#endif
+}
+
+#if defined(__aarch64__)
+static void ky_ic_emit32(uint8_t *p, uint32_t v)
+{
+    memcpy(p, &v, sizeof(v));
+}
+#endif
+
+static void ky_ic_emit_selfmod_specialized(uint8_t *code, uint32_t shape_id, int32_t offset)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    uint32_t uoff;
+    uint32_t miss = 0xFFFFFFFFu;
+    uint32_t rel = 6u;
+
+    memcpy(&uoff, &offset, sizeof(uoff));
+
+    code[0] = 0x81u; /* cmp edi, imm32 */
+    code[1] = 0xFFu;
+    memcpy(code + 2, &shape_id, 4);
+
+    code[6] = 0x0Fu; /* jne rel32 */
+    code[7] = 0x85u;
+    memcpy(code + 8, &rel, 4);
+
+    code[12] = 0xB8u; /* mov eax, imm32 */
+    memcpy(code + 13, &uoff, 4);
+
+    code[17] = 0xC3u; /* ret */
+
+    code[18] = 0xB8u; /* deopt: mov eax, -1 */
+    memcpy(code + 19, &miss, 4);
+
+    code[23] = 0xC3u; /* ret */
+#elif defined(__aarch64__)
+    uint32_t slow = shape_id & 0xFFFFu;
+    uint32_t shigh = shape_id >> 16;
+
+    uint32_t uoff = (uint32_t)offset;
+    uint32_t olow = uoff & 0xFFFFu;
+    uint32_t ohigh = uoff >> 16;
+
+    /* movz w1, slow */
+    ky_ic_emit32(code + 0, 0x52800001u | (slow << 5));
+
+    /* movk w1, shigh, lsl #16 */
+    ky_ic_emit32(code + 4, 0x72A00001u | (shigh << 5));
+
+    /* cmp w0, w1 */
+    ky_ic_emit32(code + 8, 0x6B01001Fu);
+
+    /* b.ne +4 instructions */
+    ky_ic_emit32(code + 12, 0x54000081u);
+
+    /* movz w0, olow */
+    ky_ic_emit32(code + 16, 0x52800000u | (olow << 5));
+
+    /* movk w0, ohigh, lsl #16 */
+    ky_ic_emit32(code + 20, 0x72A00000u | (ohigh << 5));
+
+    /* ret */
+    ky_ic_emit32(code + 24, 0xD65F03C0u);
+
+    /* deopt: movn w0, #0 */
+    ky_ic_emit32(code + 28, 0x12800000u);
+
+    /* ret */
+    ky_ic_emit32(code + 32, 0xD65F03C0u);
+#else
+    (void)code;
+    (void)shape_id;
+    (void)offset;
+#endif
+}
+
+static void ky_ic_emit_selfmod_deopt(uint8_t *code)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    uint32_t miss = 0xFFFFFFFFu;
+    code[0] = 0xB8u;
+    memcpy(code + 1, &miss, 4);
+    code[5] = 0xC3u;
+#elif defined(__aarch64__)
+    ky_ic_emit32(code + 0, 0x12800000u); /* movn w0, #0 */
+    ky_ic_emit32(code + 4, 0xD65F03C0u); /* ret */
+#else
+    (void)code;
+#endif
+}
+
+KyICSelfModFn ky_ic_selfmod_create(uint32_t shape_id, int32_t offset)
+{
+    size_t code_size = ky_ic_selfmod_code_size();
+    if (code_size == 0u) {
+        return NULL;
+    }
+
+    size_t page = ky_ic_page_size();
+    if (page < 128u) {
+        page = 4096u;
+    }
+
+    void *mem = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        return NULL;
+    }
+
+    memset(mem, 0, 64);
+
+    KyICSelfModMeta *meta = (KyICSelfModMeta *)mem;
+    meta->magic = KY_IC_SELF_MAGIC;
+    meta->shape_id = shape_id;
+    meta->offset = offset;
+    meta->active = 1u;
+    meta->code_offset = 64u;
+    meta->code_size = (uint32_t)code_size;
+    meta->reserved = 0u;
+
+    uint8_t *code = (uint8_t *)mem + meta->code_offset;
+    ky_ic_emit_selfmod_specialized(code, shape_id, offset);
+    ky_ic_flush_icache(code, code_size);
+
+    if (mprotect(mem, page, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, page);
+        return NULL;
+    }
+
+    return ky_ic_selfmod_fn((void *)code);
+}
+
+void ky_ic_selfmod_invalidate(void *patch)
+{
+    if (patch == NULL) {
+        return;
+    }
+
+    size_t code_size = ky_ic_selfmod_code_size();
+    if (code_size == 0u) {
+        return;
+    }
+
+    size_t page = ky_ic_page_size();
+    uintptr_t p = (uintptr_t)patch;
+    uintptr_t page_addr = p - (p % (uintptr_t)page);
+    void *mem = (void *)page_addr;
+
+    if (mprotect(mem, page, PROT_READ | PROT_WRITE) != 0) {
+        return;
+    }
+
+    KyICSelfModMeta *meta = (KyICSelfModMeta *)mem;
+    uint8_t *code;
+    size_t len = code_size;
+
+    if (meta->magic == KY_IC_SELF_MAGIC &&
+        meta->code_offset >= 64u &&
+        meta->code_offset < page) {
+        code = (uint8_t *)mem + meta->code_offset;
+        if (meta->code_size != 0u) {
+            len = meta->code_size;
+        }
+        meta->active = 0u;
+    } else {
+        code = (uint8_t *)patch;
+    }
+
+    ky_ic_emit_selfmod_deopt(code);
+    ky_ic_flush_icache(code, len);
+
+    (void)mprotect(mem, page, PROT_READ | PROT_EXEC);
+}
+
+int ky_ic_selfmod_revalidate(KyICSelfModFn fn, uint32_t shape_id, int32_t offset)
+{
+    if (fn == NULL) {
+        return 0;
+    }
+
+    size_t code_size = ky_ic_selfmod_code_size();
+    if (code_size == 0u) {
+        return 0;
+    }
+
+    size_t page = ky_ic_page_size();
+    void *codeptr = ky_ic_selfmod_void(fn);
+    uintptr_t p = (uintptr_t)codeptr;
+    uintptr_t page_addr = p - (p % (uintptr_t)page);
+    void *mem = (void *)page_addr;
+
+    if (mprotect(mem, page, PROT_READ | PROT_WRITE) != 0) {
+        return 0;
+    }
+
+    KyICSelfModMeta *meta = (KyICSelfModMeta *)mem;
+    uint8_t *code;
+    size_t len = code_size;
+
+    if (meta->magic == KY_IC_SELF_MAGIC &&
+        meta->code_offset >= 64u &&
+        meta->code_offset < page) {
+        code = (uint8_t *)mem + meta->code_offset;
+        if (meta->code_size != 0u) {
+            len = meta->code_size;
+        }
+        meta->active = 1u;
+        meta->shape_id = shape_id;
+        meta->offset = offset;
+    } else {
+        code = (uint8_t *)codeptr;
+    }
+
+    ky_ic_emit_selfmod_specialized(code, shape_id, offset);
+    ky_ic_flush_icache(code, len);
+
+    if (mprotect(mem, page, PROT_READ | PROT_EXEC) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+int ky_ic_selfmod_is_active(KyICSelfModFn fn)
+{
+    if (fn == NULL) {
+        return 0;
+    }
+
+    size_t page = ky_ic_page_size();
+    void *codeptr = ky_ic_selfmod_void(fn);
+    uintptr_t p = (uintptr_t)codeptr;
+    uintptr_t page_addr = p - (p % (uintptr_t)page);
+    KyICSelfModMeta *meta = (KyICSelfModMeta *)page_addr;
+
+    if (meta->magic == KY_IC_SELF_MAGIC) {
+        return meta->active ? 1 : 0;
+    }
+
+    return 1;
+}
+
+void ky_ic_selfmod_free(KyICSelfModFn fn)
+{
+    if (fn == NULL) {
+        return;
+    }
+
+    size_t page = ky_ic_page_size();
+    void *codeptr = ky_ic_selfmod_void(fn);
+    uintptr_t p = (uintptr_t)codeptr;
+    uintptr_t page_addr = p - (p % (uintptr_t)page);
+
+    munmap((void *)page_addr, page);
+}
+
+static void ky_ic_selfmod_invalidate_if(void *codeptr, uint32_t shape_id)
+{
+    if (codeptr == NULL) {
+        return;
+    }
+
+    size_t page = ky_ic_page_size();
+    uintptr_t p = (uintptr_t)codeptr;
+    uintptr_t page_addr = p - (p % (uintptr_t)page);
+    KyICSelfModMeta *meta = (KyICSelfModMeta *)page_addr;
+
+    if (meta->magic == KY_IC_SELF_MAGIC &&
+        meta->shape_id == shape_id &&
+        meta->active) {
+        ky_ic_selfmod_invalidate(codeptr);
+    }
+}
+
+void ky_ic_attach_selfmod(KyIC *ic, KyICSelfModFn fn)
+{
+    if (ic == NULL) {
+        return;
+    }
+
+    ic->selfmod = fn ? ky_ic_selfmod_void(fn) : NULL;
+    if (fn) {
+        ic->state = KY_IC_SELFMOD;
+    }
+}
+
+void ky_ic_invalidate(KyIC *ic, uint32_t shape_id)
+{
+    if (ic == NULL) {
+        return;
+    }
+
+    uint8_t n = ic->count;
+    for (uint8_t i = 0; i < n; ++i) {
+        if (ic->shape_ids[i] == shape_id) {
+            ic->count--;
+
+            if (i != ic->count) {
+                ic->shape_ids[i] = ic->shape_ids[ic->count];
+                ic->offsets[i] = ic->offsets[ic->count];
+            }
+
+            ic->shape_ids[ic->count] = 0xFFFFFFFFu;
+            ic->offsets[ic->count] = KY_IC_MISS;
+            break;
+        }
+    }
+
+    if (ic->mega != NULL) {
+        (void)ky_ic_mega_remove((KyICMega *)ic->mega, shape_id);
+    }
+
+    if (ic->overflow != NULL) {
+        int removed = ky_ic_overflow_remove((KyICOverflow *)ic->overflow, ic, shape_id);
+        if (removed && ic->overflow_slots != NULL) {
+            /* Remove the freed slot from the tracking list */
+            KyICOverflow *o = (KyICOverflow *)ic->overflow;
+            for (uint8_t k = 0; k < ic->overflow_count; k++) {
+                uint32_t slot = ic->overflow_slots[k];
+                if (o->keys[slot] == KY_IC_EMPTY) {
+                    /* This slot is now free — remove from list */
+                    ic->overflow_slots[k] = ic->overflow_slots[ic->overflow_count - 1];
+                    ic->overflow_count--;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (ic->selfmod != NULL) {
+        ky_ic_selfmod_invalidate_if(ic->selfmod, shape_id);
+    }
+
+    if (ic->mega != NULL && ky_ic_mega_count((KyICMega *)ic->mega) == 0u) {
+        ky_ic_mega_free((KyICMega *)ic->mega);
+        ic->mega = NULL;
+    }
+
+    if (ic->mega != NULL) {
+        ic->state = KY_IC_MEGAMORPHIC;
+        return;
+    }
+
+    if (ic->selfmod != NULL &&
+        ky_ic_selfmod_is_active(ky_ic_selfmod_fn(ic->selfmod))) {
+        ic->state = KY_IC_SELFMOD;
+        return;
+    }
+
+    if (ic->count <= 1u) {
+        ic->state = KY_IC_MONOMORPHIC;
+    } else {
+        ic->state = KY_IC_POLYMORPHIC;
+    }
+}
+
+void ky_ic_destroy(KyIC *ic)
+{
+    if (ic == NULL) return;
+
+    if (ic->mega != NULL) {
+        ky_ic_mega_free((KyICMega *)ic->mega);
+        ic->mega = NULL;
+    }
+
+    if (ic->selfmod != NULL) {
+        ky_ic_selfmod_free(ky_ic_selfmod_fn(ic->selfmod));
+        ic->selfmod = NULL;
+    }
+
+    if (ic->overflow != NULL && ic->overflow_slots != NULL) {
+        KyICOverflow *o = (KyICOverflow *)ic->overflow;
+        for (uint8_t i = 0; i < ic->overflow_count; i++) {
+            uint32_t slot = ic->overflow_slots[i];
+            o->keys[slot] = KY_IC_EMPTY;
+            o->ic_ids[slot] = 0;
+            o->values[slot] = 0;
+        }
+        free(ic->overflow_slots);
+        ic->overflow_slots = NULL;
+        ic->overflow_count = 0;
+    }
+
+    ic->count = 0;
+    ic->state = KY_IC_MONOMORPHIC;
+}
+
+#ifdef KYJIT_IC_SELFTEST
+
+#include <assert.h>
+
+int ky_ic_selftest(void)
+{
+    KyIC ic;
+    ky_ic_init(&ic);
+
+    ky_ic_update(&ic, 1, 10);
+    assert(ky_ic_lookup_inline(&ic, 1) == 10);
+    assert(ky_ic_lookup_inline(&ic, 2) == KY_IC_MISS);
+
+    ky_ic_update(&ic, 2, 20);
+    ky_ic_update(&ic, 3, 30);
+    ky_ic_update(&ic, 4, 40);
+    assert(ic.state == KY_IC_POLYMORPHIC);
+
+    ky_ic_update(&ic, 5, 50);
+#if KYJIT_IC_USE_MEGA
+    if (ic.mega != NULL) {
+        assert(ic.state == KY_IC_MEGAMORPHIC);
+        assert(ky_ic_lookup_inline(&ic, 1) == 10);
+        assert(ky_ic_lookup_inline(&ic, 2) == 20);
+        assert(ky_ic_lookup_inline(&ic, 3) == 30);
+        assert(ky_ic_lookup_inline(&ic, 4) == 40);
+        assert(ky_ic_lookup_inline(&ic, 5) == 50);
+    }
+#endif
+
+    ky_ic_invalidate(&ic, 2);
+    assert(ky_ic_lookup_inline(&ic, 2) == KY_IC_MISS);
+
+    KyICFeedback fb;
+    ky_ic_feedback_init(&fb);
+    ky_ic_feedback_record(&fb, 42);
+    ky_ic_feedback_record(&fb, 42);
+    ky_ic_feedback_record(&fb, 43);
+    assert(fb.count == 2);
+    assert(fb.hit_counts[0] == 2);
+    assert(ky_ic_feedback_recommend_state(&fb) == KY_IC_POLYMORPHIC ||
+           ky_ic_feedback_recommend_state(&fb) == KY_IC_SELFMOD ||
+           ky_ic_feedback_recommend_state(&fb) == KY_IC_MONOMORPHIC);
+
+    KyICSelfModFn fn = ky_ic_selfmod_create(7, 99);
+    if (fn != NULL) {
+        assert(fn(7) == 99);
+        assert(fn(8) == KY_IC_MISS);
+
+        ky_ic_selfmod_invalidate_fn(fn);
+        assert(fn(7) == KY_IC_MISS);
+
+        ky_ic_selfmod_free(fn);
+    }
+
+    ky_ic_destroy(&ic);
+    return 0;
+}
+
+#ifdef KYJIT_IC_SELFTEST_MAIN
+
+int main(void)
+{
+    return ky_ic_selftest();
+}
+
+#endif /* KYJIT_IC_SELFTEST_MAIN */
+
+#endif /* KYJIT_IC_SELFTEST */
+/* ============================================================
+ * Global overflow cache implementation
+ * ============================================================ */
+
+#include <stdatomic.h>
+
+static KyICOverflow *g_overflow = NULL;
+static atomic_flag g_overflow_init_flag = ATOMIC_FLAG_INIT;
+
+KyICOverflow *ky_ic_overflow_global(void)
+{
+    /* Simple spinlock init to avoid double-allocation races */
+    if (atomic_flag_test_and_set(&g_overflow_init_flag)) {
+        /* Someone else is initializing; spin until done */
+        while (g_overflow == NULL) {
+            __asm__ __volatile__("pause" ::: "memory");
+        }
+        return g_overflow;
+    }
+
+    if (g_overflow == NULL) {
+        void *p = NULL;
+        if (posix_memalign(&p, 64, sizeof(KyICOverflow)) != 0) {
+            atomic_flag_clear(&g_overflow_init_flag);
+            return NULL;
+        }
+        KyICOverflow *o = (KyICOverflow *)p;
+        for (uint32_t i = 0; i < KY_IC_OVERFLOW_SLOTS; ++i) {
+            o->keys[i] = 0xFFFFFFFFu;
+            o->ic_ids[i] = 0;
+            o->values[i] = 0;
+        }
+        o->pad[0] = o->pad[1] = o->pad[2] = o->pad[3] = 0;
+        o->pad[4] = o->pad[5] = o->pad[6] = o->pad[7] = 0;
+        for (uint32_t i = 0; i < 7; ++i) o->pad[i] = 0;
+        g_overflow = o;
+    }
+
+    atomic_flag_clear(&g_overflow_init_flag);
+    return g_overflow;
+}
+
+static uint32_t ky_ic_overflow_hash(uint32_t shape_id, const void *ic)
+{
+    uint64_t h = (uint64_t)shape_id;
+    h ^= (uint64_t)(uintptr_t)ic >> 4;   /* drop alignment bits */
+    h *= 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 32;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (uint32_t)h & (KY_IC_OVERFLOW_SLOTS - 1u);
+}
+
+int32_t ky_ic_overflow_lookup(KyICOverflow *o, const void *ic, uint32_t shape_id)
+{
+    if (o == NULL || ic == NULL) return KY_IC_MISS;
+
+    uint64_t ic_id = (uint64_t)(uintptr_t)ic;
+    uint32_t i = ky_ic_overflow_hash(shape_id, ic);
+
+    for (uint32_t probe = 0; probe < KY_IC_OVERFLOW_PROBES; ++probe) {
+        uint32_t k = o->keys[i];
+        if (k == 0xFFFFFFFFu) return KY_IC_MISS;
+        if (k == shape_id && o->ic_ids[i] == ic_id) {
+            return o->values[i];
+        }
+        i = (i + 1u) & (KY_IC_OVERFLOW_SLOTS - 1u);
+    }
+
+    return KY_IC_MISS;
+}
+
+int32_t ky_ic_overflow_insert(KyICOverflow *o, const void *ic, uint32_t shape_id, int32_t offset)
+{
+    if (o == NULL || ic == NULL) return -1;
+    uint64_t ic_id = (uint64_t)(uintptr_t)ic;
+    uint32_t i = ky_ic_overflow_hash(shape_id, ic);
+
+    for (uint32_t probe = 0; probe < KY_IC_OVERFLOW_PROBES; ++probe) {
+        uint32_t k = o->keys[i];
+        if (k == shape_id && o->ic_ids[i] == ic_id) {
+            o->values[i] = offset;
+            return (int32_t)i;
+        }
+        if (k == KY_IC_EMPTY) {
+            o->keys[i] = shape_id;
+            o->ic_ids[i] = ic_id;
+            o->values[i] = offset;
+            return (int32_t)i;
+        }
+        i = (i + 1u) & (KY_IC_OVERFLOW_SLOTS - 1u);
+    }
+
+    return -1;  /* probe window full — do not insert out-of-window */
+}
+
+int ky_ic_overflow_remove(KyICOverflow *o, const void *ic, uint32_t shape_id)
+{
+    if (o == NULL || ic == NULL) return 0;
+
+    uint64_t ic_id = (uint64_t)(uintptr_t)ic;
+    uint32_t i = ky_ic_overflow_hash(shape_id, ic);
+
+    for (uint32_t probe = 0; probe < KY_IC_OVERFLOW_PROBES; ++probe) {
+        uint32_t k = o->keys[i];
+        if (k == 0xFFFFFFFFu) return 0;
+        if (k == shape_id && o->ic_ids[i] == ic_id) {
+            o->keys[i] = 0xFFFFFFFFu;
+            o->ic_ids[i] = 0;
+            o->values[i] = 0;
+            return 1;
+        }
+        i = (i + 1u) & (KY_IC_OVERFLOW_SLOTS - 1u);
+    }
+
+    return 0;
+}
+
+uint32_t ky_ic_overflow_count(const KyICOverflow *o)
+{
+    if (o == NULL) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < KY_IC_OVERFLOW_SLOTS; ++i) {
+        if (o->keys[i] != 0xFFFFFFFFu) n++;
+    }
+    return n;
+}

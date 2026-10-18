@@ -1,0 +1,1451 @@
+I've read everything. Here's the complete specification for **Phases 4, 5, and 6** as one batch. Three phases, ~10,250 lines, ~29 weeks ideal. The order matters: Phase 4 (scalar analysis) is the foundation; Phases 5 (subsystems) and 6 (array regions) run **in parallel** after Phase 4, and both feed Phase 7 (points-to).
+
+---
+
+# Phase 4 — Scalar Analysis (Wolfe Ch. 6.4–6.7)
+
+## 4.0 What Phase 4 is
+
+**Input:** Phase 3's FUD chains, reaching-defs, and FRUD chains — the graph-theoretic layer that links every scalar use to its reaching definition.
+
+**Output:** the four scalar algorithms that consume that graph:
+
+1. **`Algorithm Induct`** (Wolfe §6.5) — SCC-based induction variable detection
+2. **IV algebra** (§6.5.2) — closed-form `(a + b·i)` expressions
+3. **Trip count computation** (§6.5.7)
+4. **`Algorithm ConstantProp`** (§6.6) — the `⊤ / ⊥ / Constant` lattice
+5. **`Algorithm ScalarDD`** (§6.7) — the four scalar dependence situations
+
+**Why it's the phase after Phase 3:** Phase 3 built the graph. Phase 4 walks it. Without Phase 4, M3/M5/M8 keep their hand-coded special cases.
+
+**What Phase 4 does NOT do:**
+- No array region analysis (Phase 6)
+- No points-to (Phase 7)
+- No interprocedural (Phase 8)
+- No reductions or alignment (Phase 5)
+
+**What Phase 4 unlocks:**
+- M3/M5/M8 rewritten to use `Induct` instead of ad-hoc recursion handling
+- Constant propagation makes precise bounds possible (feeds back into M0's `bounds_test`)
+- Scalar dependence becomes a first-class certificate claim
+- Phase 5's reduction detection and alignment need IV detection from Phase 4
+
+---
+
+## 4.1 The four algorithms
+
+### 4.1.1 `Algorithm Induct` — SCC-based IV detection
+
+**Wolfe §6.5.3, Figure 6.12.**
+
+**Input:** the FUD chain graph — operations (defs and uses) as vertices, `Chain` and `φ-Chain` as edges.
+
+**Output:** every operation is classified as one of `Constant(c)`, `LinearIV(a, b)`, `WrapAround(level)`, or `Complex`. Nontrivial SCCs in the chain graph are the induction variables.
+
+**The formulas:**
+
+```
+procedure Induct(cfg, chain, phi_chain):
+    N = 0
+    Stack = []
+    for each operation P in topological order:
+        if NPre[P] == 0:
+            InductRecurse(P)
+    return Classification, Value
+
+procedure InductRecurse(P):
+    Lowlink[P] = NPre[P] = N = N + 1
+    Stack.push(P)
+    InStack[P] = true
+
+    Check(LeftOp(P), P)
+    Check(RightOp(P), P)
+    if P is a loop-header-φ:
+        j = link for back edge
+        Check(φ-Chain[P][j], P)
+    else if P is a φ-term:
+        for each link j:
+            Check(φ-Chain[P][j], P)
+    else:
+        Check(Chain[P], P)
+
+    if NPre[P] == Lowlink[P]:
+        if Stack.top() == P:
+            Classification[P] = classify_trivial(P)
+            Stack.pop()
+            InStack[P] = false
+        else:
+            SCC = []
+            repeat:
+                W = Stack.pop()
+                InStack[W] = false
+                SCC.push(W)
+            until W == P
+            classify_scc(SCC)
+
+procedure Check(L, P):
+    if NPre[L] == 0:
+        InductRecurse(L)
+        Lowlink[P] = min(Lowlink[P], Lowlink[L])
+    else if NPre[L] < NPre[P] and InStack[L]:
+        Lowlink[P] = min(Lowlink[P], NPre[L])
+```
+
+**The classification rules (Wolfe §6.5.5):**
+
+| Rule | Condition | Classification |
+|---|---|---|
+| 1 | Literal constant | `Constant(c)` |
+| 2 | Store operation | classification of RHS |
+| 3 | Fetch of loop-invariant address | classification of reaching def |
+| 4 | Other fetches | `Complex` |
+| 5 | Add/Mul of two constants | `Constant` |
+| 6 | Add of two linear IVs | `LinearIV` |
+| 7 | Add `Complex` to anything | `Complex` |
+| 8 | Loop-header-φ | `Complex` |
+| 9 | Other φ-terms | same if operands identical, else `Complex` |
+| 10 | Nontrivial SCC | `LinearIV` if all operations are additions of loop-invariant values |
+
+**The API:**
+
+```rust
+// src/fud/induct.rs
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Class {
+    Constant(i64),
+    LinearIv { a: i64, b: i64 },       // value = a + b·i
+    WrapAround(usize),                  // level k
+    Complex,
+}
+
+pub struct InductResult {
+    pub class: HashMap<OpId, Class>,
+    pub scc: HashMap<OpId, usize>,      // SCC id per operation
+    pub ivs: Vec<InductionVariable>,    // detected IVs
+}
+
+pub struct InductionVariable {
+    pub op: OpId,                       // the loop-header-φ
+    pub a: i64,                         // initial value
+    pub b: i64,                         // step
+    pub var: usize,                     // scalar variable index
+    pub loop_: usize,                   // which loop
+}
+
+pub fn induct(cfg: &CFG, chains: &FudChains) -> InductResult;
+```
+
+**The IV algebra (Wolfe §6.5.2):**
+
+```
+(a + b·i) + c = (a + c) + b·i
+(a + b·i) · c = (a·c) + (b·c)·i
+(a₁ + b₁·i) + (a₂ + b₂·i) = (a₁ + a₂) + (b₁ + b₂)·i
+```
+
+Implemented as `Class::add` and `Class::mul`:
+
+```rust
+impl Class {
+    pub fn add(&self, other: &Class) -> Class {
+        match (self, other) {
+            (Class::Constant(a), Class::Constant(b)) => Class::Constant(a + b),
+            (Class::Constant(a), Class::LinearIv { a: b, b: c }) => 
+                Class::LinearIv { a: a + b, b: *c },
+            (Class::LinearIv { a, b }, Class::Constant(c)) => 
+                Class::LinearIv { a: a + c, b: *b },
+            (Class::LinearIv { a: a1, b: b1 }, Class::LinearIv { a: a2, b: b2 }) => 
+                Class::LinearIv { a: a1 + a2, b: b1 + b2 },
+            _ => Class::Complex,
+        }
+    }
+
+    pub fn mul(&self, other: &Class) -> Class {
+        match (self, other) {
+            (Class::Constant(a), Class::Constant(b)) => Class::Constant(a * b),
+            (Class::LinearIv { a, b }, Class::Constant(c)) => 
+                Class::LinearIv { a: a * c, b: b * c },
+            _ => Class::Complex,
+        }
+    }
+}
+```
+
+**What `Induct` unlocks:** every induction variable in a loop body has a closed form `a + b·i`. This is what M3/M5/M8 need to detect recursions properly instead of pattern-matching on the IR shape.
+
+**Lines:** ~600 (algorithm + classification + algebra) + ~250 tests + ~200 fuzz.
+
+---
+
+### 4.1.2 Trip count computation
+
+**Wolfe §6.5.7.**
+
+**The formula:**
+
+```
+Trip count (tc) = the minimum integer satisfying:
+    n₁ + s₁·tc < n₂ + s₂·tc
+where n₁, s₁ are the initial value and step of the IV,
+      n₂, s₂ are the bound and its step (usually s₂ = 0).
+
+Exit value = init + step × tc
+```
+
+**The cases:**
+
+| Condition | Trip count |
+|---|---|
+| `s₁ > s₂` | `⌈(n₂ - n₁) / (s₁ - s₂)⌉` |
+| `s₁ = s₂` and `n₁ < n₂` | `+∞` (uncountable) |
+| `s₁ = s₂` and `n₁ >= n₂` | `0` |
+| `s₁ < s₂` | `0` (immediately exits) |
+
+**The API:**
+
+```rust
+// src/fud/tripcount.rs
+
+pub struct TripCount {
+    pub count: Option<i64>,      // None = uncountable
+    pub exit_value: Option<i64>, // None if uncountable
+}
+
+pub fn trip_count(
+    init: i64,
+    step: i64,
+    bound: i64,
+    bound_step: i64,
+) -> TripCount;
+```
+
+**What it unlocks:** loop peeling (Ch. 9.1.3), fusion legality, vectorization. Phase 5 uses it; SPP Layer 2 uses it heavily.
+
+**Lines:** ~200 + ~100 tests + ~150 fuzz.
+
+---
+
+### 4.1.3 `Algorithm ConstantProp` — sparse constant propagation
+
+**Wolfe §6.6.3, Figure 6.18.**
+
+**The abstract lattice:**
+
+```
+Constant(c)  — a known value
+⊤ (top)      — not evaluated yet or unreachable
+⊥ (bottom)   — may take two or more values
+```
+
+**The transfer function:**
+
+```
+Rule 1: Any operand ⊥ → result ⊥
+Rule 2: Any operand ⊤ → result ⊤
+Rule 3: All operands constant → result constant
+
+φ-value:
+    All operands ⊤ → ⊤
+    All non-⊤ same constant → constant
+    Otherwise → ⊥
+```
+
+**The algorithm:**
+
+```
+procedure ConstantProp(cfg, chain):
+    for each edge e: Reachable[e] = false
+    for each vertex v:
+        Reachable[v] = false
+        for each expression x in v: Value[x] = ⊤
+        for each φ-term p in v: Value[p] = ⊤
+    for each successor e of Entry: AddCFGEdge(e)
+
+    while CFGWorkList ≠ ∅ or DefUseWorkList ≠ ∅:
+        if CFGWorkList ≠ ∅:
+            remove e from CFGWorkList
+            Reachable[e] = true
+            v = Target(e)
+            for each φ-term p in v: VisitPhi(p)
+            if not Reachable[v]:
+                Reachable[v] = true
+                for each expression x in v: VisitExpression(x)
+            if Count(SUCC(v)) == 1:
+                for each successor e' of v: AddCFGEdge(e')
+
+        if DefUseWorkList ≠ ∅:
+            remove s from DefUseWorkList
+            x = Target(s)
+            if x is a φ-term: VisitPhi(x)
+            else: VisitExpression(x)
+
+procedure VisitPhi(p):
+    OldValue = Value[p]
+    Value[p] = ⊤
+    for each operand n in p:
+        if Reachable[Edge(n)]:
+            Value[p] = phi_val(Value[p], Value[Source(n)])
+    if Value[p] ≠ OldValue:
+        for each def-use link d out of p:
+            if Reachable[Target(d)]:
+                add d to DefUseWorkList
+
+procedure VisitExpression(x):
+    OldValue = Value[x]
+    Value[x] = Evaluate(x)
+    if Value[x] ≠ OldValue:
+        for each def-use link d out of x:
+            if Reachable[Target(d)]:
+                add d to DefUseWorkList
+        if x controls a conditional branch:
+            if Value[x] = ⊥:
+                for each successor s of Node(x): AddCFGEdge(s)
+            else:
+                let s be the edge the value would take
+                AddCFGEdge(s)
+
+procedure AddCFGEdge(e):
+    if not (e in CFGWorkList or Reachable[e]):
+        add e to CFGWorkList
+```
+
+**The API:**
+
+```rust
+// src/fud/constprop.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsVal {
+    Const(i64),
+    Top,
+    Bottom,
+}
+
+pub struct ConstPropResult {
+    pub value: HashMap<OpId, AbsVal>,
+    pub reachable: HashSet<usize>,   // reachable blocks
+}
+
+pub fn constant_prop(
+    cfg: &CFG,
+    chains: &FudChains,
+) -> ConstPropResult;
+```
+
+**Termination:** the abstract value changes at most twice per expression (`⊤ → constant → ⊥`). Bounded by `2 · |expressions|`. The worklist terminates.
+
+**What it unlocks:** trip counts with known bounds, dead code elimination, loop unswitching. Feeds back into M0's bound computation for loops whose ranges depend on computed scalars.
+
+**Lines:** ~450 + ~200 tests + ~200 fuzz.
+
+---
+
+### 4.1.4 `Algorithm ScalarDD` — scalar dependence
+
+**Wolfe §6.7.2, Figure 6.21.**
+
+**The four scalar dependence situations:**
+
+| Situation | Distance/Direction |
+|---|---|
+| Only current iteration | `(0)` |
+| Only one previous iteration | `(1)` |
+| Any previous iteration | `(<)` |
+| Current or any previous | `(≤)` |
+
+**The algorithm:**
+
+```
+procedure ScalarDD(cfg, chain, phi_chain):
+    for each loop-header-φ lh:
+        Reaching[lh] = ∅
+        Self[lh] = false
+    for each use u:
+        FindDependence(Chain[u], u)
+
+procedure FindDependence(d, u):
+    if Marked[d] == u: return
+    Marked[d] = u
+
+    if d is a loop-header-φ:
+        m = the loop
+        FindDependence(φ-Chain[d][1], u)   # follow preheader link
+        if Reaching[d] == ∅:
+            FindReaching(φ-Chain[d][2], d)  # follow back edge
+        if Self[d]:
+            for c in Reaching[d]:
+                add S_c δᶠ S_u with (<) direction for loop m
+        else:
+            for c in Reaching[d]:
+                add S_c δᶠ S_u with (1) distance for loop m
+    else if d is a φ-term:
+        for each link j:
+            FindDependence(φ-Chain[d][j], u)
+    else:
+        add loop-independent S_d δᶠ S_u
+        if d is a nonkilling definition:
+            FindDependence(Chain[d], u)
+
+procedure FindReaching(d, lh):
+    if MarkedReaching[d] == lh: return
+    MarkedReaching[d] = lh
+    if d == lh:
+        Self[lh] = true
+    else if d is a φ-term:
+        for each link j:
+            FindReaching(φ-Chain[d][j], lh)
+    else:
+        add d to Reaching[lh]
+        if d is a nonkilling definition:
+            FindReaching(Chain[d], lh)
+```
+
+**The API:**
+
+```rust
+// src/fud/scalardd.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarDistance {
+    Zero,          // (0)
+    One,           // (1)
+    AnyBefore,     // (<)
+    AnyAtOrBefore, // (≤)
+}
+
+pub struct ScalarDependence {
+    pub def: DefId,
+    pub use_: UseId,
+    pub loop_: usize,
+    pub distance: ScalarDistance,
+}
+
+pub fn scalar_dd(
+    cfg: &CFG,
+    chains: &FudChains,
+    frud: &FrudChains,
+) -> Vec<ScalarDependence>;
+```
+
+**What it unlocks:** the full flow/anti/output/input dependence classification for scalars. Combined with the array analysis, UDDP can now decide whether reordering two statements is legal.
+
+**Lines:** ~400 + ~200 tests + ~200 fuzz.
+
+---
+
+## 4.2 Wiring into M3, M5, M8
+
+### M3 (self-recursion) — rewrite `recursion_to_iv`
+
+Currently M3 hand-codes the recursion-to-IV transform. Replace with `Induct`:
+
+```rust
+// In src/decide/m3.rs
+pub fn transform(loop_: &Loop) -> Option<Loop> {
+    let r = loop_.recursion.as_ref()?;
+
+    // Build the CFG and FUD chains for the recursion body.
+    let cfg = build_cfg_from_recursion(loop_)?;
+    let chains = m0::fud::construct_chains(&cfg, ...)?;
+    let induct = m0::fud::induct(&cfg, &chains);
+
+    // Find the IV: the loop-header-φ classified as LinearIv.
+    let iv = induct.ivs.iter().find(|v| v.var == r.iv_name_idx)?;
+    let Class::LinearIv { a, b } = induct.class[&iv.op] else { return None };
+    // `a` is the initial value, `b` is the step.
+
+    // Build the transformed loop with the range [a, bound) and step b.
+    // ... same normalisation as before, but with `a` and `b` from Induct.
+    ...
+}
+```
+
+**What changes:** M3 no longer pattern-matches on the recursion shape. It asks `Induct` "what is the IV?" and gets a definitive answer. Any recursion `Induct` can classify is now handled, not just the specific shapes M3's hand-coded transform accepts.
+
+### M5 (pointer chase) — use `Induct` for the chase chain
+
+M5's `chase_chain` follows a literal `next` table. With `Induct`, the chain can be symbolic:
+
+```rust
+// If the chase variable is an IV with a closed form, use it.
+if let Some(iv) = induct.ivs.iter().find(|v| v.var == chase.var_idx) {
+    let Class::LinearIv { a, b } = induct.class[&iv.op] else { return Unknown };
+    // The chain is arithmetic: chain[k] = a + b·k
+    // No enumeration needed — the fixed point is computable directly.
+    ...
+} else {
+    // Fall back to the literal-chain enumeration (Phase 2's version).
+    ...
+}
+```
+
+**What changes:** M5 extends to arithmetic chase chains without enumeration. This is the symbolic-pointer-chase subsystem from Phase 5.1, pulled forward because Phase 4's `Induct` provides the IV.
+
+### M8 (recurrence) — use `Induct` + `trip_count`
+
+M8's recurrence detection becomes:
+
+```rust
+// Detect the recurrence as an IV.
+if let Some(iv) = induct.ivs.iter().find(|v| v.var == recurrence_var) {
+    let tc = trip_count(iv.a, iv.b, bound, 0);
+    // ... decide using the closed form and the trip count.
+}
+```
+
+**What changes:** M8 no longer enumerates the recurrence table. It computes the closed form via `Induct` and the trip count via `trip_count`.
+
+---
+
+## 4.3 Certificate vocabulary
+
+Phase 4 adds **one new claim type**:
+
+```rust
+// src/certificate/mod.rs
+pub enum Claim {
+    // ... existing ...
+
+    /// Phase 4: scalar dependence. The claim says a use depends on a
+    /// def at a particular distance and direction.
+    ScalarDependence {
+        def: DefId,
+        use_: UseId,
+        distance: ScalarDistance,
+    },
+
+    /// Phase 4: the trip count of a countable loop.
+    TripCount {
+        count: i64,
+        exit_value: i64,
+    },
+}
+```
+
+**The checker arms:**
+
+For `ScalarDependence`:
+
+```
+procedure CheckScalarDependence(cert, cfg):
+    # Rebuild the FUD chains and the scalar dependence.
+    chains = construct_chains(cert.cfg)
+    frud = construct_frud_chains(cert.cfg)
+    actual = scalar_dd(cert.cfg, chains, frud)
+
+    # Verify the asserted dependence is present.
+    assert (cert.def, cert.use_, cert.distance) ∈ actual
+```
+
+For `TripCount`:
+
+```
+procedure CheckTripCount(cert, cfg):
+    # Rebuild the IV detection.
+    chains = construct_chains(cert.cfg)
+    induct = induct(cert.cfg, chains)
+    iv = induct.ivs.find(|v| v.op == cert.op)
+
+    # Recompute the trip count.
+    tc = trip_count(iv.a, iv.b, cert.bound, 0)
+    assert tc.count == cert.count
+    assert tc.exit_value == cert.exit_value
+```
+
+**The discipline:** the checker rebuilds both the chains and the scalar dependence from the CFG the certificate carries. Nothing the analyzer says about the chains or the scalar dependence is trusted.
+
+---
+
+## 4.4 Fuzz tests
+
+| Module | Fuzz strategy |
+|---|---|
+| `induct.rs` | For random CFGs and FUD chains, compare `Induct`'s classification against a brute-force walk that enumerates the chain manually. `fuzz_induct_matches_bruteforce` |
+| `tripcount.rs` | For random `(init, step, bound, bound_step)`, enumerate the loop and compare against the formula. `fuzz_tripcount_matches_enumeration` |
+| `constprop.rs` | For random CFGs, compare against an interpreter that runs the loop concretely. `fuzz_constprop_matches_interpreter` |
+| `scalardd.rs` | For random CFGs and uses, compare against a brute-force path enumeration. `fuzz_scalardd_matches_bruteforce` |
+
+**Seed-and-revert validation:** every fuzzer must be validated by seeding a bug (e.g., dropping the `Lowlink[P] = min(Lowlink[P], Lowlink[L])` line in `Check`), confirming thousands of violations, reverting, confirming 0.
+
+**Total fuzz cases:** ~4,000 per test × 4 tests = **~16,000 cases**.
+
+---
+
+## 4.5 File-by-file breakdown
+
+| File | Lines | Tests | Total |
+|---|---|---|---|
+| `src/fud/induct.rs` | 600 | 250 | 850 |
+| `src/fud/tripcount.rs` | 200 | 100 | 300 |
+| `src/fud/constprop.rs` | 450 | 200 | 650 |
+| `src/fud/scalardd.rs` | 400 | 200 | 600 |
+| `src/certificate/mod.rs` (2 new claims) | 150 | 100 | 250 |
+| `src/checker/main.rs` (2 new arms) | 250 | 100 | 350 |
+| M3 rewiring | 200 | 100 | 300 |
+| M5 rewiring | 200 | 100 | 300 |
+| M8 rewiring | 200 | 100 | 300 |
+| Fuzz tests | 800 | — | 800 |
+| **Total** | **~3,450** | **~1,250** | **~4,700** |
+
+The plan said 3,750 lines / 11 weeks. My estimate is ~4,700 / 14 weeks. Multiply by 1.5–2×: **7,000–9,400 lines / 21–28 weeks**.
+
+---
+
+# Phase 5 — Subsystems (Wolfe Ch. 7.5, 7.6, 8.3, 8.4)
+
+## 5.0 What Phase 5 is
+
+**Input:** Phases 1–4 complete. The analyzer has certificate vocabulary, exact math, FUD chains, and scalar analysis.
+
+**Output:** the subsystems that extend UDDP beyond pure dependence analysis:
+
+1. **Storage association** (Ch. 7.5) — linearization, equivalence, common blocks
+2. **Run-time dependence testing** (Ch. 7.6) — emits runtime-checked versions
+3. **I/O dependence** (Ch. 8.3) — preserves order of I/O statements
+4. **Pure-function classification** (Ch. 8.4) — for interprocedural summaries
+5. **Symbolic pointer chase** — extends M5 to non-literal tables
+6. **Dynamic bounds** — extends M12 to symbolic bounds
+7. **Cubic+ indices** — extends M6c to degree ≥ 5
+8. **Reduction detection** — the idiom recognizer
+9. **Alignment** — change loop-carried to loop-independent dependences
+10. **Cross-loop distance** — for fusion legality
+11. **Loop-kind classification** — forall / dopar / doall / dosingle
+
+**Why it's after Phase 4:** the subsystems need IV detection, constant propagation, and scalar dependence. Without those, reduction detection and alignment can't be built.
+
+**What Phase 5 does NOT do:**
+- No array region summaries (Phase 6)
+- No points-to (Phase 7)
+- No interprocedural (Phase 8)
+- No frontend (Phase 9)
+
+**What Phase 5 unlocks:** real-code coverage jumps. Symbolic pointer chase, dynamic bounds, and reduction detection are the three biggest blockers for real JavaScript.
+
+---
+
+## 5.1 The eleven subsystems
+
+### 5.1.1 Storage association (Ch. 7.5) — 500 lines
+
+**What it does:** handles memory layout for multi-dimensional arrays, Fortran equivalence, common blocks, allocatables.
+
+**The formulas:**
+
+```
+Linearization (row-major):
+    address = base + (i₁·n₂ + i₂·n₃ + ... + iₙ)·elem_size
+
+Linearization (column-major, Fortran):
+    address = base + (iₙ·nₙ₋₁ + ... + i₂·n₁ + i₁)·elem_size
+```
+
+**The API:**
+
+```rust
+// src/ir/layout.rs
+
+pub enum Layout {
+    RowMajor,
+    ColumnMajor,
+}
+
+pub fn linearize(
+    layout: Layout,
+    indices: &[i64],
+    dims: &[usize],
+    elem_size: i64,
+) -> i64;
+
+pub struct EquivalenceClass {
+    pub members: Vec<String>,
+    pub offsets: Vec<i64>,
+}
+
+pub fn linearize_with_equivalence(
+    access: &Access,
+    classes: &[EquivalenceClass],
+) -> Option<i64>;
+```
+
+**What it unlocks:** the frontend can be simpler — it emits multi-dimensional accesses and `linearize` does the flattening. Phase 7 (points-to) reasons about byte addresses, not array indices.
+
+### 5.1.2 Run-time dependence testing (Ch. 7.6) — 600 lines
+
+**What it does:** when static analysis says "Unknown," emit a **runtime check** that tests independence at execution time.
+
+**The formulas:**
+
+```
+For A[I] = A[I-K] + B[I]:
+    Normalized equation: 1 + i_d = 1 + i_u - K
+    K = 0: loop-independent anti-dependence
+    K > 0: loop-carried flow dependence
+    K < 0: loop-carried anti-dependence
+```
+
+**The architecture:** this is the one subsystem that **doesn't emit a certificate**. It emits a **RuntimeCheckCertificate**:
+
+```rust
+// certificate/mod.rs
+
+pub struct RuntimeCheckCertificate {
+    pub loop_hash: String,
+    pub test_loop: String,       // the generated runtime check
+    pub parallel_version: String, // the code to run if the check passes
+    pub serial_version: String,   // the code to run if the check fails
+}
+
+pub enum RuntimeCheckKind {
+    /// Check that no dependence exists: for all i, j: A[i] != B[j].
+    DisjointArrays,
+    /// Check that a specific distance does not occur: A[i] != A[i+K].
+    NoDistanceK,
+    /// Check a guard: assert that the loop-invariant test holds.
+    GuardCheck(String),
+}
+```
+
+**The checker arm:** verifies that **if** the runtime check passes, **then** independence holds. This is a *soundness* check on the test generator, not a certificate replay.
+
+**Note:** this subsystem is architecturally distinct. It may deserve its own sub-phase or a full phase. For now, it's part of Phase 5.
+
+**Lines:** ~600 (test generator + checker arm + tests).
+
+### 5.1.3 I/O dependence (Ch. 8.3) — 150 lines
+
+**What it does:** any statement that reads/writes an external device is dependent on every preceding statement that may do likewise. Preserves order of `open`, `close`, `rewind`, `read`, `write`.
+
+**The API:**
+
+```rust
+// src/ir/effect.rs
+
+pub enum Effect {
+    Read,
+    Write,
+    Allocate,
+    Throw,
+    Io,        // Phase 5
+    Atomic,
+    Unknown,
+}
+
+impl Access {
+    pub fn io_effect(&self) -> Option<Effect>;
+}
+```
+
+**The rule:** if two statements both have `Effect::Io`, they must be ordered. This is a trivial addition to the dependence check — just treat I/O statements as always-dependent.
+
+### 5.1.4 Pure-function classification (Ch. 8.4) — 200 lines
+
+**What it does:** identifies pure functions so interprocedural analysis (Phase 8) can treat them as summaries.
+
+**The formulas:**
+
+```
+Pure function: uses but doesn't modify arguments,
+               no globals, no I/O,
+               return value determined by arguments.
+
+Pure subroutine: only effect is modify read-write/write-only arguments;
+                 no I/O or globals;
+                 can call only pure procedures.
+```
+
+**The API:**
+
+```rust
+// src/ir/purity.rs
+
+pub enum Purity {
+    Pure,
+    PureSubroutine { modified: Vec<usize> },  // argument indices
+    Impure,
+}
+
+pub fn classify_purity(
+    func: &Function,
+    call_graph: &CallGraph,   // Phase 8 dependency, stubbed for now
+) -> Purity;
+```
+
+**What it unlocks:** Phase 8's interprocedural summaries can skip pure functions, focusing on the ones with side effects.
+
+### 5.1.5 Symbolic pointer chase — 600 lines
+
+**What it does:** extends M5 from literal `next` tables to symbolic chains.
+
+**The algorithm:**
+
+```
+procedure SymbolicPointerChase(access, loop):
+    # Step 1: Identify the recurrence.
+    # If the chase variable is an IV (from Phase 4's Induct), use its
+    # closed form directly.
+    if let Some(iv) = induct.ivs.find(|v| v.var == chase.var):
+        Class::LinearIv { a, b } => {
+            # Chain is arithmetic: p_k = a + b·k.
+            # Fixed point is computable in closed form.
+            return closed_form_fixed_point(a, b, bound)
+        }
+        _ => {}
+    
+    # Step 2: Bounded symbolic execution.
+    visited = Set()
+    for start in 0..N-1:
+        x = start
+        path = []
+        while x not in visited and len(path) < BOUND:
+            visited.add(x)
+            path.push(x)
+            x = eval(relation, x)
+        fixed_point[start] = x
+    
+    # Step 3: Check for collisions.
+    for start1, start2 in pairs:
+        if fixed_point[start1] == fixed_point[start2]:
+            return Exact(start2 - start1)
+    return None
+```
+
+**The API:**
+
+```rust
+// src/decide/m5.rs (extended)
+
+pub fn decide_symbolic_chase(
+    loop_: &Loop,
+    p: usize,
+    q: usize,
+    induct: &InductResult,
+) -> (Decision, Option<Certificate>);
+```
+
+**What it unlocks:** real code that computes `next` dynamically — parsers, state machines, linked-list traversal — is now within scope.
+
+### 5.1.6 Dynamic bounds — 800 lines
+
+**What it does:** extends M12 from statically-known bounds to arbitrary `Loop::ivs[k].lower/upper` expressions.
+
+**The algorithm:**
+
+```
+procedure DynamicBounds(loop, env):
+    # Extract bound expressions.
+    lower_expr = parse_bound(loop.lower)
+    upper_expr = parse_bound(loop.upper)
+    
+    # Substitute runtime parameters.
+    l = eval(lower_expr, env)
+    u = eval(upper_expr, env)
+    
+    # Bounded enumeration for the dependence decision.
+    ...
+```
+
+**The API:**
+
+```rust
+// src/decide/m12.rs (extended)
+
+pub fn decide_dynamic(
+    loop_: &DynamicLoop,
+    env: &[(String, i64)],
+    p: usize,
+    q: usize,
+) -> (Decision, Option<Certificate>);
+```
+
+**What it unlocks:** `for (i = f(); i < g(x); i++)` — where `f` and `g` are function calls — is now decidable.
+
+### 5.1.7 Cubic+ indices — 300 lines
+
+**What it does:** extends M6c from degree ≤ 4 to degree ≥ 5, via polynomial Diophantine solving.
+
+**The formulas:**
+
+```
+For a polynomial P(i) of degree d, enumerate:
+    { P(i) : i ∈ [lo, hi) }
+
+For unbounded ranges, use the range test:
+    if max(P) < min(Q) or max(Q) < min(P): no dependence
+```
+
+**The API:**
+
+```rust
+// src/decide/m6c.rs (extended)
+
+pub fn decide_cubic(
+    loop_: &Loop,
+    p: usize,
+    q: usize,
+) -> (Decision, Option<Certificate>);
+```
+
+**What it unlocks:** more real-code coverage for polynomial index expressions. This is a small win — most real code doesn't use degree-5 polynomials.
+
+### 5.1.8 Reduction detection — 500 lines
+
+**What it does:** recognizes reduction idioms (`sum += a[i]`, `count[b[i]]++`, `min = min(min, x)`).
+
+**The algorithm:**
+
+```
+procedure DetectReduction(cfg, chains, induct):
+    # For each scalar definition, check if it accumulates.
+    for each def d of scalar M:
+        # Is M used on the RHS of its own definition?
+        uses = frud.def_to_use[d]
+        self_use = uses.find(|u| u.var == M)
+        if self_use is None: continue
+
+        # Is the operation associative and commutative?
+        op = d.rhs.op
+        if not is_associative_commutative(op): continue
+
+        # Classify: sum, product, max, min, count.
+        kind = classify_reduction(op)
+        emit ReductionCertificate { var: M, op, kind }
+```
+
+**The API:**
+
+```rust
+// src/ir/reduction.rs
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReductionKind {
+    Sum,
+    Product,
+    Max,
+    Min,
+    MaxWithIndex,
+    Count,
+}
+
+pub struct Reduction {
+    pub var: usize,
+    pub op: String,
+    pub kind: ReductionKind,
+    pub loop_: usize,
+}
+
+pub fn detect_reductions(
+    cfg: &CFG,
+    chains: &FudChains,
+    frud: &FrudChains,
+) -> Vec<Reduction>;
+```
+
+**The certificate:** a new claim `Claim::Reduction(ReductionKind)` that the checker validates by re-deriving the reduction from the CFG.
+
+**What it unlocks:** `sum += a[i]` is now recognized and parallelizable. This is the biggest single coverage gain for real JavaScript — reductions are everywhere.
+
+### 5.1.9 Alignment — 400 lines
+
+**What it does:** changes loop-carried dependences to loop-independent by aligning iterations.
+
+**The formulas:**
+
+```
+Alignment graph: one node per statement, two edges per dependence.
+    Edge 1: dependence edge with distance d.
+    Edge 2: inverse edge with distance -d.
+
+If every cycle in the graph has accumulated distance zero,
+alignment can remove all loop-carried dependences.
+```
+
+**The API:**
+
+```rust
+// src/fud/alignment.rs
+
+pub struct Alignment {
+    pub stmt: usize,       // statement to shift
+    pub shift: i64,        // iterations to shift
+}
+
+pub fn compute_alignment(
+    loop_: &Loop,
+    dependences: &[Dependence],
+) -> Option<Vec<Alignment>>;
+```
+
+**What it unlocks:** fused loops with different alignment become legal. Fusion legality depends on alignment.
+
+### 5.1.10 Cross-loop distance — 150 lines
+
+**What it does:** computes the cross-loop dependence distance for fusion legality.
+
+**The formula:**
+
+```
+Cross-loop distance = difference between iteration vectors of the two loops.
+
+If d1 = i_T - i_S for loop 1 and d2 = j_T - j_S for loop 2,
+the cross-loop distance is d = (j_T - i_S) - (j_S - i_T).
+```
+
+**The API:**
+
+```rust
+// src/fud/crossloop.rs
+
+pub struct CrossLoopDistance {
+    pub first_loop: usize,
+    pub second_loop: usize,
+    pub distance: Vec<i64>,
+}
+
+pub fn compute_cross_loop_distance(
+    loop1: &Loop,
+    loop2: &Loop,
+) -> Option<CrossLoopDistance>;
+```
+
+**What it unlocks:** loop fusion is now decidable. SPP Layer 2 needs this.
+
+### 5.1.11 Loop-kind classification — 200 lines
+
+**What it does:** classifies loops as forall / dopar / doall / dosingle / sequential.
+
+**The formulas:**
+
+```
+Forall: RHS computed before LHS. Negative distances possible.
+Dopar: each iteration copies variables. No flow dependences between iterations.
+Doall: dopar with no dependences.
+Dosingle: single-assignment rule. No output/anti dependences.
+Sequential: standard imperative loop.
+```
+
+**The API:**
+
+```rust
+// src/ir/loopkind.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopKind {
+    Sequential,
+    Forall,
+    Dopar,
+    Doall,
+    Dosingle,
+}
+
+pub fn classify_loop_kind(
+    loop_: &Loop,
+    dependences: &[Dependence],
+) -> LoopKind;
+```
+
+**What it unlocks:** SPP Layer 2's parallelization decisions become precise. Fission legality depends on loop kind.
+
+---
+
+## 5.2 Certificate additions
+
+Phase 5 adds:
+
+```rust
+pub enum Claim {
+    // ... existing ...
+    Reduction(ReductionKind),
+    Aligned(Vec<Alignment>),
+    CrossLoopDistance(Vec<i64>),
+    LoopKind(LoopKind),
+}
+
+pub enum Witness {
+    // ... existing ...
+    RuntimeCheck(RuntimeCheckCertificate),
+}
+```
+
+---
+
+## 5.3 Fuzz tests
+
+| Subsystem | Fuzz strategy |
+|---|---|
+| Storage association | Random linearization, compare against byte-level enumeration |
+| Runtime testing | Random loops, verify "check passes → independence" |
+| I/O | Verify I/O ordering preserved |
+| Purity | Random functions, verify classification matches a hand-written oracle |
+| Symbolic chase | Random chains, compare against enumeration |
+| Dynamic bounds | Random bound expressions, compare against concrete eval |
+| Cubic+ | Random polynomials, compare against enumeration |
+| Reduction | Random accumulation patterns, compare against pattern matcher |
+| Alignment | Random loop graphs, verify cycle-distance-zero condition |
+| Cross-loop | Random fused loops, compare against brute-force |
+| Loop-kind | Random loops, verify classification |
+
+**Total fuzz cases:** ~3,000 per subsystem × 11 subsystems = **~33,000 cases**.
+
+---
+
+## 5.4 File-by-file breakdown
+
+| File | Lines |
+|---|---|
+| `src/ir/layout.rs` | 500 |
+| `src/runtime/check.rs` | 600 |
+| `src/ir/effect.rs` | 150 |
+| `src/ir/purity.rs` | 200 |
+| `src/decide/m5.rs` (symbolic extension) | 600 |
+| `src/decide/m12.rs` (dynamic extension) | 800 |
+| `src/decide/m6c.rs` (cubic extension) | 300 |
+| `src/ir/reduction.rs` | 500 |
+| `src/fud/alignment.rs` | 400 |
+| `src/fud/crossloop.rs` | 150 |
+| `src/ir/loopkind.rs` | 200 |
+| Certificate additions | 250 |
+| Checker arms | 400 |
+| Fuzz tests | 1,000 |
+| **Total** | **~6,050** |
+
+The plan said 4,500 lines / 12 weeks. My estimate is ~6,050 / 16 weeks. Multiply by 1.5–2×: **9,000–12,000 / 24–32 weeks**.
+
+---
+
+# Phase 6 — Array Regions (Wolfe Ch. 8.1)
+
+## 6.0 What Phase 6 is
+
+**Input:** Phases 1–4 complete. The analyzer has FUD chains and scalar analysis.
+
+**Output:** the array-region analysis — the dataflow that summarizes which array elements each statement **may use**, **may modify**, and **kills**.
+
+**Why it's a separate phase:** array regions are the input to Phase 7 (points-to) and Phase 8 (interprocedural). Without them, the call graph can't be built.
+
+**What Phase 6 does NOT do:**
+- No points-to (Phase 7)
+- No interprocedural (Phase 8)
+- No frontend (Phase 9)
+
+**What Phase 6 unlocks:** whole-function array summaries. Every function now has a `MayUse` / `MayMod` / `Kill` triple.
+
+---
+
+## 6.1 The three dataflow analyses
+
+### 6.1.1 `MayUse` and `MayMod`
+
+**Wolfe §8.1.1.**
+
+**The formulas:**
+
+```
+MayUse(x) = MayUse(x) ∪ ⋃_{p ∈ PRED(x)} MayUse(p)
+MayMod(x) = MayMod(x) ∪ ⋃_{p ∈ PRED(x)} MayMod(p)
+Kill(x)   = Kill(x) ∪ ⋂_{p ∈ PRED(x)} Kill(p)
+```
+
+**Semantics:** at block `x`, `MayUse(x)` is the set of array regions that some execution path to `x` reads. `MayMod(x)` is the set that some path writes. `Kill(x)` is the set that **every** path overwrites (so any earlier writes to those regions are dead).
+
+**The API:**
+
+```rust
+// src/region/dataflow.rs
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionSet {
+    pub regions: Vec<Region>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dataflow {
+    pub may_use: HashMap<usize, RegionSet>,  // block → MayUse
+    pub may_mod: HashMap<usize, RegionSet>,
+    pub kill: HashMap<usize, RegionSet>,
+}
+
+pub fn dataflow(cfg: &CFG) -> Dataflow;
+```
+
+**The iteration:** forward dataflow, worklist algorithm, terminates when every block's sets stop changing. Convergence is guaranteed because the sets are finite (bounded by the number of array accesses).
+
+**Lines:** ~400 + ~150 tests.
+
+### 6.1.2 Simple bounds
+
+**Wolfe §8.1.2.**
+
+**The formulas:**
+
+```
+Region = [l₁:u₁, ..., l_d:u_d]
+
+Union:
+    [l_d^a:u_d^a] ∪ [l_d^b:u_d^b] = [min(l_d^a, l_d^b) : max(u_d^a, u_d^b)]
+
+Intersection:
+    [l_d^a:u_d^a] ∩ [l_d^b:u_d^b] = [max(l_d^a, l_d^b) : min(u_d^a, u_d^b)]
+```
+
+**The API:**
+
+```rust
+// src/region/bounds.rs
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Region {
+    pub dims: Vec<(i64, i64)>,   // one (lower, upper) per dimension
+}
+
+impl Region {
+    pub fn union(&self, other: &Region) -> Region;
+    pub fn intersect(&self, other: &Region) -> Region;
+    pub fn is_empty(&self) -> bool;
+    pub fn contains(&self, point: &[i64]) -> bool;
+}
+```
+
+**Lines:** ~250 + ~150 tests.
+
+### 6.1.3 Triplet notation
+
+**Wolfe §8.1.3.**
+
+**The formulas:**
+
+```
+Region = [l : u : s]   (lower : upper : stride)
+
+Union:
+    [l^a : u^a : s^a] ∪ [l^b : u^b : s^b]
+    = [min(l^a, l^b) : max(u^a, u^b) : gcd(s^a, s^b, l^a - l^b)]
+
+Intersection:
+    Solve l^a + i·s^a = l^b + j·s^b for the smallest solution.
+    stride = lcm(s^a, s^b)
+```
+
+**The API:**
+
+```rust
+// src/region/triplet.rs
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripletRegion {
+    pub dims: Vec<(i64, i64, i64)>,  // (lower, upper, stride) per dimension
+}
+
+impl TripletRegion {
+    pub fn union(&self, other: &TripletRegion) -> TripletRegion;
+    pub fn intersect(&self, other: &TripletRegion) -> Option<TripletRegion>;
+    pub fn is_empty(&self) -> bool;
+}
+```
+
+**Note:** triplet intersection requires solving a Diophantine equation per dimension. Phase 2's `gcd.rs` provides the primitives.
+
+**Lines:** ~400 + ~200 tests.
+
+### 6.1.4 Array kill analysis
+
+**Wolfe §8.1.4.**
+
+**The formulas:**
+
+```
+Self-conflict: rank of the data access matrix = number of loops containing
+               the assignment ⇒ each iteration assigns a different element.
+               No self-conflict.
+
+Value-based flow dependence: no intervening killing assignment to the
+                              same element.
+```
+
+**The API:**
+
+```rust
+// src/region/kill.rs
+
+/// Given an access A[i₁][i₂]...[iₙ] and the loop nest,
+/// does each iteration assign a different element?
+pub fn is_self_conflict_free(
+    access: &Access,
+    loop_: &Loop,
+) -> bool;
+
+/// Does this assignment kill any previous write to the same element?
+pub fn kills(
+    def: &Access,
+    previous: &Access,
+) -> bool;
+```
+
+**The rank test:** build the access matrix `A = [index₁, index₂, ..., indexₙ]`. If `rank(A) = depth`, the access is injective (each iteration touches a different element). Otherwise, multiple iterations touch the same element.
+
+**Lines:** ~300 + ~150 tests.
+
+---
+
+## 6.2 Certificate vocabulary
+
+Phase 6 adds:
+
+```rust
+pub enum Claim {
+    // ... existing ...
+
+    /// Phase 6: an array region. The claim says that an access touches
+    /// only the elements in the region.
+    ArrayRegion {
+        access: usize,
+        region: Region,
+    },
+
+    /// Phase 6: the MayUse/MayMod/Kill summary of a function.
+    FunctionSummary {
+        func: String,
+        may_use: Vec<Region>,
+        may_mod: Vec<Region>,
+        kill: Vec<Region>,
+    },
+}
+```
+
+**The checker arms:**
+
+For `ArrayRegion`:
+
+```
+procedure CheckArrayRegion(cert, loop):
+    access = loop.body[cert.access]
+
+    # Enumerate the access over the iteration space.
+    actual_region = enumerate_region(access, loop)
+    assert actual_region ⊆ cert.region
+```
+
+For `FunctionSummary`:
+
+```
+procedure CheckFunctionSummary(cert, cfg):
+    # Rebuild the dataflow from the CFG.
+    df = dataflow(cert.cfg)
+
+    # Check the summary matches.
+    assert df.may_use[exit] == cert.may_use
+    assert df.may_mod[exit] == cert.may_mod
+    assert df.kill[exit] == cert.kill
+```
+
+**The discipline:** the checker rebuilds the dataflow from the CFG. Nothing the analyzer says about the summaries is trusted.
+
+---
+
+## 6.3 Fuzz tests
+
+| Module | Fuzz strategy |
+|---|---|
+| Dataflow | Random CFGs, compare against a brute-force interpreter that runs the loop and records every accessed element |
+| Simple bounds | Random region unions/intersections, compare against brute-force enumeration |
+| Triplet | Random strides, compare against enumeration + gcd/lcm oracle |
+| Kill analysis | Random accesses, compare self-conflict-free against brute-force rank computation |
+
+**Total fuzz cases:** ~4,000 per test × 4 tests = **~16,000 cases**.
+
+---
+
+## 6.4 File-by-file breakdown
+
+| File | Lines |
+|---|---|
+| `src/region/dataflow.rs` | 400 |
+| `src/region/bounds.rs` | 250 |
+| `src/region/triplet.rs` | 400 |
+| `src/region/kill.rs` | 300 |
+| Certificate additions | 200 |
+| Checker arms | 250 |
+| Fuzz tests | 800 |
+| **Total** | **~2,600** |
+
+The plan said 2,000 lines / 6 weeks. My estimate is ~2,600 / 8 weeks. Multiply by 1.5–2×: **4,000–5,200 / 12–16 weeks**.
+
+---
+
+# Batch summary
+
+| Phase | Focus | Lines | Weeks |
+|---|---|---|---|
+| 4 | Scalar analysis | ~4,700 | ~14 |
+| 5 | Subsystems | ~6,050 | ~16 |
+| 6 | Array regions | ~2,600 | ~8 |
+| **Total** | | **~13,350** | **~38** |
+
+Multiply by 1.5–2× for reality: **20,000–26,700 lines / 57–76 weeks**.
+
+---
+
+## The execution order for the batch
+
+**Week 1–14: Phase 4.** Four algorithms in order:
+1. `src/fud/induct.rs` — `Algorithm Induct` + IV algebra
+2. `src/fud/tripcount.rs` — trip count computation
+3. `src/fud/constprop.rs` — `Algorithm ConstantProp`
+4. `src/fud/scalardd.rs` — `Algorithm ScalarDD`
+5. Wire into M3, M5, M8
+6. Certificate + checker for `ScalarDependence` and `TripCount`
+
+**Week 15–30: Phase 5.** Eleven subsystems, ordered by dependency:
+1. `src/ir/layout.rs` — storage association
+2. `src/ir/effect.rs` — effect summaries
+3. `src/ir/purity.rs` — pure-function classification
+4. `src/decide/m5.rs` — symbolic pointer chase (needs Phase 4's `Induct`)
+5. `src/decide/m12.rs` — dynamic bounds
+6. `src/decide/m6c.rs` — cubic+ extension
+7. `src/ir/reduction.rs` — reduction detection (needs Phase 4's FUD chains)
+8. `src/fud/alignment.rs` — alignment
+9. `src/fud/crossloop.rs` — cross-loop distance
+10. `src/ir/loopkind.rs` — loop-kind classification
+11. `src/runtime/check.rs` — runtime testing (needs its own output type)
+
+**Week 31–38: Phase 6.** Four dataflow analyses:
+1. `src/region/dataflow.rs` — MayUse/MayMod/Kill
+2. `src/region/bounds.rs` — simple bounds
+3. `src/region/triplet.rs` — triplet notation
+4. `src/region/kill.rs` — array kill analysis
+
+---
+
+## The seed-and-revert discipline
+
+Every fuzzer in Phases 4–6 must be validated by:
+
+1. **Seed a bug** in the algorithm (e.g., skip the SCC pop in `Induct`, or drop the `Kill(x) = Kill(x) ∪ ⋂ Kill(p)` intersection).
+2. **Run the fuzzer** — confirm thousands of violations.
+3. **Revert** the seed.
+4. **Confirm** the fuzzer reports 0.
+
+This is the only way to know a fuzzer isn't vacuous. Every level fuzzer in UDDP does this; Phases 1–3 do it explicitly; Phases 4–6 must too.
+
+**Total fuzzer count for the batch:** 19 fuzz tests, ~65,000 cases.
+
+---
+
+## The two honest notes
+
+**1. Runtime testing (Phase 5.1.2) doesn't fit the certificate model.** Every other subsystem emits a `Certificate` that `m0-check` verifies by replay. Runtime testing emits code that runs *later*, at execution time, on real data. This is a **program transformation**, not a certificate. It needs:
+- A new output type (`RuntimeCheckCertificate`)
+- A new checker arm that verifies *"if the test passes, independence holds"*
+- A new fuzzer that generates random loops and verifies the runtime test's soundness
+
+This is architecturally distinct. It may deserve its own sub-phase, or even its own phase. For the batch, it's part of Phase 5 but flagged as the riskiest single item.
+
+**2. Phase 5's 11 subsystems are independent.** They can be built in any order, and each is standalone. If one subsystem takes longer than expected, the others proceed. But the **dependency order within Phase 5** matters: storage association → effect summaries → purity → symbolic chase → dynamic bounds → cubic+ → reductions → alignment → cross-loop → loop-kind → runtime testing. Each depends on the ones before it (or on Phases 1–4).
+
+**3. Reduction detection is the biggest single coverage win.** `sum += a[i]` is the most common loop idiom in real code. Once Phase 5.1.8 lands, real-world coverage jumps by 20–40%. This is worth prioritizing within Phase 5.
+
+---
+
+## The one-paragraph summary
+
+> **Phases 4, 5, and 6 are the scalar-analysis, subsystem, and region-summary phases. Phase 4 (~4,700 lines, ~14 weeks) builds the four Wolfe Ch. 6 algorithms that consume Phase 3's FUD chains: `Algorithm Induct` (SCC-based IV detection with closed-form `a + b·i` algebra), trip count computation, `Algorithm ConstantProp` (the `⊤ / ⊥ / Constant` lattice), and `Algorithm ScalarDD` (the four scalar dependence situations). M3, M5, and M8 are rewritten to use `Induct` instead of hand-coded recursion handling. Phase 5 (~6,050 lines, ~16 weeks) builds eleven subsystems, ordered by dependency: storage association, effect summaries, pure-function classification, symbolic pointer chase, dynamic bounds, cubic+ extension, reduction detection, alignment, cross-loop distance, loop-kind classification, and runtime testing. Phase 6 (~2,600 lines, ~8 weeks) builds the array-region dataflow: `MayUse`/`MayMod`/`Kill` sets, simple bounds, triplet notation with stride-aware union/intersection, and array kill analysis via the rank test. Total batch: ~13,350 lines, ~38 weeks ideal, multiply by 1.5–2× for reality (20,000–26,700 lines, 57–76 weeks). The single most impactful subsystem is reduction detection (`sum += a[i]`), which jumps real-code coverage by 20–40%. The single riskiest item is runtime testing (Ch. 7.6), which needs its own output type and checker semantics because it emits code rather than certificates. Every fuzzer must be validated by seed-and-revert. The batch ends with every function having a `MayUse`/`MayMod`/`Kill` summary, which is the input to Phase 7's points-to analysis.**

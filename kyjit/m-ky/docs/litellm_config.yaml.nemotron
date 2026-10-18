@@ -1,0 +1,60 @@
+general_settings:
+  dangerously_permit_weak_or_unset_master_key: true
+
+model_list:
+  # ---------- claude-opus-5-5 : key1 primary, key2 fallback ----------
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_1"
+      timeout: 300
+      weight: 100
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_2"
+      timeout: 300
+      weight: 1
+
+  # ---------- claude-fable-5-1 : key1 primary, key2 fallback ----------
+  - model_name: claude-fable-5-1
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_1"
+      timeout: 300
+      weight: 100
+  - model_name: claude-fable-5-1
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_2"
+      timeout: 300
+      weight: 1
+
+  # ---------- claude-sonnet-5-5 : key1 primary, key2 fallback ----------
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_1"
+      timeout: 300
+      weight: 100
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: openai/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: "os.environ/NVIDIA_API_KEY_2"
+      timeout: 300
+      weight: 1
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 3
+  retry_after: 2
+  allowed_fails: 10
+  cooldown_time: 10
+  enable_pre_call_checks: true
+  disable_cooldowns: false        # keep cooldowns but make them shorter

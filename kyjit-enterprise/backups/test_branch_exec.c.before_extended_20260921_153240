@@ -1,0 +1,137 @@
+/*
+ * test_branch_exec.c — verify IR_IF executes the correct branch.
+ *
+ * Only tests that branches RUN correctly. Emits a function that
+ * takes a condition as param0 and returns different values based
+ * on it. Uses IR_IF + two IR_RETURN nodes.
+ */
+
+#include "kyjit_ir.h"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <stdint.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+/* Build: if (param0) return 42; else return 99; */
+static KyGraph *build_if_else_ret(void) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *cond = kyir_node_create(g, IR_PARAMETER);
+    cond->constant.i64 = 0;
+    cond->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, cond);
+
+    KyNode *then_lbl = kyir_build_label(b);
+    KyNode *else_lbl = kyir_build_label(b);
+
+    /* use_current_block: after IF, the builder starts a new block.
+     * Add subsequent nodes to b->current_block, not the stale b0. */
+    kyir_build_if(b, cond, then_lbl, else_lbl);
+
+    /* then block: return 42 */
+    KyBlock *then_blk = b->current_block;
+    kyir_block_add_node(then_blk, then_lbl);
+    KyNode *v42 = kyir_const_i64(g, 42);
+    kyir_block_add_node(then_blk, v42);
+    KyNode *ret1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret1, v42);
+    kyir_node_add_use(v42, ret1);
+    kyir_block_add_node(then_blk, ret1);
+    then_blk->terminator = ret1;
+
+    /* else block: return 99 */
+    KyBlock *else_blk = kyir_builder_new_block(b);
+    kyir_block_add_node(else_blk, else_lbl);
+    KyNode *v99 = kyir_const_i64(g, 99);
+    kyir_block_add_node(else_blk, v99);
+    KyNode *ret2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret2, v99);
+    kyir_node_add_use(v99, ret2);
+    kyir_block_add_node(else_blk, ret2);
+    else_blk->terminator = ret2;
+
+    kyir_builder_destroy(b);
+    return g;
+}
+
+static int64_t run1(KyGraph *g, int64_t arg, uint8_t *bytes, size_t *blen) {
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return -999999;
+
+    size_t len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &len);
+    if (rc != 0) { munmap(code, 4096); return -999999; }
+
+    if (bytes && blen) {
+        size_t n = (*blen < 64) ? *blen : 64;
+        __builtin_memcpy(bytes, code, n);
+        *blen = len;
+    }
+
+    typedef int64_t (*Fn1)(int64_t);
+    Fn1 f = (Fn1)code;
+    int64_t r = f(arg);
+    munmap(code, 4096);
+    return r;
+}
+
+int main(void) {
+    printf("KYJIT Branch Execution Test v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n");
+
+    printf("\n[if (a) return 42; else return 99;]\n");
+    KyGraph *g = build_if_else_ret();
+    uint8_t bytes[64]; size_t len = 64;
+
+    /* single_compile: compile once, call twice. Re-compiling the same
+     * graph uses stale label ids (n->reg) that no longer exist on the
+     * fresh backend, so branches vanish. */
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    TEST("mmap", code != MAP_FAILED);
+
+    size_t code_len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &code_len);
+    printf("  compile rc=%d len=%zu\n", rc, code_len);
+    TEST("compiled", rc == 0);
+
+    if (rc == 0) {
+        printf("  bytes (%zu): ", code_len);
+        for (size_t i = 0; i < code_len && i < 40; i++)
+            printf("%02x ", ((uint8_t*)code)[i]);
+        printf("\n");
+
+        typedef int64_t (*Fn1)(int64_t);
+        Fn1 f = (Fn1)code;
+
+        int64_t r1 = f(1);
+        printf("  f(1) = %ld (expect 42)\n", (long)r1);
+        TEST("f(1) == 42", r1 == 42);
+
+        int64_t r0 = f(0);
+        printf("  f(0) = %ld (expect 99)\n", (long)r0);
+        TEST("f(0) == 99", r0 == 99);
+    }
+
+    munmap(code, 4096);
+    kyir_graph_destroy(g);
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+    return (tests_run == tests_passed) ? 0 : 1;
+}

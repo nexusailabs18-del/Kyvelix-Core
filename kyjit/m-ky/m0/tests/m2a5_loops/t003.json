@@ -1,0 +1,10 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 4, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "indirect": { "base": "B", "index": [1], "offset": 0, "table": [1,1,2,3], "domain_lo": 0, "domain_hi": 4 } },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "indirect": { "base": "B", "index": [1], "offset": 0, "table": [1,1,2,3], "domain_lo": 0, "domain_hi": 4 } }
+  ]
+}

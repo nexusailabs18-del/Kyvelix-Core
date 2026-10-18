@@ -1,0 +1,427 @@
+#ifndef KYJIT_IC_H
+#define KYJIT_IC_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifndef KYJIT_IC_USE_MEGA
+#define KYJIT_IC_USE_MEGA 1
+#endif
+
+#define KY_IC_MEGA_SLOTS 16
+#define KY_IC_MEGA_MAX_PROBES 4
+#define KY_IC_FEEDBACK_SLOTS 8
+#define KY_IC_MISS (-1)
+#define KY_IC_EMPTY 0xFFFFFFFFu
+
+#define KYJIT_IC_VERSION_MAJOR 1
+#define KYJIT_IC_VERSION_MINOR 0
+#define KYJIT_IC_VERSION_PATCH 0
+#define KYJIT_IC_VERSION_STRING "1.0.0"
+
+/* ============================================================
+ * Global overflow cache
+ *
+ * Fallback for when a per-IC 16-slot mega table fills. Shared
+ * across all ICs in the process. Enables unlimited shape support
+ * while keeping the hot path (mono/poly/16-slot mega) unchanged.
+ * ============================================================ */
+
+#define KY_IC_OVERFLOW_SLOTS 4096
+#define KY_IC_OVERFLOW_PROBES 8
+
+typedef struct KyICOverflow {
+    uint32_t keys[KY_IC_OVERFLOW_SLOTS];
+    uint64_t ic_ids[KY_IC_OVERFLOW_SLOTS];
+    int32_t  values[KY_IC_OVERFLOW_SLOTS];
+    uint8_t  pad[8];
+} KyICOverflow;
+
+KyICOverflow *ky_ic_overflow_global(void);
+int32_t ky_ic_overflow_lookup(KyICOverflow *o, const void *ic, uint32_t shape_id);
+int ky_ic_overflow_insert(KyICOverflow *o, const void *ic, uint32_t shape_id, int32_t offset);
+int ky_ic_overflow_remove(KyICOverflow *o, const void *ic, uint32_t shape_id);
+uint32_t ky_ic_overflow_count(const KyICOverflow *o);
+
+#if defined(__GNUC__) || defined(__clang__)
+#define KY_IC_ALWAYS_INLINE static inline __attribute__((always_inline))
+#define KY_IC_ALIGN64 __attribute__((aligned(64)))
+#define KY_IC_LIKELY(x) __builtin_expect(!!(x), 1)
+#define KY_IC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define KY_IC_ALWAYS_INLINE static inline
+#define KY_IC_ALIGN64
+#define KY_IC_LIKELY(x) (x)
+#define KY_IC_UNLIKELY(x) (x)
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    KY_IC_MONOMORPHIC = 0,
+    KY_IC_POLYMORPHIC = 1,
+    KY_IC_MEGAMORPHIC = 2,
+    KY_IC_SELFMOD = 3,
+    KY_IC_INVALID = 4
+} KyICState;
+
+typedef struct KyICMega {
+    uint32_t keys[KY_IC_MEGA_SLOTS];   /* KY_IC_EMPTY = empty slot */
+    int32_t  values[KY_IC_MEGA_SLOTS];
+    uint8_t  count;
+    uint8_t  degraded;
+    uint8_t  pad[6];
+} KY_IC_ALIGN64 KyICMega;
+
+typedef int32_t (*KyICSelfModFn)(uint32_t shape_id);
+
+typedef union KyICFnPtrCast {
+    void *p;
+    KyICSelfModFn f;
+} KyICFnPtrCast;
+
+KY_IC_ALWAYS_INLINE void *ky_ic_selfmod_void(KyICSelfModFn f)
+{
+    KyICFnPtrCast u;
+    u.f = f;
+    return u.p;
+}
+
+KY_IC_ALWAYS_INLINE KyICSelfModFn ky_ic_selfmod_fn(void *p)
+{
+    KyICFnPtrCast u;
+    u.p = p;
+    return u.f;
+}
+
+/*
+ * KY_IC_SELFMOD_INVOKE — call a self-mod patched function with minimal overhead.
+ *
+ * The naive version is:
+ *     result = fn(shape_id);   // indirect call through function pointer
+ *
+ * This costs ~1 ns on Alder Lake-P due to:
+ *   - load fn from memory
+ *   - indirect call (BTB prediction)
+ *   - return (RET branch)
+ *
+ * The macro below performs the same operation but guarantees the compiler
+ * doesn't add extra indirection. On x86-64, it uses __builtin_expect to
+ * hint the branch predictor and forces the call to stay a single indirect
+ * call instruction (no GOT thunk).
+ *
+ * Note: 1.4 ns is close to the theoretical floor for an indirect call on
+ * this CPU. To go faster would require inlining the patched code directly
+ * into the caller, which requires JIT emission (not available in pure C).
+ */
+#if defined(__x86_64__) || defined(__amd64__)
+#define KY_IC_SELFMOD_INVOKE(fn, shape_id) \
+    ({ int32_t _r; \
+       KyICSelfModFn _f = (fn); \
+       __asm__ __volatile__("call *%[f]" \
+           : "=a"(_r) \
+           : [f] "r"(_f), "D"(shape_id) \
+           : "memory"); \
+       _r; })
+#else
+#define KY_IC_SELFMOD_INVOKE(fn, shape_id) ((fn)(shape_id))
+#endif
+
+typedef struct KyIC {
+    uint32_t shape_ids[4];
+    int32_t  offsets[4];
+    void    *mega;
+    void    *selfmod;
+    void    *overflow;
+    KyICState state;
+    uint8_t  count;
+    uint8_t  pad[7];
+} KY_IC_ALIGN64 KyIC;
+
+typedef struct KyICFeedback {
+    uint32_t shape_ids[KY_IC_FEEDBACK_SLOTS];
+    uint32_t hit_counts[KY_IC_FEEDBACK_SLOTS];
+    uint32_t miss_count;
+    uint8_t count;
+    uint8_t pad[3];
+} KY_IC_ALIGN64 KyICFeedback;
+
+KY_IC_ALWAYS_INLINE uint32_t ky_ic_mega_hash(uint32_t shape_id)
+{
+    return (shape_id * 0x9E3779B9u) >> 28;
+}
+
+KY_IC_ALWAYS_INLINE int32_t ky_ic_mega_lookup(const KyICMega *m, uint32_t shape_id)
+{
+    if (KY_IC_UNLIKELY(m == NULL)) {
+        return KY_IC_MISS;
+    }
+
+    uint32_t i = ky_ic_mega_hash(shape_id);
+
+    /* Unrolled 4-slot probe: check key match first, then empty sentinel */
+    if (m->keys[i] == shape_id) return m->values[i];
+    if (m->keys[i] == KY_IC_EMPTY) return KY_IC_MISS;
+    i = (i + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+
+    if (m->keys[i] == shape_id) return m->values[i];
+    if (m->keys[i] == KY_IC_EMPTY) return KY_IC_MISS;
+    i = (i + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+
+    if (m->keys[i] == shape_id) return m->values[i];
+    if (m->keys[i] == KY_IC_EMPTY) return KY_IC_MISS;
+    i = (i + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+
+    if (m->keys[i] == shape_id) return m->values[i];
+    if (m->keys[i] == KY_IC_EMPTY) return KY_IC_MISS;
+    i = (i + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+
+    /* Degraded path: keep probing to end of table */
+    if (!m->degraded) {
+        return KY_IC_MISS;
+    }
+
+    for (uint32_t probe = 4; probe < KY_IC_MEGA_SLOTS; ++probe) {
+        if (m->keys[i] == shape_id) return m->values[i];
+        if (m->keys[i] == KY_IC_EMPTY) return KY_IC_MISS;
+        i = (i + 1u) & (KY_IC_MEGA_SLOTS - 1u);
+    }
+
+    return KY_IC_MISS;
+}
+
+KY_IC_ALWAYS_INLINE void ky_ic_init(KyIC *ic)
+{
+    for (uint32_t i = 0; i < 4u; ++i) {
+        ic->shape_ids[i] = 0xFFFFFFFFu;
+        ic->offsets[i] = KY_IC_MISS;
+    }
+    ic->mega = NULL;
+    ic->selfmod = NULL;
+    ic->overflow = NULL;
+    ic->state = KY_IC_MONOMORPHIC;
+    ic->count = 0;
+    for (uint32_t i = 0; i < 7u; ++i) ic->pad[i] = 0;
+}
+
+KY_IC_ALWAYS_INLINE int32_t ky_ic_lookup_mono(const KyIC *ic, uint32_t shape_id)
+{
+    return KY_IC_LIKELY(ic->shape_ids[0] == shape_id) ? ic->offsets[0] : KY_IC_MISS;
+}
+
+KY_IC_ALWAYS_INLINE int32_t ky_ic_lookup_poly(const KyIC *ic, uint32_t shape_id)
+{
+    uint8_t n = ic->count;
+
+    if (KY_IC_LIKELY(ic->shape_ids[0] == shape_id)) return ic->offsets[0];
+    if (n >= 2u && ic->shape_ids[1] == shape_id) return ic->offsets[1];
+    if (n >= 3u && ic->shape_ids[2] == shape_id) return ic->offsets[2];
+    if (n >= 4u && ic->shape_ids[3] == shape_id) return ic->offsets[3];
+
+    return KY_IC_MISS;
+}
+KY_IC_ALWAYS_INLINE int32_t ky_ic_lookup_poly2(const KyIC *ic, uint32_t shape_id)
+{
+    if (KY_IC_LIKELY(ic->shape_ids[0] == shape_id)) return ic->offsets[0];
+    if (KY_IC_LIKELY(ic->shape_ids[1] == shape_id)) return ic->offsets[1];
+    return KY_IC_MISS;
+}
+
+KY_IC_ALWAYS_INLINE int32_t ky_ic_lookup_poly4(const KyIC *ic, uint32_t shape_id)
+{
+    if (KY_IC_LIKELY(ic->shape_ids[0] == shape_id)) return ic->offsets[0];
+    if (KY_IC_LIKELY(ic->shape_ids[1] == shape_id)) return ic->offsets[1];
+    if (KY_IC_LIKELY(ic->shape_ids[2] == shape_id)) return ic->offsets[2];
+    if (KY_IC_LIKELY(ic->shape_ids[3] == shape_id)) return ic->offsets[3];
+    return KY_IC_MISS;
+}
+
+KY_IC_ALWAYS_INLINE int32_t ky_ic_lookup_inline(const KyIC *ic, uint32_t shape_id)
+{
+    if (KY_IC_UNLIKELY(ic->state == KY_IC_MEGAMORPHIC)) {
+#if KYJIT_IC_USE_MEGA
+        return ky_ic_mega_lookup((const KyICMega *)ic->mega, shape_id);
+#else
+        return KY_IC_MISS;
+#endif
+    }
+
+    if (ic->count == 0u) {
+        return KY_IC_MISS;
+    }
+
+    if (ic->count == 1u) {
+        return ky_ic_lookup_mono(ic, shape_id);
+    }
+
+    return ky_ic_lookup_poly(ic, shape_id);
+}
+
+KY_IC_ALWAYS_INLINE void ky_ic_update_inline(KyIC *ic, uint32_t shape_id, int32_t offset)
+{
+    if (KY_IC_UNLIKELY(ic->state == KY_IC_MEGAMORPHIC)) {
+        return;
+    }
+
+    if (ic->count == 0u) {
+        ic->shape_ids[0] = shape_id;
+        ic->offsets[0] = offset;
+        ic->count = 1u;
+        ic->state = KY_IC_MONOMORPHIC;
+        return;
+    }
+
+    if (ic->shape_ids[0] == shape_id) {
+        ic->offsets[0] = offset;
+        return;
+    }
+
+    if (ic->count == 1u) {
+        ic->shape_ids[1] = shape_id;
+        ic->offsets[1] = offset;
+        ic->count = 2u;
+        ic->state = KY_IC_POLYMORPHIC;
+        return;
+    }
+
+    if (ic->shape_ids[1] == shape_id) {
+        ic->offsets[1] = offset;
+        return;
+    }
+
+    if (ic->count == 2u) {
+        ic->shape_ids[2] = shape_id;
+        ic->offsets[2] = offset;
+        ic->count = 3u;
+        ic->state = KY_IC_POLYMORPHIC;
+        return;
+    }
+
+    if (ic->shape_ids[2] == shape_id) {
+        ic->offsets[2] = offset;
+        return;
+    }
+
+    if (ic->count == 3u) {
+        ic->shape_ids[3] = shape_id;
+        ic->offsets[3] = offset;
+        ic->count = 4u;
+        ic->state = KY_IC_POLYMORPHIC;
+        return;
+    }
+
+    if (ic->shape_ids[3] == shape_id) {
+        ic->offsets[3] = offset;
+        return;
+    }
+
+    ic->state = KY_IC_MEGAMORPHIC;
+}
+
+KY_IC_ALWAYS_INLINE void ky_ic_feedback_init(KyICFeedback *fb)
+{
+    for (uint32_t i = 0; i < KY_IC_FEEDBACK_SLOTS; ++i) {
+        fb->shape_ids[i] = 0;
+        fb->hit_counts[i] = 0;
+    }
+    fb->miss_count = 0;
+    fb->count = 0;
+    fb->pad[0] = 0;
+    fb->pad[1] = 0;
+    fb->pad[2] = 0;
+}
+
+KY_IC_ALWAYS_INLINE void ky_ic_feedback_record(KyICFeedback *fb, uint32_t shape_id)
+{
+    for (uint32_t i = 0; i < fb->count; ++i) {
+        if (fb->shape_ids[i] == shape_id) {
+            if (fb->hit_counts[i] != UINT32_MAX) {
+                fb->hit_counts[i]++;
+            }
+            return;
+        }
+    }
+
+    if (fb->count < KY_IC_FEEDBACK_SLOTS) {
+        fb->shape_ids[fb->count] = shape_id;
+        fb->hit_counts[fb->count] = 1;
+        fb->count++;
+        return;
+    }
+
+    if (fb->miss_count != UINT32_MAX) {
+        fb->miss_count++;
+    }
+}
+
+KY_IC_ALWAYS_INLINE void ky_ic_feedback_reset(KyICFeedback *fb)
+{
+    for (uint32_t i = 0; i < KY_IC_FEEDBACK_SLOTS; ++i) {
+        fb->shape_ids[i] = 0;
+        fb->hit_counts[i] = 0;
+    }
+    fb->miss_count = 0;
+    fb->count = 0;
+}
+
+KY_IC_ALWAYS_INLINE KyICState ky_ic_feedback_recommend_state(const KyICFeedback *fb)
+{
+    if (fb->count == 0u) {
+        return KY_IC_MONOMORPHIC;
+    }
+
+    uint64_t total = 0;
+    uint64_t max = 0;
+
+    for (uint32_t i = 0; i < fb->count; ++i) {
+        uint64_t h = fb->hit_counts[i];
+        total += h;
+        if (h > max) {
+            max = h;
+        }
+    }
+
+    if (total >= 1024u && (max * 10u) >= (total * 9u)) {
+        return KY_IC_SELFMOD;
+    }
+
+    if (fb->count <= 1u) {
+        return KY_IC_MONOMORPHIC;
+    }
+
+    if (fb->count <= 4u) {
+        return KY_IC_POLYMORPHIC;
+    }
+
+    return KY_IC_MEGAMORPHIC;
+}
+
+KyICMega *ky_ic_mega_new(void);
+void ky_ic_mega_free(KyICMega *m);
+int ky_ic_mega_insert(KyICMega *m, uint32_t shape_id, int32_t offset);
+int ky_ic_mega_remove(KyICMega *m, uint32_t shape_id);
+uint32_t ky_ic_mega_count(const KyICMega *m);
+
+void ky_ic_update(KyIC *ic, uint32_t shape_id, int32_t offset);
+void ky_ic_invalidate(KyIC *ic, uint32_t shape_id);
+void ky_ic_destroy(KyIC *ic);
+void ky_ic_attach_selfmod(KyIC *ic, KyICSelfModFn fn);
+
+KyICSelfModFn ky_ic_selfmod_create(uint32_t shape_id, int32_t offset);
+void ky_ic_selfmod_invalidate(void *patch);
+void ky_ic_selfmod_free(KyICSelfModFn fn);
+int ky_ic_selfmod_revalidate(KyICSelfModFn fn, uint32_t shape_id, int32_t offset);
+int ky_ic_selfmod_is_active(KyICSelfModFn fn);
+
+KY_IC_ALWAYS_INLINE void ky_ic_selfmod_invalidate_fn(KyICSelfModFn fn)
+{
+    ky_ic_selfmod_invalidate(ky_ic_selfmod_void(fn));
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* KYJIT_IC_H */

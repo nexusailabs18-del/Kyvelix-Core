@@ -1,0 +1,864 @@
+# Phase 3 — FUD Chains: Complete Specification
+
+**Chapter 6.1–6.3** of Wolfe. The graph-theoretic layer that every scalar analysis depends on. This is the phase that turns the analyzer from "array-only" into "array + scalar."
+
+---
+
+## 3.0 What Phase 3 is and why it must come before Phase 4
+
+**Input:** M0–M13 as they stand after Phase 2. The analyzer can decide array dependence but has no model of scalar value flow.
+
+**Output:** every *use* of every *scalar variable* in a loop body is linked to its unique *reaching definition* (or to a φ-term that merges incoming definitions). This is the **Factored Use-Def chain** — the data structure Wolfe builds in Chapter 6.
+
+**Why it's the bottleneck:** every scalar-related analysis in the remaining phases depends on this:
+
+| Later phase | What it needs from Phase 3 |
+|---|---|
+| Phase 4 (scalar analysis) | IV detection needs the FUD chain graph; constant propagation needs the chain; scalar dependence needs the chain |
+| Phase 5 (subsystems) | Reduction detection needs to walk the chain to see accumulation patterns |
+| Phase 8 (interprocedural) | Interprocedural constant propagation needs the chain to propagate values across call sites |
+| SPP Layer 2 | Induction variable substitution, scalar expansion, dead code elimination all walk the chain |
+
+**Without Phase 3**, the analyzer cannot answer "is this scalar variable the same value at these two points?" — which is what every scalar-related transformation in Wolfe Chapter 9 asks.
+
+**What Phase 3 does NOT do:**
+- No IV detection (Phase 4)
+- No constant propagation (Phase 4)
+- No scalar dependence (Phase 4)
+- No array FUD chains — only scalar (array chains are Phase 6, after array regions)
+
+---
+
+## 3.1 The data model
+
+### 3.1.1 The CFG
+
+Before FUD chains, you need a control-flow graph. The loop body is a sequence of statements, but the *uses* and *definitions* of scalars are what matter, and their reachability depends on the control flow.
+
+**Source:** the IR currently has `Access` (array accesses) but no scalar model. Phase 3 must add:
+
+```rust
+// src/ir/scalar.rs
+
+/// A single scalar variable in a loop body.
+pub struct ScalarVar {
+    pub name: String,
+    pub ty: ScalarTy,         // for later phases; Phase 3 ignores
+}
+
+pub enum ScalarTy {
+    I64,
+    F64,
+    Bool,
+    Unknown,
+}
+
+/// A use of a scalar: reads the current value.
+pub struct ScalarUse {
+    pub var: usize,           // index into the loop's scalar table
+    pub stmt: usize,          // which statement it appears in
+    pub order: usize,         // position within the statement
+}
+
+/// A definition of a scalar: assigns a new value.
+pub struct ScalarDef {
+    pub var: usize,
+    pub stmt: usize,
+    pub order: usize,
+}
+
+/// A φ-term: a merge point where two or more definitions of the same
+/// scalar reach a common successor. Records one incoming def per
+/// predecessor of the merge block.
+pub struct PhiTerm {
+    pub var: usize,
+    pub block: usize,         // the merge block
+    pub incoming: Vec<usize>, // one per predecessor, in predecessor order
+}
+```
+
+### 3.1.2 The CFG structure
+
+```rust
+pub struct CFG {
+    pub blocks: Vec<Block>,
+    pub entry: usize,
+    pub exit: usize,
+}
+
+pub struct Block {
+    pub id: usize,
+    pub preds: Vec<usize>,
+    pub succs: Vec<usize>,
+    pub stmts: Vec<Stmt>,
+}
+
+pub struct Stmt {
+    pub id: usize,
+    pub uses: Vec<ScalarUse>,
+    pub defs: Vec<ScalarDef>,
+}
+```
+
+For a loop body, the CFG has a canonical shape:
+
+```
+entry → body_block → loop_header → (exit | back to body_block)
+```
+
+with additional blocks for `if`/`else`/`break`/`continue` inside the loop. Phase 3 must construct this from the IR's `body` — and if the IR doesn't yet have `if`/`else`, the CFG is a single block, and the FUD chain construction degenerates to "each use reaches the immediately preceding def."
+
+**The IR gap:** the current `Access` type has no notion of statements or control flow. Phase 3 must either:
+- **(a)** Add `Stmt` and `CFG` to the IR, and extend the frontend to emit them; or
+- **(b)** Build a single-block CFG from the existing `body`, treating the loop body as one basic block.
+
+**Pick (b) for Phase 3, defer (a) to Phase 9.** The reason: UDDP's current IR doesn't model `if`/`else`, so a single-block CFG is *correct* for the loops it currently accepts. When the frontend grows branching (Phase 9), the CFG grows with it.
+
+Under (b), every loop body is one basic block. The CFG has:
+
+```
+entry → body → exit
+```
+
+No merge points, no φ-terms needed (φ-terms only appear at merge points). So Phase 3's φ-placement machinery has no work to do yet — but the *machinery itself* must be built so Phase 9 can use it.
+
+### 3.1.3 The FUD chain
+
+```rust
+pub struct FudChains {
+    /// use ID → the definition ID it reaches.
+    pub use_to_def: HashMap<UseId, DefId>,
+    /// def ID → the φ-term that merges it, or None.
+    pub def_to_phi: HashMap<DefId, Option<PhiId>>,
+    /// φ-term ID → one incoming def per predecessor.
+    pub phi_incoming: HashMap<PhiId, Vec<DefId>>,
+    /// def ID → the previous def of the same variable, or None.
+    /// This is the "def-def link" Wolfe describes in §6.2.
+    pub def_to_prev: HashMap<DefId, Option<DefId>>,
+}
+```
+
+The three links:
+
+- **use → def** (the forward chain): for each use, which definition's value it sees
+- **φ-term incoming** (the merge structure): at a merge block, each predecessor contributes one def
+- **def → prev def** (the backward chain): every def knows the previous def of the same variable, so a walker can enumerate all reaching defs
+
+---
+
+## 3.2 Dominators and the dominance frontier
+
+**Wolfe §6.1.3.** Before φ-placement, you need the dominance frontier of each block.
+
+### 3.2.1 The formulas
+
+**Dominance:**
+```
+X DOM Y   iff   every path from Entry to Y passes through X
+
+DOM(Y) = { X | X DOM Y }
+```
+
+**Immediate dominator:**
+```
+IDOM(Y) = the unique X ∈ DOM(Y) \ {Y} such that X is closest to Y
+```
+
+**Dominance frontier:**
+```
+DF(X) = { Z | (∃ Y₁, Y₂ ∈ PRED(Z)) [X DOM Y₁] ∧ [X ¬DOM Y₂] }
+```
+
+**Iterated dominance frontier:**
+```
+DF⁺(S) = fixpoint of: DF⁺(S) = DF(S ∪ DF⁺(S))
+```
+
+**The equivalence theorem (Wolfe §6.1.3):**
+```
+DF⁺(S) = J⁺(S)   if Entry ∈ S
+```
+where `J⁺` is the iterated join set. This is why you can use iterated dominance frontier for φ-placement — it's exactly the join set.
+
+### 3.2.2 Algorithm: Cooper-Harvey-Kennedy dominator tree
+
+Wolfe doesn't give the algorithm; this is the standard one. Runs in near-linear time.
+
+```
+procedure ComputeDominators(cfg):
+    # Step 1: reverse postorder
+    rpo = ReversePostorder(cfg, entry)
+    for each block b: idom[b] = None
+
+    idom[entry] = entry
+    changed = true
+    while changed:
+        changed = false
+        for b in rpo[1..]:
+            # Find the new idom by intersecting all predecessors' idoms
+            new_idom = None
+            for p in preds(b):
+                if idom[p] != None:
+                    if new_idom == None:
+                        new_idom = p
+                    else:
+                        new_idom = Intersect(p, new_idom)
+            if idom[b] != new_idom:
+                idom[b] = new_idom
+                changed = true
+    return idom
+
+procedure Intersect(b1, b2):
+    finger1 = b1
+    finger2 = b2
+    while finger1 != finger2:
+        while rpo_index[finger1] < rpo_index[finger2]:
+            finger1 = idom[finger1]
+        while rpo_index[finger2] < rpo_index[finger1]:
+            finger2 = idom[finger2]
+    return finger1
+```
+
+### 3.2.3 Algorithm: dominance frontier
+
+```
+procedure ComputeDF(cfg, idom):
+    for each block b: DF[b] = ∅
+    for each block b:
+        if |preds(b)| >= 2:
+            for each p in preds(b):
+                runner = p
+                while runner != idom[b]:
+                    DF[runner] = DF[runner] ∪ {b}
+                    runner = idom[runner]
+    return DF
+
+procedure ComputeDFPlus(cfg, DF):
+    # Iterate until fixpoint
+    DFPlus[b] = DF[b] for all b
+    changed = true
+    while changed:
+        changed = false
+        for each block b:
+            for each Y in DFPlus[b]:
+                for each Z in DF[Y]:
+                    if Z ∉ DFPlus[b]:
+                        DFPlus[b] = DFPlus[b] ∪ {Z}
+                        changed = true
+    return DFPlus
+```
+
+### 3.2.4 The API
+
+```rust
+// src/fud/dominators.rs
+
+pub struct DominatorTree {
+    pub idom: Vec<usize>,             // idom[b] = immediate dominator of b
+    pub rpo_index: Vec<usize>,        // reverse postorder index
+    pub children: Vec<Vec<usize>>,    // dominator tree children
+}
+
+pub fn compute_dominators(cfg: &CFG) -> DominatorTree;
+
+pub struct DominanceFrontiers {
+    pub df: Vec<HashSet<usize>>,      // DF[b] = dominance frontier
+    pub df_plus: Vec<HashSet<usize>>, // iterated frontier
+}
+
+pub fn compute_dominance_frontiers(
+    cfg: &CFG,
+    dom: &DominatorTree,
+) -> DominanceFrontiers;
+```
+
+---
+
+## 3.3 φ-term placement (Algorithm Placement)
+
+**Wolfe §6.1.2 and §6.1.4.**
+
+### 3.3.1 The join set
+
+```
+J(X₁, X₂) = { Z | ∃ paths p₁: X₁ → Y₁, p₂: X₂ → Y₂
+                  with Y₁ → Z, Y₂ → Z, p₁ ∩ p₂ = ∅ }
+```
+
+Two definitions `X₁` and `X₂` of the same variable share a join point `Z` if disjoint paths from them lead to two predecessors of `Z`.
+
+**The convention:** `J(X, X) = ∅`. A single definition doesn't create a φ-term.
+
+**Iterated join set:**
+```
+J¹(S) = J(S)
+Jⁱ(S) = J(S ∪ Jⁱ⁻¹(S))
+J⁺(S) = lim_{i→∞} Jⁱ(S)
+```
+
+### 3.3.2 Algorithm Placement
+
+```
+procedure Placement(cfg, D, DF):
+    # D: Map from variable → set of blocks that define it
+    # Returns: Map from variable → set of blocks needing a φ-term
+
+    for each block X:
+        InWork[X] = ⊥        # which variable is this block being processed for
+        Added[X] = ⊥         # which variable's φ-term has been placed here
+
+    for each variable M:
+        WorkList = D[M]       # blocks defining M
+        for each X in WorkList:
+            InWork[X] = M
+        while WorkList ≠ ∅:
+            remove some X from WorkList
+            for each W in DF[X]:
+                if Added[W] ≠ M:
+                    place φ-term for M at W
+                    Added[W] = M
+                    if InWork[W] ≠ M:
+                        WorkList = WorkList ∪ {W}
+                        InWork[W] = M
+```
+
+**Why `InWork[X] = M`:** the flag prevents re-adding a block that's already in the worklist for variable `M`. Without it, the algorithm can loop forever.
+
+**Why `Added[W] ≠ M`:** the flag prevents placing a second φ-term for the same variable at the same block.
+
+### 3.3.3 Using DF⁺ instead of iterating Placement
+
+Because `DF⁺(S) = J⁺(S)` (Wolfe's theorem), you can skip the worklist and place φ-terms directly:
+
+```
+procedure PlacementDirect(cfg, D, DFPlus):
+    for each variable M:
+        S = D[M]                                  # blocks defining M
+        for each W in DFPlus[S]:
+            place φ-term for M at W
+```
+
+This is simpler and terminates immediately. **Use this.**
+
+### 3.3.4 The API
+
+```rust
+// src/fud/placement.rs
+
+pub struct PhiPlacement {
+    /// Which variables need a φ-term at which blocks.
+    pub phi_at: HashMap<(usize, usize), Vec<usize>>,  // (var, block) → incoming defs
+}
+
+pub fn place_phi_terms(
+    cfg: &CFG,
+    definitions: &HashMap<usize, HashSet<usize>>,   // var → blocks defining it
+    frontiers: &DominanceFrontiers,
+) -> PhiPlacement;
+```
+
+---
+
+## 3.4 Chain construction (Algorithm Chain)
+
+**Wolfe §6.1.5.**
+
+### 3.4.1 The algorithm
+
+```
+procedure Chain(cfg, Symbols):
+    for M in Symbols:
+        CurrDef[M] = ⊥
+    Search(Entry)
+
+procedure Search(X):
+    # Process the block's statements in order.
+    for each variable use or def or φ-term R in X:
+        M = variable at R
+        if R is a use:
+            Chain[R] = CurrDef[M]
+        else if R is a def or φ-term:
+            SaveChain[R] = CurrDef[M]
+            CurrDef[M] = R
+
+    # For each successor Y of X, record the reaching def into Y's φ-terms.
+    for Y in SUCC(X):
+        J = WhichPred(X → Y)              # index of X in Y's predecessor list
+        for each φ-term R in Y:
+            M = variable at R
+            φ-Chain[R][J] = CurrDef[M]
+
+    # Recursively process dominator children.
+    for Y in Child(X):
+        Search(Y)
+
+    # On the way back up, restore CurrDef to the state before this block.
+    for each variable use or def or φ-term R in X in reverse order:
+        M = variable at R
+        if R is a def or φ-term:
+            CurrDef[M] = SaveChain[R]
+```
+
+### 3.4.2 Why the reverse pass matters
+
+`CurrDef[M]` is a global map: "the most recent definition of `M` seen so far." When you descend into a dominator child, you enter a region where `M` may be redefined. When you come back out, `M` must be restored to what it was before the descent — otherwise subsequent siblings of the child see the wrong `CurrDef`.
+
+**The `SaveChain` map implements this.** Before a def overwrites `CurrDef[M]`, the old value is saved in `SaveChain[def]`. On the reverse pass (after all children have been processed), the def restores `CurrDef[M] = SaveChain[def]`.
+
+**Skipping the reverse pass is the classic bug.** Without it, the chain gives wrong results on any CFG with branching, because uses in the second branch see definitions from the first.
+
+### 3.4.3 The `WhichPred` helper
+
+For a CFG edge `X → Y`, `WhichPred(X → Y)` is the index of `X` in `Y.preds`. This is used to place the reaching definition into the correct slot of `Y`'s φ-term's incoming vector.
+
+Precompute once:
+
+```rust
+pub struct EdgeIndex {
+    /// (from, to) → index of `from` in `to.preds`
+    pub which_pred: HashMap<(usize, usize), usize>,
+}
+
+pub fn build_edge_index(cfg: &CFG) -> EdgeIndex;
+```
+
+### 3.4.4 The API
+
+```rust
+// src/fud/chain.rs
+
+pub struct FudChain {
+    pub use_to_def: HashMap<UseId, DefId>,
+    pub phi_incoming: HashMap<PhiId, Vec<DefId>>,
+    pub def_to_save: HashMap<DefId, Option<DefId>>,   // for the reverse pass
+}
+
+pub fn construct_chains(
+    cfg: &CFG,
+    dom: &DominatorTree,
+    placement: &PhiPlacement,
+) -> FudChain;
+```
+
+---
+
+## 3.5 Finding all reaching definitions (Algorithm FollowChain)
+
+**Wolfe §6.3.**
+
+### 3.5.1 The algorithm
+
+```
+procedure FollowChain(d, u):
+    if Marked[d] = u then return
+    Marked[d] = u
+
+    if d is a definition for u:
+        add d to Defs[u]
+
+    if d is a φ-term:
+        for each link j:
+            FollowChain(φ-Chain[d][j], u)
+    else if d is a killing definition:
+        # The chain terminates here — this def kills all previous defs
+        # of the same variable, so no earlier def can reach u.
+        stop
+    else:
+        # d is a nonkilling definition (e.g., an array store).
+        # Follow the def-def link to the previous def.
+        FollowChain(Chain[d], u)
+```
+
+### 3.5.2 The data structures
+
+**`Marked[d] = u`:** for each def `d`, store the *most recent use* `u` for which `d` was visited. If we're processing `d` again for the same `u`, skip — this is a cycle guard.
+
+**`Defs[u]`:** the set of definitions that reach `u`. This is the *full* set, not just the immediate reaching def.
+
+**`Chain[d]`:** for a non-killing def, the previous def of the same variable. This is the def-def link from §6.2.
+
+### 3.5.3 Killing vs. non-killing definitions
+
+**Killing definition:** a def that overwrites the entire variable. Once a killing def of `M` executes, no earlier def of `M` can reach any later use. The chain terminates.
+
+**Non-killing definition:** a def that partially updates the variable (e.g., an array store `A[i] = ...`). Earlier defs may still reach later uses through the parts that weren't overwritten. The chain follows the def-def link.
+
+For scalars, every def is killing. For arrays, stores are non-killing. **Phase 3 only handles scalars**, so every def is killing and the `else` branch is unreachable. But the machinery must be present for Phase 6 (array chains).
+
+### 3.5.4 The API
+
+```rust
+// src/fud/reaching.rs
+
+pub struct ReachingDefs {
+    /// For each use, the set of definitions that reach it.
+    pub defs: HashMap<UseId, HashSet<DefId>>,
+}
+
+pub fn find_reaching_defs(
+    cfg: &CFG,
+    chain: &FudChain,
+) -> ReachingDefs;
+```
+
+---
+
+## 3.6 FRUD chains (Factored Redef-Use chains)
+
+**Wolfe §6.7.5.** The mirror of FUD chains: instead of linking each use to its reaching def, link each *def* to the *uses* it reaches.
+
+### 3.6.1 The Υ-term (upsilon)
+
+The analogue of φ for uses. At a merge point, instead of merging defs, it merges uses.
+
+```
+Υ-term at block Z for variable M:
+    incoming: Vec<UseId>   # one per predecessor, in predecessor order
+```
+
+### 3.6.2 Algorithm FRUD-Chain
+
+The same structure as `Chain`, but tracking `CurrUse[M]` instead of `CurrDef[M]`. Every def is linked to the "current use" at its point.
+
+```
+procedure FRUD-Chain(cfg, Symbols):
+    for M in Symbols:
+        CurrUse[M] = ⊥
+    SearchReverse(Exit)
+
+procedure SearchReverse(X):
+    for each variable use or def or Υ-term R in X in reverse order:
+        M = variable at R
+        if R is a def:
+            DefUse[R] = CurrUse[M]
+        else if R is a use or Υ-term:
+            SaveUse[R] = CurrUse[M]
+            CurrUse[M] = R
+
+    for Y in PRED(X):
+        J = WhichSucc(Y → X)
+        for each Υ-term R in Y:
+            M = variable at R
+            Υ-Chain[R][J] = CurrUse[M]
+
+    for Y in Parent(X):
+        SearchReverse(Y)
+
+    for each variable use or def or Υ-term R in X in order:
+        M = variable at R
+        if R is a use or Υ-term:
+            CurrUse[M] = SaveUse[R]
+```
+
+### 3.6.3 When FRUD chains are needed
+
+**Anti-dependence.** A use of `M` followed by a def of `M` is an anti-dependence. FUD chains give you use → reaching def (flow dependence); FRUD chains give you def → reached uses (anti-dependence).
+
+**Phase 3 builds both**, but Phase 4 only uses FUD for IV detection and constant propagation. FRUD is used by Phase 5 (reduction detection) and SPP Layer 2 (scalar expansion).
+
+### 3.6.4 The API
+
+```rust
+// src/fud/frud.rs
+
+pub struct FrudChain {
+    pub def_to_use: HashMap<DefId, UseId>,
+    pub upsilon_incoming: HashMap<UpsilonId, Vec<UseId>>,
+    pub use_to_save: HashMap<UseId, Option<UseId>>,
+}
+
+pub fn construct_frud_chains(
+    cfg: &CFG,
+    dom: &DominatorTree,
+) -> FrudChain;
+```
+
+---
+
+## 3.7 The complete module structure
+
+```
+src/fud/
+├── mod.rs              (re-exports, top-level API)
+├── cfg.rs              (~400 lines — CFG construction from IR)
+├── dominators.rs       (~300 lines — Cooper-Harvey-Kennedy)
+├── placement.rs        (~250 lines — φ-placement via DF⁺)
+├── chain.rs            (~350 lines — Algorithm Chain)
+├── reaching.rs         (~300 lines — Algorithm FollowChain)
+└── frud.rs             (~300 lines — FRUD chains)
+```
+
+**Plus IR extensions:**
+
+```
+src/ir/scalar.rs        (~150 lines — ScalarVar, ScalarUse, ScalarDef, PhiTerm)
+src/ir/cfg.rs           (~150 lines — CFG, Block, Stmt)
+```
+
+**Total: ~2,200 lines.** The Phase 3 plan estimate was ~2,950; this is closer to the real number.
+
+---
+
+## 3.8 The certificate vocabulary
+
+Phase 3 must make FUD chains **certifiable**. The checker must be able to verify "this use reaches that def" by replaying the chain.
+
+### 3.8.1 The new witness variant
+
+```rust
+// certificate/mod.rs
+
+pub enum Witness {
+    // ... existing ...
+
+    /// Phase 3: a FUD chain, presented as evidence that a scalar use
+    /// reaches (or does not reach) a scalar definition.
+    ///
+    /// The chain itself is not verified by replay — it is *rebuilt* by
+    /// the checker from the CFG the certificate carries, and the
+    /// certificate's claim is that the rebuild produces the same result.
+    /// This mirrors the WithLoop discipline: the checker trusts nothing
+    /// the analyzer says about the chain; it re-derives the chain.
+    FudChainEvidence {
+        cfg: Box<CFG>,
+        /// The certificate asserts this specific use reaches this
+        /// specific def (or the use has no reaching def).
+        asserted_use: UseId,
+        asserted_def: Option<DefId>,
+    },
+}
+```
+
+### 3.8.2 The new claim type
+
+```rust
+pub enum Claim {
+    // ... existing ...
+
+    /// Phase 3: a scalar dependence claim. The claim says that a use
+    /// at one point reaches a def at another. This is a *value-based*
+    /// dependence — the flow of a scalar's value from def to use.
+    ScalarReach { use_id: UseId, def_id: DefId },
+
+    /// Phase 3: the negative form. The use has no reaching def (the
+    /// variable is uninitialized at this point, or all defs are
+    /// dominated by a killing definition).
+    ScalarNoReach { use_id: UseId },
+}
+```
+
+### 3.8.3 The checker arm
+
+The checker's `FudChainEvidence` arm:
+
+```
+procedure CheckFudChain(cert, loop_on_disk):
+    # Step 1: verify the carried CFG matches the loop on disk.
+    assert cfg_matches_loop(cert.cfg, loop_on_disk)
+
+    # Step 2: rebuild the FUD chain from scratch.
+    chain = construct_chains(cert.cfg)
+
+    # Step 3: verify the asserted link.
+    match cert.claim:
+        ScalarReach { use_id, def_id }:
+            actual_def = chain.use_to_def[use_id]
+            assert actual_def == def_id
+        ScalarNoReach { use_id }:
+            assert use_id ∉ chain.use_to_def
+```
+
+The **critical property:** the checker **rebuilds the chain from the CFG**, not from the analyzer's chain. If the analyzer claims a false link, the checker's rebuild finds a different link and rejects.
+
+This is the same "trust nothing" pattern as the rest of UDDP.
+
+### 3.8.4 Why carry the CFG
+
+The CFG is the ground truth for the chain. If the certificate carries the CFG, the checker can rebuild the chain without trusting the analyzer's chain construction. If the certificate did **not** carry the CFG, the checker would have to trust either the analyzer's chain or the file's implied CFG — and the file's CFG isn't well-defined without a frontend.
+
+**Carry the CFG. Rebuild the chain.**
+
+---
+
+## 3.9 Wiring into existing levels
+
+**Phase 3 does not change any existing level's decision procedure.** The chain is built alongside the array analysis; levels that don't need it continue to work unchanged.
+
+The first consumer is **Phase 4's `Induct`** (IV detection) and `ConstantProp`. Phase 3 exposes the API; Phase 4 calls it.
+
+**But** Phase 3 should wire the FUD chain into a place where it can be verified end-to-end. The natural place is a **new top-level entry point** in `src/decide/mod.rs`:
+
+```rust
+pub fn decide_with_scalars(
+    loop_: &Loop,
+    p: usize,
+    q: usize,
+) -> (Decision, Option<Certificate>);
+```
+
+This builds the FUD chain first, then delegates to the existing dispatcher. Levels that ignore scalars return the same answer; levels that use them (Phase 4+) see the chain in a thread-local or passed as a parameter.
+
+**Defer the wiring to Phase 4.** Phase 3 only needs the module and its tests.
+
+---
+
+## 3.10 Test coverage
+
+Every algorithm in Phase 3 gets a **brute-force differential fuzz test**, same discipline as Phases 1–2.
+
+### 3.10.1 CFG construction
+
+| Test | What it verifies |
+|---|---|
+| `cfg_single_block_is_trivial` | a loop with no branches produces a 3-block CFG (entry, body, exit) |
+| `cfg_from_ir_preserves_statement_order` | statements appear in the block in IR order |
+| `cfg_succ_pred_are_consistent` | if `X → Y`, then `X ∈ preds(Y)` and `Y ∈ succs(X)` |
+| `fuzz_cfg_well_formed` | random CFGs satisfy the invariants |
+
+### 3.10.2 Dominators
+
+| Test | What it verifies |
+|---|---|
+| `dom_entry_dominates_everything` | `Entry ∈ DOM(X)` for all X |
+| `dom_reflexive` | `X ∈ DOM(X)` |
+| `dom_idom_is_immediate` | `idom[X]` is the closest dominator |
+| `fuzz_dominators_brute_force` | for random CFGs, compare against a brute-force "is there a path avoiding X" oracle |
+| `fuzz_idom_vs_dom` | `idom[X]` is the unique element of `DOM(X) \ {X}` that dominates all others in `DOM(X)` |
+| `fuzz_df_brute_force` | compare against the definition: `Z ∈ DF(X)` iff some pred of `Z` is dominated by `X` and some isn't |
+| `fuzz_df_plus_is_transitive_closure` | `DF⁺(X)` is the transitive closure of `DF` from `X` |
+
+### 3.10.3 φ-placement
+
+| Test | What it verifies |
+|---|---|
+| `phi_at_single_def_is_none` | one def, no φ-term |
+| `phi_at_two_defs_in_branches` | two defs in different branches, one φ-term at the merge |
+| `phi_at_nested_branches` | nested branches, φ-terms at each merge |
+| `fuzz_phi_placement_vs_bruteforce` | for random CFGs, compute `J⁺` by brute force (enumerate all pairs of disjoint paths) and compare with `DF⁺` |
+| `fuzz_phi_no_duplicates` | each variable gets at most one φ-term per block |
+
+### 3.10.4 Chain construction
+
+| Test | What it verifies |
+|---|---|
+| `chain_linear_is_simple` | a linear chain of defs → all uses link to the immediately preceding def |
+| `chain_branch_takes_correct_def` | a use in the true branch sees the true branch's def |
+| `chain_merge_goes_through_phi` | a use after a merge sees the φ-term |
+| `chain_reverse_pass_restores` | the reverse pass restores `CurrDef` correctly |
+| `fuzz_chain_vs_bruteforce` | brute-force reachability: "does the def reach the use along some CFG path with no intervening def?" — compare |
+| `fuzz_chain_every_use_has_a_def_or_is_uninit` | every use either has a reaching def or is provably unreachable |
+
+### 3.10.5 Reaching definitions
+
+| Test | What it verifies |
+|---|---|
+| `reaching_single_def` | one def, every use sees it |
+| `reaching_killed_by_overwrite` | a second def kills the first for later uses |
+| `reaching_through_phi` | a use after a merge sees all defs reaching the φ-term |
+| `reaching_branch_conditional` | only defs from the taken branch are in `Defs[u]` |
+| `fuzz_reaching_vs_bruteforce` | for random CFGs, enumerate all paths and compare |
+
+### 3.10.6 FRUD chains
+
+| Test | What it verifies |
+|---|---|
+| `frud_linear` | linear defs, each links to the next use |
+| `frud_branch` | a def in the true branch links to uses in the true branch |
+| `frud_merge_uses_upsilon` | a def before a merge links to the Υ-term at the merge |
+| `fuzz_frud_vs_bruteforce` | brute-force: "does the def's value reach the use along some CFG path with no intervening def?" |
+
+### 3.10.7 End-to-end
+
+| Test | What it verifies |
+|---|---|
+| `fuzz_fud_chain_checker_roundtrip` | for random CFGs, build a chain, emit a `FudChainEvidence` certificate, run the checker, expect ACCEPT |
+| `fuzz_fud_chain_seeded_bug` | seed a bug in `Chain` (skip the reverse pass); confirm thousands of rejections; revert; confirm 0 |
+
+### 3.10.8 Total fuzz coverage
+
+| Algorithm | Fuzz tests | Approx. cases per test |
+|---|---|---|
+| CFG | 4 | 1000 |
+| Dominators | 4 | 1000 |
+| φ-placement | 2 | 1000 |
+| Chain | 3 | 1000 |
+| Reaching defs | 3 | 1000 |
+| FRUD | 2 | 1000 |
+| End-to-end | 2 | 1000 |
+| **Total** | **20** | **~20,000 cases** |
+
+Each fuzz test compares against a brute-force oracle:
+- **Dominators:** "does every path from entry to X pass through Y?" — enumerate all paths up to length N
+- **φ-placement:** enumerate all pairs of disjoint paths from defs to a candidate merge point
+- **Chain:** for each use, brute-force enumerate all defs that could reach it without an intervening killing def
+- **FRUD:** symmetric
+
+The brute-force oracles are shared and their own correctness is verified by hand-written unit tests on small fixed CFGs.
+
+---
+
+## 3.11 The risk register
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| `Chain` skips the reverse pass | wrong chains on any CFG with branches | `fuzz_chain_vs_bruteforce` catches it; explicit test `chain_reverse_pass_restores` |
+| `WhichPred` computed wrong | φ-terms get incoming defs in the wrong order | `fuzz_phi_incoming_order_matches_preds` |
+| `Placement` misses a φ-term | use after merge has no reaching def | `fuzz_chain_every_use_has_a_def_or_is_uninit` |
+| `Placement` places extra φ-terms | unnecessary φ-terms | `fuzz_phi_no_duplicates` |
+| Dominance frontier off-by-one | wrong φ-placement | `fuzz_df_brute_force` |
+| `CFG` has a cycle that isn't a loop | infinite recursion in `Search` | CFG construction guarantees acyclic except for the loop back edge |
+| CFG construction from IR loses statement order | wrong chains | `cfg_from_ir_preserves_statement_order` |
+| `FudChainEvidence` certificate lets the analyzer smuggle a bad chain | checker accepts a false claim | checker **rebuilds** the chain from the carried CFG; never trusts the analyzer's chain |
+
+The last row is the most important. The `FudChainEvidence` witness must carry the CFG, and the checker must **rebuild** the chain, not trust the analyzer's chain. This is the same discipline as `WithLoop` and `CrossLoopSolution`: the certificate carries the ground truth, and the checker re-derives everything.
+
+---
+
+## 3.12 The sub-phase breakdown
+
+| Sub-phase | What | Lines | Weeks |
+|---|---|---|---|
+| 3.1 | IR extensions (`scalar.rs`, `cfg.rs`) + CFG construction | 700 | 2 |
+| 3.2 | Dominators + dominance frontiers | 550 | 1.5 |
+| 3.3 | φ-placement (DF⁺) | 400 | 1 |
+| 3.4 | Chain construction | 550 | 1.5 |
+| 3.5 | Reaching definitions | 450 | 1 |
+| 3.6 | FRUD chains | 450 | 1 |
+| 3.7 | Certificate vocabulary (`FudChainEvidence`, `ScalarReach`, `ScalarNoReach`) + checker arm | 500 | 1.5 |
+| 3.8 | 20 fuzz tests | 800 | 2 |
+| **Total** | | **~4,400** | **~11.5** |
+
+The Phase 3 plan said ~2,950 lines / 8.5 weeks. The real estimate is closer to **4,400 lines / 11.5 weeks** because:
+- The IR extension is real work (the current IR has no statements)
+- The certificate vocabulary is significant (rebuilding the chain in the checker requires exposing the chain constructor)
+- 20 fuzz tests each need their own brute-force oracle
+- The seed-and-revert validation for each fuzzer is time-consuming
+
+Multiply by 1.5–2× for reality: **6,600–8,800 lines / 17–23 weeks**.
+
+---
+
+## 3.13 What Phase 3 unlocks
+
+After Phase 3:
+
+- Every scalar use in a loop body is linked to its reaching definition
+- Every definition is linked to the previous definition of the same variable
+- Every merge point has a φ-term (or provably doesn't need one)
+- FRUD chains give the reverse direction (def → reached uses)
+- The whole thing is **certified** — the checker rebuilds the chain from the CFG the certificate carries
+
+**What Phase 3 does NOT unlock:**
+- IV detection (still needed for M3, M5, M8 rewrites)
+- Constant propagation (still needed for precise bounds)
+- Scalar dependence (still needed for scalar-level answers)
+
+Those are Phase 4. Phase 3 is the data structure; Phase 4 is the analysis on top of it.
+
+**The single most important consumer:** Phase 4's `Algorithm Induct`. Without FUD chains, `Induct` has no graph to search for SCCs. Without `Induct`, the analyzer's IV detection remains the hand-coded special cases in M3/M5/M8 — which don't generalize.
+
+---
+
+## 3.14 The one-paragraph summary
+
+> **Phase 3 builds the Factored Use-Def chain — the graph-theoretic structure that links every scalar use to its reaching definition, with φ-terms merging definitions at control-flow joins. It has six modules: `cfg.rs` (CFG construction from IR), `dominators.rs` (Cooper-Harvey-Kennedy dominator tree + dominance frontiers), `placement.rs` (φ-placement via iterated dominance frontier DF⁺, using Wolfe's theorem DF⁺(S) = J⁺(S)), `chain.rs` (Algorithm Chain — the forward pass linking uses to defs, with a reverse pass restoring `CurrDef` on the way back up), `reaching.rs` (Algorithm FollowChain — enumerating all definitions reaching a use, with cycle-guarding via per-use marked sets), and `frud.rs` (FRUD chains — the mirror, linking defs to uses with Υ-terms). The certificate carries a `Witness::FudChainEvidence { cfg, asserted_use, asserted_def }` and the checker **rebuilds the chain** from the CFG rather than trusting the analyzer's chain — the same "trust nothing" discipline as `WithLoop` and `CrossLoopSolution`. The claim vocabulary adds `Claim::ScalarReach { use_id, def_id }` and `Claim::ScalarNoReach { use_id }`. ~4,400 lines, ~11.5 weeks ideal, multiply by 1.5–2× for reality. ~20 fuzz tests, each with a brute-force oracle. The biggest single risk is `Chain` skipping the reverse pass — the classic bug that produces wrong chains on every CFG with branching. The most important consumer is Phase 4's `Algorithm Induct`: without FUD chains, IV detection has no graph to search, and the analyzer's scalar handling remains the hand-coded special cases in M3/M5/M8. Phase 3 does not change any existing level's decision procedure; it builds the data structure that Phase 4 will consume.**

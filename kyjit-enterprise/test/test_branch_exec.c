@@ -1,0 +1,790 @@
+/*
+ * test_branch_exec.c — verify IR_IF executes the correct branch.
+ *
+ * Only tests that branches RUN correctly. Emits a function that
+ * takes a condition as param0 and returns different values based
+ * on it. Uses IR_IF + two IR_RETURN nodes.
+ */
+
+#include "kyjit_ir.h"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <stdint.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+/* Build: if (param0) return 42; else return 99; */
+static KyGraph *build_if_else_ret(void) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *cond = kyir_node_create(g, IR_PARAMETER);
+    cond->constant.i64 = 0;
+    cond->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, cond);
+
+    KyNode *then_lbl = kyir_build_label(b);
+    KyNode *else_lbl = kyir_build_label(b);
+
+    /* use_current_block: after IF, the builder starts a new block.
+     * Add subsequent nodes to b->current_block, not the stale b0. */
+    kyir_build_if(b, cond, then_lbl, else_lbl);
+
+    /* then block: return 42 */
+    KyBlock *then_blk = b->current_block;
+    kyir_block_add_node(then_blk, then_lbl);
+    KyNode *v42 = kyir_const_i64(g, 42);
+    kyir_block_add_node(then_blk, v42);
+    KyNode *ret1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret1, v42);
+    kyir_node_add_use(v42, ret1);
+    kyir_block_add_node(then_blk, ret1);
+    then_blk->terminator = ret1;
+
+    /* else block: return 99 */
+    KyBlock *else_blk = kyir_builder_new_block(b);
+    kyir_block_add_node(else_blk, else_lbl);
+    KyNode *v99 = kyir_const_i64(g, 99);
+    kyir_block_add_node(else_blk, v99);
+    KyNode *ret2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret2, v99);
+    kyir_node_add_use(v99, ret2);
+    kyir_block_add_node(else_blk, ret2);
+    else_blk->terminator = ret2;
+
+    kyir_builder_destroy(b);
+    return g;
+}
+
+static int64_t run1(KyGraph *g, int64_t arg, uint8_t *bytes, size_t *blen) {
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return -999999;
+
+    size_t len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &len);
+    if (rc != 0) { munmap(code, 4096); return -999999; }
+
+    if (bytes && blen) {
+        size_t n = (*blen < 64) ? *blen : 64;
+        __builtin_memcpy(bytes, code, n);
+        *blen = len;
+    }
+
+    typedef int64_t (*Fn1)(int64_t);
+    Fn1 f = (Fn1)code;
+    int64_t r = f(arg);
+    munmap(code, 4096);
+    return r;
+}
+
+/* Compile once, return the raw code page for repeated calls */
+static void *compile_once(KyGraph *g, size_t *len_out) {
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return NULL;
+    size_t len = 0;
+    if (kyx64_compile(g, (uint8_t *)code, 4096, &len) != 0) {
+        munmap(code, 4096);
+        return NULL;
+    }
+    *len_out = len;
+    return code;
+}
+
+
+/* ============================================================
+ * Extended branch tests
+ * ============================================================ */
+
+/* Test 2: nested if — two params, four outcomes
+ *
+ *   if (a) {
+ *       if (b) return 100;
+ *       else return 200;
+ *   } else {
+ *       return 300;
+ *   }
+ */
+static void test_nested_if(void) {
+    printf("\n[Test 2: nested if(a, b)]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0; a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+    KyNode *bv = kyir_node_create(g, IR_PARAMETER);
+    bv->constant.i64 = 1; bv->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, bv);
+
+    /* Outer IF: a ? outer_then : outer_else */
+    KyNode *outer_then = kyir_build_label(b);
+    KyNode *outer_else = kyir_build_label(b);
+    kyir_build_if(b, a, outer_then, outer_else);
+
+    /* Outer then: inner IF: b ? return 100 : return 200 */
+    KyBlock *ot_blk = b->current_block;
+    kyir_block_add_node(ot_blk, outer_then);
+    KyNode *inner_then = kyir_build_label(b);
+    KyNode *inner_else = kyir_build_label(b);
+    kyir_build_if(b, bv, inner_then, inner_else);
+
+    /* inner then: return 100 */
+    KyBlock *it_blk = b->current_block;
+    kyir_block_add_node(it_blk, inner_then);
+    KyNode *v100 = kyir_const_i64(g, 100);
+    kyir_block_add_node(it_blk, v100);
+    KyNode *r100 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r100, v100);
+    kyir_node_add_use(v100, r100);
+    kyir_block_add_node(it_blk, r100);
+
+    /* inner else: return 200 */
+    KyBlock *ie_blk = kyir_builder_new_block(b);
+    kyir_block_add_node(ie_blk, inner_else);
+    KyNode *v200 = kyir_const_i64(g, 200);
+    kyir_block_add_node(ie_blk, v200);
+    KyNode *r200 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r200, v200);
+    kyir_node_add_use(v200, r200);
+    kyir_block_add_node(ie_blk, r200);
+
+    /* Outer else: return 300 */
+    KyBlock *oe_blk = kyir_builder_new_block(b);
+    kyir_block_add_node(oe_blk, outer_else);
+    KyNode *v300 = kyir_const_i64(g, 300);
+    kyir_block_add_node(oe_blk, v300);
+    KyNode *r300 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r300, v300);
+    kyir_node_add_use(v300, r300);
+    kyir_block_add_node(oe_blk, r300);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("nested: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn2)(int64_t, int64_t);
+        Fn2 f = (Fn2)code;
+        int64_t r11 = f(1, 1);   /* expect 100 */
+        int64_t r10 = f(1, 0);   /* expect 200 */
+        int64_t r01 = f(0, 1);   /* expect 300 */
+        int64_t r00 = f(0, 0);   /* expect 300 */
+        printf("  f(1,1) = %ld (expect 100)\n", (long)r11);
+        printf("  f(1,0) = %ld (expect 200)\n", (long)r10);
+        printf("  f(0,1) = %ld (expect 300)\n", (long)r01);
+        printf("  f(0,0) = %ld (expect 300)\n", (long)r00);
+        TEST("nested f(1,1) == 100", r11 == 100);
+        TEST("nested f(1,0) == 200", r10 == 200);
+        TEST("nested f(0,1) == 300", r01 == 300);
+        TEST("nested f(0,0) == 300", r00 == 300);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 3: else-if chain
+ *
+ *   if (a == 1) return 10;
+ *   else if (a == 2) return 20;
+ *   else return 30;
+ */
+static void test_else_if_chain(void) {
+    printf("\n[Test 3: else-if chain]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0; a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+
+    KyNode *c1 = kyir_const_i64(g, 1);
+    kyir_block_add_node(b0, c1);
+    KyNode *c2 = kyir_const_i64(g, 2);
+    kyir_block_add_node(b0, c2);
+
+    KyNode *eq1 = kyir_cmp_eq(g, a, c1);
+    kyir_block_add_node(b0, eq1);
+    KyNode *eq2 = kyir_cmp_eq(g, a, c2);
+    kyir_block_add_node(b0, eq2);
+
+    KyNode *lbl_1 = kyir_build_label(b);   /* a==1: return 10 */
+    KyNode *lbl_2 = kyir_build_label(b);   /* a==2: return 20 */
+    KyNode *lbl_3 = kyir_build_label(b);   /* else: return 30 */
+
+    kyir_build_if(b, eq1, lbl_1, lbl_2);
+
+    /* lbl_2 block: check eq2 */
+    KyBlock *blk2 = b->current_block;
+    /* Wait — we want lbl_2 to be the start of the else branch of the FIRST if.
+     * But kyir_build_if's new block represents the "then" fallthrough (lbl_1).
+     * We need to explicitly make a block for lbl_2. */
+    (void)blk2;
+
+    /* then branch (lbl_1): return 10 */
+    KyBlock *then1 = b->current_block;
+    kyir_block_add_node(then1, lbl_1);
+    KyNode *v10 = kyir_const_i64(g, 10);
+    kyir_block_add_node(then1, v10);
+    KyNode *r10 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r10, v10);
+    kyir_node_add_use(v10, r10);
+    kyir_block_add_node(then1, r10);
+
+    /* else branch: start with lbl_2, then another if (eq2) */
+    KyBlock *else1 = kyir_builder_new_block(b);
+    kyir_block_add_node(else1, lbl_2);
+
+    KyNode *lbl_2_then = kyir_build_label(b);
+    KyNode *lbl_2_else = kyir_build_label(b);
+    kyir_build_if(b, eq2, lbl_2_then, lbl_2_else);
+
+    /* lbl_2_then: return 20 */
+    KyBlock *then2 = b->current_block;
+    kyir_block_add_node(then2, lbl_2_then);
+    KyNode *v20 = kyir_const_i64(g, 20);
+    kyir_block_add_node(then2, v20);
+    KyNode *r20 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r20, v20);
+    kyir_node_add_use(v20, r20);
+    kyir_block_add_node(then2, r20);
+
+    /* lbl_2_else: return 30 */
+    KyBlock *else2 = kyir_builder_new_block(b);
+    kyir_block_add_node(else2, lbl_2_else);
+    KyNode *v30 = kyir_const_i64(g, 30);
+    kyir_block_add_node(else2, v30);
+    KyNode *r30 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r30, v30);
+    kyir_node_add_use(v30, r30);
+    kyir_block_add_node(else2, r30);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("else-if: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn1)(int64_t);
+        Fn1 f = (Fn1)code;
+        int64_t r1 = f(1);
+        int64_t r2 = f(2);
+        int64_t r99 = f(99);
+        printf("  f(1) = %ld (expect 10)\n", (long)r1);
+        printf("  f(2) = %ld (expect 20)\n", (long)r2);
+        printf("  f(99) = %ld (expect 30)\n", (long)r99);
+        TEST("else-if f(1) == 10", r1 == 10);
+        TEST("else-if f(2) == 20", r2 == 20);
+        TEST("else-if f(99) == 30", r99 == 30);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 4: multiple early returns
+ *
+ *   if (a) return 1;
+ *   if (b) return 2;
+ *   if (c) return 3;
+ *   return 4;
+ */
+static void test_multi_return(void) {
+    printf("\n[Test 4: multiple early returns]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+    KyNode *pb = kyir_node_create(g, IR_PARAMETER);
+    pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pb);
+    KyNode *pc = kyir_node_create(g, IR_PARAMETER);
+    pc->constant.i64 = 2; pc->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pc);
+
+    KyNode *lbl_a = kyir_build_label(b);   /* a true → return 1 */
+    KyNode *lbl_b = kyir_build_label(b);   /* a false → check b */
+    kyir_build_if(b, pa, lbl_a, lbl_b);
+
+    /* lbl_a: return 1 */
+    KyBlock *blk_a = b->current_block;
+    kyir_block_add_node(blk_a, lbl_a);
+    KyNode *v1 = kyir_const_i64(g, 1);
+    kyir_block_add_node(blk_a, v1);
+    KyNode *r1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r1, v1);
+    kyir_node_add_use(v1, r1);
+    kyir_block_add_node(blk_a, r1);
+
+    /* lbl_b: check b */
+    KyBlock *blk_b = kyir_builder_new_block(b);
+    kyir_block_add_node(blk_b, lbl_b);
+    KyNode *lbl_bb = kyir_build_label(b);   /* b true → return 2 */
+    KyNode *lbl_c = kyir_build_label(b);    /* b false → check c */
+    kyir_build_if(b, pb, lbl_bb, lbl_c);
+
+    /* lbl_bb: return 2 */
+    KyBlock *blk_bb = b->current_block;
+    kyir_block_add_node(blk_bb, lbl_bb);
+    KyNode *v2 = kyir_const_i64(g, 2);
+    kyir_block_add_node(blk_bb, v2);
+    KyNode *r2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r2, v2);
+    kyir_node_add_use(v2, r2);
+    kyir_block_add_node(blk_bb, r2);
+
+    /* lbl_c: check c */
+    KyBlock *blk_c = kyir_builder_new_block(b);
+    kyir_block_add_node(blk_c, lbl_c);
+    KyNode *lbl_cc = kyir_build_label(b);   /* c true → return 3 */
+    KyNode *lbl_ret4 = kyir_build_label(b); /* c false → return 4 */
+    kyir_build_if(b, pc, lbl_cc, lbl_ret4);
+
+    /* lbl_cc: return 3 */
+    KyBlock *blk_cc = b->current_block;
+    kyir_block_add_node(blk_cc, lbl_cc);
+    KyNode *v3 = kyir_const_i64(g, 3);
+    kyir_block_add_node(blk_cc, v3);
+    KyNode *r3 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r3, v3);
+    kyir_node_add_use(v3, r3);
+    kyir_block_add_node(blk_cc, r3);
+
+    /* lbl_ret4: return 4 */
+    KyBlock *blk_ret4 = kyir_builder_new_block(b);
+    kyir_block_add_node(blk_ret4, lbl_ret4);
+    KyNode *v4 = kyir_const_i64(g, 4);
+    kyir_block_add_node(blk_ret4, v4);
+    KyNode *r4 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r4, v4);
+    kyir_node_add_use(v4, r4);
+    kyir_block_add_node(blk_ret4, r4);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("multi-return: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+        Fn3 f = (Fn3)code;
+        int64_t ra = f(1, 0, 0);   /* expect 1 */
+        int64_t rb = f(0, 1, 0);   /* expect 2 */
+        int64_t rc = f(0, 0, 1);   /* expect 3 */
+        int64_t rd = f(0, 0, 0);   /* expect 4 */
+        printf("  f(1,0,0) = %ld (expect 1)\n", (long)ra);
+        printf("  f(0,1,0) = %ld (expect 2)\n", (long)rb);
+        printf("  f(0,0,1) = %ld (expect 3)\n", (long)rc);
+        printf("  f(0,0,0) = %ld (expect 4)\n", (long)rd);
+        TEST("multi f(1,0,0) == 1", ra == 1);
+        TEST("multi f(0,1,0) == 2", rb == 2);
+        TEST("multi f(0,0,1) == 3", rc == 3);
+        TEST("multi f(0,0,0) == 4", rd == 4);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 5: branch with computation in each arm
+ *
+ *   if (cond) return a + b;
+ *   else      return a * b;
+ */
+static void test_branch_with_computation(void) {
+    printf("\n[Test 5: branch with computation]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *cond = kyir_node_create(g, IR_PARAMETER);
+    cond->constant.i64 = 0; cond->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, cond);
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 1; pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+    KyNode *pb = kyir_node_create(g, IR_PARAMETER);
+    pb->constant.i64 = 2; pb->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pb);
+
+    KyNode *lbl_then = kyir_build_label(b);
+    KyNode *lbl_else = kyir_build_label(b);
+    kyir_build_if(b, cond, lbl_then, lbl_else);
+
+    /* then: return a + b */
+    KyBlock *tb = b->current_block;
+    kyir_block_add_node(tb, lbl_then);
+    KyNode *sum = kyir_add(g, pa, pb);
+    kyir_block_add_node(tb, sum);
+    KyNode *r1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r1, sum);
+    kyir_node_add_use(sum, r1);
+    kyir_block_add_node(tb, r1);
+
+    /* else: return a * b */
+    KyBlock *eb = kyir_builder_new_block(b);
+    kyir_block_add_node(eb, lbl_else);
+    KyNode *prod = kyir_mul(g, pa, pb);
+    kyir_block_add_node(eb, prod);
+    KyNode *r2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r2, prod);
+    kyir_node_add_use(prod, r2);
+    kyir_block_add_node(eb, r2);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("branch-compute: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+        Fn3 f = (Fn3)code;
+        int64_t ra = f(1, 10, 5);   /* 10 + 5 = 15 */
+        int64_t rb = f(0, 10, 5);   /* 10 * 5 = 50 */
+        printf("  f(1,10,5) = %ld (expect 15)\n", (long)ra);
+        printf("  f(0,10,5) = %ld (expect 50)\n", (long)rb);
+        TEST("compute f(1,10,5) == 15", ra == 15);
+        TEST("compute f(0,10,5) == 50", rb == 50);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 6: shared value computed before the branch
+ *
+ *   s = a + b;
+ *   if (cond) return s + 1;
+ *   else      return s - 1;
+ */
+static void test_shared_value(void) {
+    printf("\n[Test 6: shared value across branches]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *cond = kyir_node_create(g, IR_PARAMETER);
+    cond->constant.i64 = 0; cond->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, cond);
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 1; pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+    KyNode *pb = kyir_node_create(g, IR_PARAMETER);
+    pb->constant.i64 = 2; pb->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pb);
+
+    /* hoist_verification: deliberately BROKEN order.
+     * `one` created after the IF, before the terminator. The hoisting
+     * pass should still move it to the correct block. */
+    KyNode *sum = kyir_add(g, pa, pb);
+    kyir_block_add_node(b0, sum);
+
+    KyNode *lbl_then = kyir_build_label(b);
+    KyNode *lbl_else = kyir_build_label(b);
+    kyir_build_if(b, cond, lbl_then, lbl_else);
+
+    KyNode *one = kyir_const_i64(g, 1);
+    kyir_block_add_node(b0, one);
+
+    /* then: return sum + 1 */
+    KyBlock *tb = b->current_block;
+    kyir_block_add_node(tb, lbl_then);
+    KyNode *up = kyir_add(g, sum, one);
+    kyir_block_add_node(tb, up);
+    KyNode *r1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r1, up);
+    kyir_node_add_use(up, r1);
+    kyir_block_add_node(tb, r1);
+
+    /* else: return sum - 1 */
+    KyBlock *eb = kyir_builder_new_block(b);
+    kyir_block_add_node(eb, lbl_else);
+    KyNode *down = kyir_sub(g, sum, one);
+    kyir_block_add_node(eb, down);
+    KyNode *r2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r2, down);
+    kyir_node_add_use(down, r2);
+    kyir_block_add_node(eb, r2);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("shared-value: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+        Fn3 f = (Fn3)code;
+        int64_t ra = f(1, 100, 200);   /* 300 + 1 = 301 */
+        int64_t rb = f(0, 100, 200);   /* 300 - 1 = 299 */
+        printf("  f(1,100,200) = %ld (expect 301)\n", (long)ra);
+        printf("  f(0,100,200) = %ld (expect 299)\n", (long)rb);
+        TEST("shared f(1,100,200) == 301", ra == 301);
+        TEST("shared f(0,100,200) == 299", rb == 299);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 7: two arms that compute the same number of operations
+ *
+ *   if (cond) return (a + 5) * 2;
+ *   else      return (a + 5) / 2;
+ */
+static void test_parallel_arms(void) {
+    printf("\n[Test 7: parallel computation arms]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *cond = kyir_node_create(g, IR_PARAMETER);
+    cond->constant.i64 = 0; cond->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, cond);
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 1; pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+
+    KyNode *five = kyir_const_i64(g, 5);
+    kyir_block_add_node(b0, five);
+    KyNode *two = kyir_const_i64(g, 2);
+    kyir_block_add_node(b0, two);
+    KyNode *base = kyir_add(g, pa, five);
+    kyir_block_add_node(b0, base);
+
+    KyNode *lbl_then = kyir_build_label(b);
+    KyNode *lbl_else = kyir_build_label(b);
+    kyir_build_if(b, cond, lbl_then, lbl_else);
+
+    /* then: (a+5) * 2 */
+    KyBlock *tb = b->current_block;
+    kyir_block_add_node(tb, lbl_then);
+    KyNode *prod = kyir_mul(g, base, two);
+    kyir_block_add_node(tb, prod);
+    KyNode *r1 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r1, prod);
+    kyir_node_add_use(prod, r1);
+    kyir_block_add_node(tb, r1);
+
+    /* else: (a+5) / 2 */
+    KyBlock *eb = kyir_builder_new_block(b);
+    kyir_block_add_node(eb, lbl_else);
+    KyNode *quot = kyir_div(g, base, two);
+    kyir_block_add_node(eb, quot);
+    KyNode *r2 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r2, quot);
+    kyir_node_add_use(quot, r2);
+    kyir_block_add_node(eb, r2);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("parallel-arms: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn2)(int64_t, int64_t);
+        Fn2 f = (Fn2)code;
+        int64_t ra = f(1, 15);   /* (15+5)*2 = 40 */
+        int64_t rb = f(0, 15);   /* (15+5)/2 = 10 */
+        printf("  f(1,15) = %ld (expect 40)\n", (long)ra);
+        printf("  f(0,15) = %ld (expect 10)\n", (long)rb);
+        TEST("parallel f(1,15) == 40", ra == 40);
+        TEST("parallel f(0,15) == 10", rb == 10);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+/* Test 8: three-level nested if
+ *
+ *   if (a) {
+ *       if (b) {
+ *           if (c) return 111;
+ *           else   return 110;
+ *       } else {
+ *           return 100;
+ *       }
+ *   } else {
+ *       return 0;
+ *   }
+ */
+static void test_deep_nesting(void) {
+    printf("\n[Test 8: 3-level nested if]\n");
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *b = kyir_builder_create(g);
+    kyir_builder_set_block(b, b0);
+
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+    KyNode *pb = kyir_node_create(g, IR_PARAMETER);
+    pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pb);
+    KyNode *pc = kyir_node_create(g, IR_PARAMETER);
+    pc->constant.i64 = 2; pc->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pc);
+
+    KyNode *la = kyir_build_label(b);   /* a: then */
+    KyNode *lea = kyir_build_label(b);  /* a: else → return 0 */
+    kyir_build_if(b, pa, la, lea);
+
+    /* a then: if b → lb else leb(return 100) */
+    KyBlock *a_then = b->current_block;
+    kyir_block_add_node(a_then, la);
+    KyNode *lb = kyir_build_label(b);
+    KyNode *leb = kyir_build_label(b);
+    kyir_build_if(b, pb, lb, leb);
+
+    /* b then: if c → lc else lec(110) */
+    KyBlock *b_then = b->current_block;
+    kyir_block_add_node(b_then, lb);
+    KyNode *lc = kyir_build_label(b);
+    KyNode *lec = kyir_build_label(b);
+    kyir_build_if(b, pc, lc, lec);
+
+    /* c then: return 111 */
+    KyBlock *c_then = b->current_block;
+    kyir_block_add_node(c_then, lc);
+    KyNode *v111 = kyir_const_i64(g, 111);
+    kyir_block_add_node(c_then, v111);
+    KyNode *r111 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r111, v111);
+    kyir_node_add_use(v111, r111);
+    kyir_block_add_node(c_then, r111);
+
+    /* c else: return 110 */
+    KyBlock *c_else = kyir_builder_new_block(b);
+    kyir_block_add_node(c_else, lec);
+    KyNode *v110 = kyir_const_i64(g, 110);
+    kyir_block_add_node(c_else, v110);
+    KyNode *r110 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r110, v110);
+    kyir_node_add_use(v110, r110);
+    kyir_block_add_node(c_else, r110);
+
+    /* b else: return 100 */
+    KyBlock *b_else = kyir_builder_new_block(b);
+    kyir_block_add_node(b_else, leb);
+    KyNode *v100 = kyir_const_i64(g, 100);
+    kyir_block_add_node(b_else, v100);
+    KyNode *r100 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r100, v100);
+    kyir_node_add_use(v100, r100);
+    kyir_block_add_node(b_else, r100);
+
+    /* a else: return 0 */
+    KyBlock *a_else = kyir_builder_new_block(b);
+    kyir_block_add_node(a_else, lea);
+    KyNode *v0 = kyir_const_i64(g, 0);
+    kyir_block_add_node(a_else, v0);
+    KyNode *r0 = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(r0, v0);
+    kyir_node_add_use(v0, r0);
+    kyir_block_add_node(a_else, r0);
+
+    size_t len = 0;
+    void *code = compile_once(g, &len);
+    TEST("deep-nest: compiled", code != NULL);
+
+    if (code) {
+        typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+        Fn3 f = (Fn3)code;
+        int64_t r111 = f(1, 1, 1);   /* 111 */
+        int64_t r110 = f(1, 1, 0);   /* 110 */
+        int64_t r100 = f(1, 0, 1);   /* 100 */
+        int64_t r0   = f(0, 1, 1);   /* 0 */
+        printf("  f(1,1,1) = %ld (expect 111)\n", (long)r111);
+        printf("  f(1,1,0) = %ld (expect 110)\n", (long)r110);
+        printf("  f(1,0,1) = %ld (expect 100)\n", (long)r100);
+        printf("  f(0,1,1) = %ld (expect 0)\n",   (long)r0);
+        TEST("deep f(1,1,1) == 111", r111 == 111);
+        TEST("deep f(1,1,0) == 110", r110 == 110);
+        TEST("deep f(1,0,1) == 100", r100 == 100);
+        TEST("deep f(0,1,1) == 0",   r0   == 0);
+        munmap(code, 4096);
+    }
+
+    kyir_builder_destroy(b);
+    kyir_graph_destroy(g);
+}
+
+int main(void) {
+    printf("KYJIT Branch Execution Test v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n");
+
+    printf("\n[if (a) return 42; else return 99;]\n");
+    KyGraph *g = build_if_else_ret();
+    uint8_t bytes[64]; size_t len = 64;
+
+    /* single_compile: compile once, call twice. Re-compiling the same
+     * graph uses stale label ids (n->reg) that no longer exist on the
+     * fresh backend, so branches vanish. */
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    TEST("mmap", code != MAP_FAILED);
+
+    size_t code_len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &code_len);
+    printf("  compile rc=%d len=%zu\n", rc, code_len);
+    TEST("compiled", rc == 0);
+
+    if (rc == 0) {
+        printf("  bytes (%zu): ", code_len);
+        for (size_t i = 0; i < code_len && i < 40; i++)
+            printf("%02x ", ((uint8_t*)code)[i]);
+        printf("\n");
+
+        typedef int64_t (*Fn1)(int64_t);
+        Fn1 f = (Fn1)code;
+
+        int64_t r1 = f(1);
+        printf("  f(1) = %ld (expect 42)\n", (long)r1);
+        TEST("f(1) == 42", r1 == 42);
+
+        int64_t r0 = f(0);
+        printf("  f(0) = %ld (expect 99)\n", (long)r0);
+        TEST("f(0) == 99", r0 == 99);
+    }
+
+    munmap(code, 4096);
+    kyir_graph_destroy(g);
+
+    test_nested_if();
+    test_else_if_chain();
+    test_multi_return();
+    test_branch_with_computation();
+    test_shared_value();
+    test_parallel_arms();
+    test_deep_nesting();
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+    return (tests_run == tests_passed) ? 0 : 1;
+}

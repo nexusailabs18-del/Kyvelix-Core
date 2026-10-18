@@ -1,0 +1,919 @@
+#define _GNU_SOURCE
+#include "kyjit_ir.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+/* ============================================================
+ * Graph
+ * ============================================================ */
+
+KyGraph *kyir_graph_create(void) {
+    KyGraph *g = (KyGraph *)calloc(1, sizeof(KyGraph));
+    if (!g) return NULL;
+
+    g->node_capacity = 1024;
+    g->nodes = (KyNode **)calloc(g->node_capacity, sizeof(KyNode *));
+    if (!g->nodes) { free(g); return NULL; }
+
+    g->block_capacity = 64;
+    g->blocks = (KyBlock **)calloc(g->block_capacity, sizeof(KyBlock *));
+    if (!g->blocks) { free(g->nodes); free(g); return NULL; }
+
+    /* Create start and end nodes */
+    g->start = kyir_node_create(g, IR_START);
+    g->end   = kyir_node_create(g, IR_END);
+
+    return g;
+}
+
+void kyir_graph_destroy(KyGraph *g) {
+    if (!g) return;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+        free(n->value_inputs);
+        free(n->control_inputs);
+        free(n->effect_inputs);
+        free(n->uses);
+        free(n);
+    }
+    for (uint32_t i = 0; i < g->block_count; i++) {
+        KyBlock *b = g->blocks[i];
+        if (!b) continue;
+        free(b->successors);
+        free(b->predecessors);
+        free(b->nodes);
+        free(b);
+    }
+    free(g->nodes);
+    free(g->blocks);
+    free(g);
+}
+
+/* ============================================================
+ * Nodes
+ * ============================================================ */
+
+KyNode *kyir_node_create(KyGraph *g, KyIROpcode opcode) {
+    if (!g) return NULL;
+
+    KyNode *n = (KyNode *)calloc(1, sizeof(KyNode));
+    if (!n) return NULL;
+
+    n->id = g->node_count;
+    n->opcode = (uint16_t)opcode;
+    n->type = KYIR_TYPE_UNKNOWN;
+    n->reg = -1;
+    n->stack_slot = -1;
+
+    /* Set default flags based on opcode */
+    switch (opcode) {
+        case IR_START:
+        case IR_END:
+        case IR_IF:
+        case IR_LOOP:
+        case IR_MERGE:
+        case IR_RETURN:
+        case IR_JUMP:
+        case IR_THROW:
+            n->flags |= KYIR_FLAG_CONTROL;
+            break;
+        case IR_STORE:
+        case IR_STORE_FIELD:
+        case IR_STORE_ELEMENT:
+        case IR_CALL:
+        case IR_CALL_DIRECT:
+        case IR_CALL_INDIRECT:
+        case IR_CALL_RUNTIME:
+        case IR_NEW_OBJECT:
+        case IR_NEW_ARRAY:
+        case IR_NEW_CLOSURE:
+            n->flags |= KYIR_FLAG_HAS_SIDE_EFFECT;
+            break;
+        case IR_CONST_I32:
+        case IR_CONST_I64:
+        case IR_CONST_F32:
+        case IR_CONST_F64:
+        case IR_CONST_NULL:
+        case IR_CONST_UNDEF:
+        case IR_CONST_TRUE:
+        case IR_CONST_FALSE:
+            n->flags |= KYIR_FLAG_CONSTANT;
+            break;
+        default:
+            break;
+    }
+
+    /* Grow nodes array */
+    if (g->node_count >= g->node_capacity) {
+        uint32_t new_cap = g->node_capacity * 2;
+        KyNode **new_arr = (KyNode **)realloc(g->nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) { free(n); return NULL; }
+        g->nodes = new_arr;
+        g->node_capacity = new_cap;
+    }
+    g->nodes[g->node_count++] = n;
+
+    return n;
+}
+
+void kyir_node_add_value_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->value_inputs,
+                                            (n->num_values + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->value_inputs = new_arr;
+    n->value_inputs[n->num_values++] = input;
+}
+
+void kyir_node_add_control_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->control_inputs,
+                                            (n->num_controls + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->control_inputs = new_arr;
+    n->control_inputs[n->num_controls++] = input;
+}
+
+void kyir_node_add_effect_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->effect_inputs,
+                                            (n->num_effects + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->effect_inputs = new_arr;
+    n->effect_inputs[n->num_effects++] = input;
+}
+
+void kyir_node_add_use(KyNode *n, KyNode *use) {
+    if (!n || !use) return;
+    if (n->num_uses >= n->use_capacity) {
+        uint16_t new_cap = n->use_capacity ? (uint16_t)(n->use_capacity * 2) : 4;
+        KyNode **new_arr = (KyNode **)realloc(n->uses, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        n->uses = new_arr;
+        n->use_capacity = new_cap;
+    }
+    n->uses[n->num_uses++] = use;
+}
+
+/* ============================================================
+ * Convenience constructors
+ * ============================================================ */
+
+KyNode *kyir_const_i64(KyGraph *g, int64_t value) {
+    KyNode *n = kyir_node_create(g, IR_CONST_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    n->constant.i64 = value;
+    return n;
+}
+
+KyNode *kyir_add(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_ADD_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+KyNode *kyir_sub(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_SUB_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+KyNode *kyir_mul(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_MUL_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+/* ============================================================
+ * Debug
+ * ============================================================ */
+
+static const char *opcode_name(KyIROpcode op) {
+    switch (op) {
+        case IR_START:        return "Start";
+        case IR_END:          return "End";
+        case IR_IF:           return "If";
+        case IR_LOOP:         return "Loop";
+        case IR_MERGE:        return "Merge";
+        case IR_PHI:          return "Phi";
+        case IR_RETURN:       return "Return";
+        case IR_JUMP:         return "Jump";
+        case IR_THROW:        return "Throw";
+        case IR_ADD_I32:      return "AddI32";
+        case IR_ADD_I64:      return "AddI64";
+        case IR_SUB_I32:      return "SubI32";
+        case IR_SUB_I64:      return "SubI64";
+        case IR_MUL_I32:      return "MulI32";
+        case IR_MUL_I64:      return "MulI64";
+        case IR_DIV_I32:      return "DivI32";
+        case IR_DIV_I64:      return "DivI64";
+        case IR_MOD_I32:      return "ModI32";
+        case IR_MOD_I64:      return "ModI64";
+        case IR_NEG_I32:      return "NegI32";
+        case IR_NEG_I64:      return "NegI64";
+        case IR_SHL:          return "Shl";
+        case IR_SHR:          return "Shr";
+        case IR_AND:          return "And";
+        case IR_OR:           return "Or";
+        case IR_XOR:          return "Xor";
+        case IR_ADD_F32:      return "AddF32";
+        case IR_ADD_F64:      return "AddF64";
+        case IR_SUB_F32:      return "SubF32";
+        case IR_SUB_F64:      return "SubF64";
+        case IR_MUL_F32:      return "MulF32";
+        case IR_MUL_F64:      return "MulF64";
+        case IR_DIV_F32:      return "DivF32";
+        case IR_DIV_F64:      return "DivF64";
+        case IR_CMP_EQ:       return "CmpEq";
+        case IR_CMP_NE:       return "CmpNe";
+        case IR_CMP_LT:       return "CmpLt";
+        case IR_CMP_LE:       return "CmpLe";
+        case IR_CMP_GT:       return "CmpGt";
+        case IR_CMP_GE:       return "CmpGe";
+        case IR_LOAD:         return "Load";
+        case IR_STORE:        return "Store";
+        case IR_LOAD_FIELD:   return "LoadField";
+        case IR_STORE_FIELD:  return "StoreField";
+        case IR_LOAD_ELEMENT: return "LoadElement";
+        case IR_STORE_ELEMENT:return "StoreElement";
+        case IR_NEW_OBJECT:   return "NewObject";
+        case IR_NEW_ARRAY:    return "NewArray";
+        case IR_NEW_CLOSURE:  return "NewClosure";
+        case IR_CALL:         return "Call";
+        case IR_CALL_DIRECT:  return "CallDirect";
+        case IR_CALL_INDIRECT:return "CallIndirect";
+        case IR_CHECK_MAP:    return "CheckMap";
+        case IR_CHECK_BOUNDS: return "CheckBounds";
+        case IR_CHECK_NULL:   return "CheckNull";
+        case IR_DEOPT:        return "Deopt";
+        case IR_CONST_I32:    return "ConstI32";
+        case IR_CONST_I64:    return "ConstI64";
+        case IR_CONST_F32:    return "ConstF32";
+        case IR_CONST_F64:    return "ConstF64";
+        case IR_CONST_NULL:   return "ConstNull";
+        case IR_CONST_UNDEF:  return "ConstUndef";
+        case IR_CONST_TRUE:   return "ConstTrue";
+        case IR_CONST_FALSE:  return "ConstFalse";
+        case IR_PARAMETER:    return "Parameter";
+        case IR_ARGUMENT:     return "Argument";
+        case IR_EFFECT:       return "Effect";
+        case IR_MEMORY:       return "Memory";
+        case IR_NOP:          return "Nop";
+        default:              return "?";
+    }
+}
+
+void kyir_node_print(const KyNode *n) {
+    if (!n) return;
+    printf("  n%-4u %-14s", n->id, opcode_name((KyIROpcode)n->opcode));
+
+    if (n->flags & KYIR_FLAG_CONSTANT) {
+        if (n->opcode == IR_CONST_I64 || n->opcode == IR_CONST_I32) {
+            printf(" = %lld", (long long)n->constant.i64);
+        } else if (n->opcode == IR_CONST_F32 || n->opcode == IR_CONST_F64) {
+            printf(" = %f", n->constant.f64);
+        }
+    }
+
+    printf("  [in: %u/%u/%u, out: %u]\n",
+           n->num_values, n->num_controls, n->num_effects, n->num_uses);
+}
+
+void kyir_graph_print(const KyGraph *g) {
+    if (!g) return;
+    printf("Graph: %u nodes, %u blocks\n", g->node_count, g->block_count);
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        kyir_node_print(g->nodes[i]);
+    }
+}
+
+/* ============================================================
+ * Utility
+ * ============================================================ */
+
+uint32_t kyir_node_use_count(const KyNode *n) {
+    return n ? n->num_uses : 0;
+}
+
+/* ============================================================
+ * Layer 2: Blocks
+ * ============================================================ */
+
+KyBlock *kyir_block_create(KyGraph *g) {
+    if (!g) return NULL;
+
+    KyBlock *b = (KyBlock *)calloc(1, sizeof(KyBlock));
+    if (!b) return NULL;
+
+    b->id = g->block_count;
+    b->node_capacity = 16;
+    b->nodes = (KyNode **)calloc(b->node_capacity, sizeof(KyNode *));
+
+    if (g->block_count >= g->block_capacity) {
+        uint32_t new_cap = g->block_capacity * 2;
+        KyBlock **new_arr = (KyBlock **)realloc(g->blocks, new_cap * sizeof(KyBlock *));
+        if (!new_arr) { free(b->nodes); free(b); return NULL; }
+        g->blocks = new_arr;
+        g->block_capacity = new_cap;
+    }
+    g->blocks[g->block_count++] = b;
+
+    return b;
+}
+
+void kyir_block_add_node(KyBlock *b, KyNode *n) {
+    if (!b || !n) return;
+    if (b->num_nodes >= b->node_capacity) {
+        uint32_t new_cap = b->node_capacity * 2;
+        KyNode **new_arr = (KyNode **)realloc(b->nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        b->nodes = new_arr;
+        b->node_capacity = new_cap;
+    }
+    b->nodes[b->num_nodes++] = n;
+    n->block = b;
+}
+
+void kyir_block_add_successor(KyBlock *b, KyBlock *succ) {
+    if (!b || !succ) return;
+    if (b->num_successors >= b->num_succ_capacity) {
+        uint16_t new_cap = b->num_succ_capacity ? (uint16_t)(b->num_succ_capacity * 2) : 4;
+        KyBlock **new_arr = (KyBlock **)realloc(b->successors, new_cap * sizeof(KyBlock *));
+        if (!new_arr) return;
+        b->successors = new_arr;
+        b->num_succ_capacity = new_cap;
+    }
+    b->successors[b->num_successors++] = succ;
+}
+
+void kyir_block_add_predecessor(KyBlock *b, KyBlock *pred) {
+    if (!b || !pred) return;
+    if (b->num_predecessors >= b->num_pred_capacity) {
+        uint16_t new_cap = b->num_pred_capacity ? (uint16_t)(b->num_pred_capacity * 2) : 4;
+        KyBlock **new_arr = (KyBlock **)realloc(b->predecessors, new_cap * sizeof(KyBlock *));
+        if (!new_arr) return;
+        b->predecessors = new_arr;
+        b->num_pred_capacity = new_cap;
+    }
+    b->predecessors[b->num_predecessors++] = pred;
+}
+
+void kyir_block_set_terminator(KyBlock *b, KyNode *n) {
+    if (!b || !n) return;
+    /* Terminator is the last node in the block */
+    kyir_block_add_node(b, n);
+}
+
+void kyir_block_print(const KyBlock *b) {
+    if (!b) return;
+    printf("  b%-3u [%u nodes, %u succ, %u pred]\n",
+           b->id, b->num_nodes, b->num_successors, b->num_predecessors);
+}
+
+/* ============================================================
+ * Layer 3: Dominator Tree
+ *
+ * Uses the iterative Cooper-Harvey-Kennedy algorithm:
+ *   1. Postorder DFS to number blocks
+ *   2. Intersect function using postorder numbers
+ *   3. Iterate until fixed point
+ * ============================================================ */
+
+static uint32_t *g_postorder_num = NULL;
+static uint32_t *g_postorder = NULL;
+static uint32_t  g_postorder_count = 0;
+
+static void postorder_dfs(KyBlock *b, KyDomTree *dt, int *visited) {
+    if (!b || visited[b->id]) return;
+    visited[b->id] = 1;
+    for (uint16_t i = 0; i < b->num_successors; i++) {
+        postorder_dfs(b->successors[i], dt, visited);
+    }
+    g_postorder[g_postorder_count] = b->id;
+    dt->postorder_num[b->id] = g_postorder_count;
+    g_postorder_count++;
+}
+
+KyDomTree *kyir_domtree_build(KyGraph *g) {
+    if (!g || g->block_count == 0) return NULL;
+
+    KyDomTree *dt = (KyDomTree *)calloc(1, sizeof(KyDomTree));
+    if (!dt) return NULL;
+
+    dt->num_blocks = g->block_count;
+    dt->idom = (KyBlock **)calloc(g->block_count, sizeof(KyBlock *));
+    dt->dom_depth = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+    dt->postorder = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+    dt->postorder_num = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+
+    g_postorder = dt->postorder;
+    g_postorder_num = dt->postorder_num;
+    g_postorder_count = 0;
+
+    /* 1. Postorder DFS from entry block */
+    int *visited = (int *)calloc(g->block_count, sizeof(int));
+    postorder_dfs(g->blocks[0], dt, visited);
+    free(visited);
+
+    /* 2. Initialize idom: entry has self, others undefined */
+    dt->idom[g->blocks[0]->id] = g->blocks[0];
+    dt->dom_depth[g->blocks[0]->id] = 0;
+
+    /* 3. Iterate intersect until fixed point */
+    int changed = 1;
+    int iterations = 0;
+    while (changed && iterations < 1000) {
+        changed = 0;
+        iterations++;
+        /* Process in postorder */
+        for (uint32_t i = 0; i < g_postorder_count; i++) {
+            KyBlock *b = g->blocks[g_postorder[i]];
+            if (b->id == g->blocks[0]->id) continue;
+
+            KyBlock *new_idom = NULL;
+            for (uint16_t j = 0; j < b->num_predecessors; j++) {
+                KyBlock *pred = b->predecessors[j];
+                if (!dt->idom[pred->id]) continue;
+                if (!new_idom) {
+                    new_idom = pred;
+                } else {
+                    /* Find LCA via intersect */
+                    KyBlock *a = new_idom;
+                    KyBlock *c = pred;
+                    while (a != c) {
+                        while (dt->postorder_num[a->id] < dt->postorder_num[c->id]) {
+                            if (!dt->idom[a->id]) break;
+                            a = dt->idom[a->id];
+                        }
+                        while (dt->postorder_num[c->id] < dt->postorder_num[a->id]) {
+                            if (!dt->idom[c->id]) break;
+                            c = dt->idom[c->id];
+                        }
+                    }
+                    new_idom = a;
+                }
+            }
+            if (new_idom && dt->idom[b->id] != new_idom) {
+                dt->idom[b->id] = new_idom;
+                dt->dom_depth[b->id] = dt->dom_depth[new_idom->id] + 1;
+                changed = 1;
+            }
+        }
+    }
+
+    return dt;
+}
+
+void kyir_domtree_destroy(KyDomTree *dt) {
+    if (!dt) return;
+    free(dt->idom);
+    free(dt->dom_depth);
+    free(dt->postorder);
+    free(dt->postorder_num);
+    free(dt);
+}
+
+int kyir_domtree_dominates(KyDomTree *dt, KyBlock *a, KyBlock *b) {
+    if (!dt || !a || !b) return 0;
+    if (a == b) return 1;
+    KyBlock *cur = b;
+    while (cur && cur != a && dt->idom[cur->id]) {
+        cur = dt->idom[cur->id];
+    }
+    return cur == a;
+}
+
+KyBlock *kyir_domtree_lca(KyDomTree *dt, KyBlock *a, KyBlock *b) {
+    if (!dt || !a || !b) return NULL;
+    while (a != b) {
+        while (dt->postorder_num[a->id] < dt->postorder_num[b->id]) {
+            if (!dt->idom[a->id]) return NULL;
+            a = dt->idom[a->id];
+        }
+        while (dt->postorder_num[b->id] < dt->postorder_num[a->id]) {
+            if (!dt->idom[b->id]) return NULL;
+            b = dt->idom[b->id];
+        }
+    }
+    return a;
+}
+
+
+/* ============================================================
+ * Layer 5: IR Builder
+ * ============================================================ */
+
+KyIRBuilder *kyir_builder_create(KyGraph *g) {
+    if (!g) return NULL;
+
+    KyIRBuilder *b = (KyIRBuilder *)calloc(1, sizeof(KyIRBuilder));
+    if (!b) return NULL;
+
+    b->graph = g;
+    b->var_capacity = 64;
+    b->var_nodes = (KyNode **)calloc(b->var_capacity, sizeof(KyNode *));
+
+    return b;
+}
+
+void kyir_builder_destroy(KyIRBuilder *b) {
+    if (!b) return;
+    free(b->var_nodes);
+    free(b->loop_stack);
+    free(b);
+}
+
+void kyir_builder_set_block(KyIRBuilder *b, KyBlock *block) {
+    if (!b || !block) return;
+    b->current_block = block;
+}
+
+KyNode *kyir_builder_get_var(KyIRBuilder *b, uint32_t var_id) {
+    if (!b || var_id >= b->num_vars) return NULL;
+    return b->var_nodes[var_id];
+}
+
+void kyir_builder_set_var(KyIRBuilder *b, uint32_t var_id, KyNode *value) {
+    if (!b) return;
+    if (var_id >= b->var_capacity) {
+        uint32_t new_cap = b->var_capacity;
+        while (new_cap <= var_id) new_cap *= 2;
+        KyNode **new_arr = (KyNode **)realloc(b->var_nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        b->var_nodes = new_arr;
+        b->var_capacity = new_cap;
+    }
+    b->var_nodes[var_id] = value;
+    if (var_id >= b->num_vars) b->num_vars = var_id + 1;
+}
+
+KyNode *kyir_build_const(KyIRBuilder *b, int64_t value) {
+    return kyir_const_i64(b->graph, value);
+}
+
+KyNode *kyir_build_add(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_add(b->graph, a, c);
+}
+
+KyNode *kyir_build_sub(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_sub(b->graph, a, c);
+}
+
+KyNode *kyir_build_mul(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_mul(b->graph, a, c);
+}
+
+KyNode *kyir_build_return(KyIRBuilder *b, KyNode *value) {
+    if (!b || !value) return NULL;
+    KyNode *ret = kyir_node_create(b->graph, IR_RETURN);
+    if (!ret) return NULL;
+    kyir_node_add_value_input(ret, value);
+    kyir_node_add_use(value, ret);
+    /* Attach control (last control node in block) */
+    if (b->current_control) {
+        kyir_node_add_control_input(ret, b->current_control);
+    }
+    if (b->current_block) {
+        kyir_block_add_node(b->current_block, ret);
+    }
+    return ret;
+}
+
+
+/* ============================================================
+ * Layer 6: Optimizations
+ * ============================================================ */
+
+/* ---------- Utility: replace uses of one node with another ---------- */
+
+void kyir_node_remove_use(KyNode *n, KyNode *use) {
+    if (!n || !use) return;
+    for (uint16_t i = 0; i < n->num_uses; i++) {
+        if (n->uses[i] == use) {
+            n->uses[i] = n->uses[n->num_uses - 1];
+            n->num_uses--;
+            return;
+        }
+    }
+}
+
+void kyir_node_replace_uses(KyGraph *g, KyNode *old_node, KyNode *new_node) {
+    if (!g || !old_node || !new_node) return;
+
+    /* Update all uses of old_node to use new_node */
+    for (uint16_t u = 0; u < old_node->num_uses; u++) {
+        KyNode *user = old_node->uses[u];
+        if (!user) continue;
+
+        /* Replace in value_inputs */
+        for (uint16_t i = 0; i < user->num_values; i++) {
+            if (user->value_inputs[i] == old_node) {
+                user->value_inputs[i] = new_node;
+                kyir_node_add_use(new_node, user);
+            }
+        }
+        /* Replace in control_inputs */
+        for (uint16_t i = 0; i < user->num_controls; i++) {
+            if (user->control_inputs[i] == old_node) {
+                user->control_inputs[i] = new_node;
+            }
+        }
+        /* Replace in effect_inputs */
+        for (uint16_t i = 0; i < user->num_effects; i++) {
+            if (user->effect_inputs[i] == old_node) {
+                user->effect_inputs[i] = new_node;
+            }
+        }
+    }
+    old_node->num_uses = 0;
+}
+
+int kyir_node_is_constant(const KyNode *n) {
+    return n && (n->flags & KYIR_FLAG_CONSTANT);
+}
+
+int64_t kyir_node_const_i64(const KyNode *n) {
+    if (!n) return 0;
+    if (n->opcode == IR_CONST_I32) return (int64_t)n->constant.i32;
+    return n->constant.i64;
+}
+
+/* ---------- Constant Folding ---------- */
+
+int kyir_opt_constfold(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+
+        /* Skip non-arithmetic nodes */
+        if (n->num_values != 2) continue;
+
+        KyNode *a = n->value_inputs[0];
+        KyNode *b = n->value_inputs[1];
+        if (!kyir_node_is_constant(a) || !kyir_node_is_constant(b)) continue;
+
+        int64_t va = kyir_node_const_i64(a);
+        int64_t vb = kyir_node_const_i64(b);
+        int64_t result = 0;
+        int folded = 0;
+
+        switch (n->opcode) {
+            case IR_ADD_I32:
+            case IR_ADD_I64: result = va + vb; folded = 1; break;
+            case IR_SUB_I32:
+            case IR_SUB_I64: result = va - vb; folded = 1; break;
+            case IR_MUL_I32:
+            case IR_MUL_I64: result = va * vb; folded = 1; break;
+            case IR_DIV_I32:
+            case IR_DIV_I64: if (vb != 0) { result = va / vb; folded = 1; } break;
+            case IR_MOD_I32:
+            case IR_MOD_I64: if (vb != 0) { result = va % vb; folded = 1; } break;
+            case IR_AND: result = va & vb; folded = 1; break;
+            case IR_OR:  result = va | vb; folded = 1; break;
+            case IR_XOR: result = va ^ vb; folded = 1; break;
+            default: break;
+        }
+
+        if (folded) {
+            /* Replace node with constant */
+            KyNode *c = kyir_const_i64(g, result);
+            kyir_node_replace_uses(g, n, c);
+            n->flags |= KYIR_FLAG_DEAD;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Algebraic Simplify ---------- */
+
+static int is_const_zero(KyNode *n) {
+    return kyir_node_is_constant(n) && kyir_node_const_i64(n) == 0;
+}
+
+static int is_const_one(KyNode *n) {
+    return kyir_node_is_constant(n) && kyir_node_const_i64(n) == 1;
+}
+
+int kyir_opt_algebraic(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->num_values != 2) continue;
+
+        KyNode *a = n->value_inputs[0];
+        KyNode *b = n->value_inputs[1];
+        KyNode *replacement = NULL;
+
+        switch (n->opcode) {
+            case IR_ADD_I32: case IR_ADD_I64:
+                if (is_const_zero(a)) replacement = b;
+                else if (is_const_zero(b)) replacement = a;
+                break;
+
+            case IR_SUB_I32: case IR_SUB_I64:
+                if (is_const_zero(b)) replacement = a;
+                /* x - x = 0 */
+                if (a == b) {
+                    KyNode *c = kyir_const_i64(g, 0);
+                    replacement = c;
+                }
+                break;
+
+            case IR_MUL_I32: case IR_MUL_I64:
+                if (is_const_zero(a) || is_const_zero(b)) {
+                    KyNode *c = kyir_const_i64(g, 0);
+                    replacement = c;
+                } else if (is_const_one(a)) {
+                    replacement = b;
+                } else if (is_const_one(b)) {
+                    replacement = a;
+                }
+                break;
+
+            default: break;
+        }
+
+        if (replacement && replacement != n) {
+            kyir_node_replace_uses(g, n, replacement);
+            n->flags |= KYIR_FLAG_DEAD;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Dead Code Elimination ---------- */
+
+int kyir_opt_dce(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    /* A node is dead if:
+     * 1. It's marked DEAD, OR
+     * 2. It has no uses AND no side effects AND is not a terminator */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+
+        /* Skip constants — they can be reused */
+        if (kyir_node_is_constant(n)) continue;
+
+        /* Skip terminators and control nodes */
+        if (n->flags & KYIR_FLAG_CONTROL) continue;
+
+        /* Skip side effects */
+        if (n->flags & KYIR_FLAG_HAS_SIDE_EFFECT) continue;
+
+        /* If unused, mark dead */
+        if (n->num_uses == 0) {
+            n->flags |= KYIR_FLAG_DEAD;
+            /* Remove uses from its inputs */
+            for (uint16_t j = 0; j < n->num_values; j++) {
+                kyir_node_remove_use(n->value_inputs[j], n);
+            }
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Global Value Numbering (basic) ---------- */
+
+int kyir_opt_gvn(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    /* Simple O(n²) GVN — for each pair of nodes, if they compute the same
+     * thing, replace uses of the second with the first. */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *a = g->nodes[i];
+        if (!a || (a->flags & KYIR_FLAG_DEAD)) continue;
+        if (a->flags & (KYIR_FLAG_HAS_SIDE_EFFECT | KYIR_FLAG_CONTROL)) continue;
+        if (a->num_values != 2) continue;
+
+        for (uint32_t j = i + 1; j < g->node_count; j++) {
+            KyNode *b = g->nodes[j];
+            if (!b || (b->flags & KYIR_FLAG_DEAD)) continue;
+            if (b->opcode != a->opcode) continue;
+            if (b->num_values != a->num_values) continue;
+
+            /* Check if same inputs */
+            int same = 1;
+            for (uint16_t k = 0; k < a->num_values; k++) {
+                if (a->value_inputs[k] != b->value_inputs[k]) {
+                    /* Try commutative swap for ADD/MUL */
+                    if (a->opcode == IR_ADD_I32 || a->opcode == IR_ADD_I64 ||
+                        a->opcode == IR_MUL_I32 || a->opcode == IR_MUL_I64) {
+                        if (a->value_inputs[0] == b->value_inputs[1] &&
+                            a->value_inputs[1] == b->value_inputs[0]) {
+                            continue;
+                        }
+                    }
+                    same = 0;
+                    break;
+                }
+            }
+            if (same) {
+                kyir_node_replace_uses(g, b, a);
+                b->flags |= KYIR_FLAG_DEAD;
+                changed++;
+            }
+        }
+    }
+    return changed;
+}
+
+/* ---------- Optimize Driver ---------- */
+
+int kyir_optimize(KyGraph *g) {
+    if (!g) return 0;
+    int total_changes = 0;
+    int iteration = 0;
+    int changed;
+
+    do {
+        changed = 0;
+        changed |= kyir_opt_constfold(g);
+        changed |= kyir_opt_algebraic(g);
+        changed |= kyir_opt_gvn(g);
+        changed |= kyir_opt_dce(g);
+        total_changes += changed;
+        iteration++;
+    } while (changed > 0 && iteration < 20);
+
+    return total_changes;
+}
+
+/* ============================================================
+ * Layer 7: Graph Verifier
+ * ============================================================ */
+
+KyVerifyResult kyir_graph_verify(KyGraph *g) {
+    KyVerifyResult r;
+    memset(&r, 0, sizeof(r));
+    r.ok = 1;
+
+    if (!g) {
+        r.ok = 0;
+        snprintf(r.messages[r.errors++], 128, "graph is NULL");
+        return r;
+    }
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) {
+            r.ok = 0;
+            snprintf(r.messages[r.errors++], 128, "node %u is NULL", i);
+            if (r.errors >= 16) break;
+            continue;
+        }
+
+        /* Every node should have valid id */
+        if (n->id != i) {
+            r.ok = 0;
+            snprintf(r.messages[r.errors++], 128,
+                     "node at %u has id %u", i, n->id);
+            if (r.errors >= 16) break;
+        }
+
+        /* Every value input should be non-NULL */
+        for (uint16_t j = 0; j < n->num_values; j++) {
+            if (!n->value_inputs[j]) {
+                r.ok = 0;
+                snprintf(r.messages[r.errors++], 128,
+                         "node %u has NULL value input %u", n->id, j);
+                if (r.errors >= 16) break;
+            }
+        }
+        if (r.errors >= 16) break;
+    }
+
+    return r;
+}
+

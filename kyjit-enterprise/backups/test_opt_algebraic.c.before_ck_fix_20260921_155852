@@ -1,0 +1,171 @@
+/*
+ * test_opt_algebraic.c — verify algebraic simplifications.
+ */
+
+#include "kyjit_ir.h"
+#include <stdio.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+/* Build "return OP(param0, const k);" then algebraic; check
+ * whether the OP node was replaced by param0 (for identities like x+0),
+ * or by a constant (for x*0), or NOT replaced. */
+static void test_binop_const(KyIROpcode op, int64_t k,
+                             int expect_replaced,
+                             int expect_const,
+                             int64_t expected_const_value,
+                             const char *label) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *bi = kyir_builder_create(g);
+    kyir_builder_set_block(bi, b0);
+
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 0;
+    pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+
+    KyNode *ck = kyir_const_i64(g, k);
+    kyir_block_add_node(b0, ck);
+
+    KyNode *expr = kyir_node_create(g, op);
+    kyir_node_add_value_input(expr, pa);
+    kyir_node_add_value_input(expr, ck);
+    kyir_node_add_use(pa, expr);
+    kyir_node_add_use(ck, expr);
+    expr->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, expr);
+
+    kyir_build_return(bi, expr);
+
+    kyir_opt_algebraic(g);
+
+    /* Check if expr was marked dead (replaced) */
+    int was_replaced = (expr->flags & KYIR_FLAG_DEAD) != 0;
+
+    int ok = 1;
+    if (expect_replaced && !was_replaced) ok = 0;
+    if (!expect_replaced && was_replaced) ok = 0;
+
+    if (ok && expect_const && was_replaced) {
+        /* Find the replacing constant — the node with no inputs that's not ck */
+        int found = 0;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            KyNode *n = g->nodes[i];
+            if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+            if (n == ck) continue;
+            if (kyir_node_is_constant(n)) {
+                if (kyir_node_const_i64(n) == expected_const_value) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (!found) ok = 0;
+    }
+
+    printf("  %-30s %s\n", label, ok ? "PASS" : "FAIL");
+    tests_run++;
+    if (ok) tests_passed++;
+
+    kyir_builder_destroy(bi);
+    kyir_graph_destroy(g);
+}
+
+/* Two-identical-input case: build OP(param0, param0) */
+static void test_binop_same(int opcode, int expect_replaced, int expect_zero,
+                            const char *label) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+    KyIRBuilder *bi = kyir_builder_create(g);
+    kyir_builder_set_block(bi, b0);
+
+    KyNode *pa = kyir_node_create(g, IR_PARAMETER);
+    pa->constant.i64 = 0;
+    pa->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, pa);
+
+    KyNode *expr = kyir_node_create(g, opcode);
+    kyir_node_add_value_input(expr, pa);
+    kyir_node_add_value_input(expr, pa);
+    kyir_node_add_use(pa, expr);
+    kyir_node_add_use(pa, expr);
+    expr->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, expr);
+
+    kyir_build_return(bi, expr);
+
+    kyir_opt_algebraic(g);
+
+    int was_replaced = (expr->flags & KYIR_FLAG_DEAD) != 0;
+    int ok = (was_replaced == expect_replaced);
+    if (ok && expect_zero) {
+        int found_zero = 0;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            KyNode *n = g->nodes[i];
+            if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+            if (kyir_node_is_constant(n) && kyir_node_const_i64(n) == 0) {
+                found_zero = 1;
+                break;
+            }
+        }
+        if (!found_zero) ok = 0;
+    }
+
+    printf("  %-30s %s\n", label, ok ? "PASS" : "FAIL");
+    tests_run++;
+    if (ok) tests_passed++;
+
+    kyir_builder_destroy(bi);
+    kyir_graph_destroy(g);
+}
+
+int main(void) {
+    printf("KYJIT Algebraic Test v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n");
+
+    printf("\n[ADD]\n");
+    test_binop_const(IR_ADD_I64, 0, 1, 0, 0, "x + 0 → x");
+    /* (x+0 case: replaced, not by a constant) */
+
+    printf("\n[SUB]\n");
+    test_binop_const(IR_SUB_I64, 0, 1, 0, 0, "x - 0 → x");
+    test_binop_same(IR_SUB_I64, 1, 1, "x - x → 0");
+
+    printf("\n[MUL]\n");
+    test_binop_const(IR_MUL_I64, 0, 1, 1, 0, "x * 0 → 0");
+    test_binop_const(IR_MUL_I64, 1, 1, 0, 0, "x * 1 → x");
+
+    printf("\n[AND]\n");
+    test_binop_const(IR_AND, 0, 1, 1, 0, "x & 0 → 0");
+    test_binop_same(IR_AND, 1, 0, "x & x → x");
+    test_binop_const(IR_AND, -1, 1, 0, 0, "x & -1 → x");
+
+    printf("\n[OR]\n");
+    test_binop_const(IR_OR, 0, 1, 0, 0, "x | 0 → x");
+    test_binop_same(IR_OR, 1, 0, "x | x → x");
+    test_binop_const(IR_OR, -1, 1, 1, -1, "x | -1 → -1");
+
+    printf("\n[XOR]\n");
+    test_binop_const(IR_XOR, 0, 1, 0, 0, "x ^ 0 → x");
+    test_binop_same(IR_XOR, 1, 1, "x ^ x → 0");
+
+    printf("\n[SHIFTS]\n");
+    test_binop_const(IR_SHL, 0, 1, 0, 0, "x << 0 → x");
+    test_binop_const(IR_SHR, 0, 1, 0, 0, "x >> 0 → x");
+    test_binop_const(IR_SAR, 0, 1, 0, 0, "x >>a 0 → x");
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+    return (tests_run == tests_passed) ? 0 : 1;
+}

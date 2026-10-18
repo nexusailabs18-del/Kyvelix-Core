@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/include",
+                "/usr/include",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include/linux",
+                "/usr/lib/gcc/x86_64-linux-gnu/*/include"
+            ],
+            "defines": [
+                "_POSIX_C_SOURCE=200112L",
+                "_DEFAULT_SOURCE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "compilerArgs": [
+                "-Wall",
+                "-Wextra"
+            ],
+            "forcedInclude": [
+                "${workspaceFolder}/include/ky_protocol.h"
+            ]
+        }
+    ],
+    "version": 4
+}

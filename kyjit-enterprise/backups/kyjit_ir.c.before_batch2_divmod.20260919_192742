@@ -1,0 +1,4864 @@
+#define _GNU_SOURCE
+#include "kyjit_ir.h"
+
+/* Forward declarations for encoders used by kyx64_emit but defined later */
+static int encode_push (uint8_t *code, size_t code_size, size_t *off, KyX64Reg reg);
+static int encode_pop  (uint8_t *code, size_t code_size, size_t *off, KyX64Reg reg);
+static int encode_load (uint8_t *code, size_t code_size, size_t *off,
+                        KyX64Reg dst, KyX64Reg base, int32_t offset);
+static int encode_store(uint8_t *code, size_t code_size, size_t *off,
+                        KyX64Reg base, int32_t offset, KyX64Reg src);
+static int encode_lea  (uint8_t *code, size_t code_size, size_t *off,
+                        KyX64Reg dst, KyX64Reg base, int32_t offset);
+static int encode_cmp_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg reg, int32_t imm);
+static int encode_cmp_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg a, KyX64Reg b);
+static int encode_and_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, KyX64Reg src);
+static int encode_or_reg (uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, KyX64Reg src);
+static int encode_xor_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, KyX64Reg src);
+static int encode_shl_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm);
+static int encode_shr_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm);
+static int encode_sar_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm);
+static int encode_neg(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Reg dst);
+static int encode_not(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Reg dst);
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+
+
+/* ============================================================
+ * Graph
+ * ============================================================ */
+
+KyGraph *kyir_graph_create(void) {
+    KyGraph *g = (KyGraph *)calloc(1, sizeof(KyGraph));
+    if (!g) return NULL;
+
+    g->node_capacity = 1024;
+    g->nodes = (KyNode **)calloc(g->node_capacity, sizeof(KyNode *));
+    if (!g->nodes) { free(g); return NULL; }
+
+    g->block_capacity = 64;
+    g->blocks = (KyBlock **)calloc(g->block_capacity, sizeof(KyBlock *));
+    if (!g->blocks) { free(g->nodes); free(g); return NULL; }
+
+    /* Create start and end nodes */
+    g->start = kyir_node_create(g, IR_START);
+    g->end   = kyir_node_create(g, IR_END);
+
+    return g;
+}
+
+void kyir_graph_destroy(KyGraph *g) {
+    if (!g) return;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+        free(n->value_inputs);
+        free(n->control_inputs);
+        free(n->effect_inputs);
+        free(n->uses);
+        free(n);
+    }
+    for (uint32_t i = 0; i < g->block_count; i++) {
+        KyBlock *b = g->blocks[i];
+        if (!b) continue;
+        free(b->successors);
+        free(b->predecessors);
+        free(b->nodes);
+        free(b);
+    }
+    free(g->nodes);
+    free(g->blocks);
+    free(g);
+}
+
+/* ============================================================
+ * Nodes
+ * ============================================================ */
+
+KyNode *kyir_node_create(KyGraph *g, KyIROpcode opcode) {
+    if (!g) return NULL;
+
+    KyNode *n = (KyNode *)calloc(1, sizeof(KyNode));
+    if (!n) return NULL;
+
+    n->id = g->node_count;
+    n->opcode = (uint16_t)opcode;
+    n->type = KYIR_TYPE_UNKNOWN;
+    n->reg = -1;
+    n->stack_slot = -1;
+
+    /* Set default flags based on opcode */
+    switch (opcode) {
+        case IR_START:
+        case IR_END:
+        case IR_IF:
+        case IR_LOOP:
+        case IR_MERGE:
+        case IR_RETURN:
+        case IR_JUMP:
+        case IR_THROW:
+            n->flags |= KYIR_FLAG_CONTROL;
+            break;
+        case IR_STORE:
+        case IR_STORE_FIELD:
+        case IR_STORE_ELEMENT:
+        case IR_CALL:
+        case IR_CALL_DIRECT:
+        case IR_CALL_INDIRECT:
+        case IR_CALL_RUNTIME:
+        case IR_NEW_OBJECT:
+        case IR_NEW_ARRAY:
+        case IR_NEW_CLOSURE:
+            n->flags |= KYIR_FLAG_HAS_SIDE_EFFECT;
+            break;
+        case IR_CONST_I32:
+        case IR_CONST_I64:
+        case IR_CONST_F32:
+        case IR_CONST_F64:
+        case IR_CONST_NULL:
+        case IR_CONST_UNDEF:
+        case IR_CONST_TRUE:
+        case IR_CONST_FALSE:
+            n->flags |= KYIR_FLAG_CONSTANT;
+            break;
+        default:
+            break;
+    }
+
+    /* Grow nodes array */
+    if (g->node_count >= g->node_capacity) {
+        uint32_t new_cap = g->node_capacity * 2;
+        KyNode **new_arr = (KyNode **)realloc(g->nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) { free(n); return NULL; }
+        g->nodes = new_arr;
+        g->node_capacity = new_cap;
+    }
+    g->nodes[g->node_count++] = n;
+
+    return n;
+}
+
+void kyir_node_add_value_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->value_inputs,
+                                            (n->num_values + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->value_inputs = new_arr;
+    n->value_inputs[n->num_values++] = input;
+}
+
+void kyir_node_add_control_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->control_inputs,
+                                            (n->num_controls + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->control_inputs = new_arr;
+    n->control_inputs[n->num_controls++] = input;
+}
+
+void kyir_node_add_effect_input(KyNode *n, KyNode *input) {
+    if (!n || !input) return;
+    KyNode **new_arr = (KyNode **)realloc(n->effect_inputs,
+                                            (n->num_effects + 1) * sizeof(KyNode *));
+    if (!new_arr) return;
+    n->effect_inputs = new_arr;
+    n->effect_inputs[n->num_effects++] = input;
+}
+
+void kyir_node_add_use(KyNode *n, KyNode *use) {
+    if (!n || !use) return;
+    if (n->num_uses >= n->use_capacity) {
+        uint16_t new_cap = n->use_capacity ? (uint16_t)(n->use_capacity * 2) : 4;
+        KyNode **new_arr = (KyNode **)realloc(n->uses, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        n->uses = new_arr;
+        n->use_capacity = new_cap;
+    }
+    n->uses[n->num_uses++] = use;
+}
+
+/* ============================================================
+ * Convenience constructors
+ * ============================================================ */
+
+/* Generic two-input bitwise/shift op builder.
+ * Note: rhs of a shift is treated as a value_input (may be a constant
+ * node or a parameter). The selector checks that it's constant. */
+static KyNode *kyir_make_binop(KyGraph *g, KyIROpcode op,
+                               KyNode *a, KyNode *b) {
+    if (!g || !a || !b) return NULL;
+    KyNode *n = kyir_node_create(g, op);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+static KyNode *kyir_make_unop(KyGraph *g, KyIROpcode op, KyNode *a) {
+    if (!g || !a) return NULL;
+    KyNode *n = kyir_node_create(g, op);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_use(a, n);
+    return n;
+}
+
+KyNode *kyir_shl(KyGraph *g, KyNode *a, KyNode *s) { return kyir_make_binop(g, IR_SHL, a, s); }
+KyNode *kyir_shr(KyGraph *g, KyNode *a, KyNode *s) { return kyir_make_binop(g, IR_SHR, a, s); }
+KyNode *kyir_sar(KyGraph *g, KyNode *a, KyNode *s) { return kyir_make_binop(g, IR_SAR, a, s); }
+KyNode *kyir_and(KyGraph *g, KyNode *a, KyNode *b) { return kyir_make_binop(g, IR_AND, a, b); }
+KyNode *kyir_or (KyGraph *g, KyNode *a, KyNode *b) { return kyir_make_binop(g, IR_OR,  a, b); }
+KyNode *kyir_xor(KyGraph *g, KyNode *a, KyNode *b) { return kyir_make_binop(g, IR_XOR, a, b); }
+KyNode *kyir_neg(KyGraph *g, KyNode *a) { return kyir_make_unop(g, IR_NEG_I64, a); }
+KyNode *kyir_not(KyGraph *g, KyNode *a) { return kyir_make_unop(g, IR_NOT, a); }
+
+KyNode *kyir_const_i64(KyGraph *g, int64_t value) {
+    KyNode *n = kyir_node_create(g, IR_CONST_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    n->constant.i64 = value;
+    return n;
+}
+
+KyNode *kyir_add(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_ADD_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+KyNode *kyir_sub(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_SUB_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+KyNode *kyir_mul(KyGraph *g, KyNode *a, KyNode *b) {
+    KyNode *n = kyir_node_create(g, IR_MUL_I64);
+    if (!n) return NULL;
+    n->type = KYIR_TYPE_INT64;
+    kyir_node_add_value_input(n, a);
+    kyir_node_add_value_input(n, b);
+    kyir_node_add_use(a, n);
+    kyir_node_add_use(b, n);
+    return n;
+}
+
+/* ============================================================
+ * Debug
+ * ============================================================ */
+
+static const char *opcode_name(KyIROpcode op) {
+    switch (op) {
+        case IR_START:        return "Start";
+        case IR_END:          return "End";
+        case IR_IF:           return "If";
+        case IR_LOOP:         return "Loop";
+        case IR_MERGE:        return "Merge";
+        case IR_PHI:          return "Phi";
+        case IR_RETURN:       return "Return";
+        case IR_JUMP:         return "Jump";
+        case IR_THROW:        return "Throw";
+        case IR_ADD_I32:      return "AddI32";
+        case IR_ADD_I64:      return "AddI64";
+        case IR_SUB_I32:      return "SubI32";
+        case IR_SUB_I64:      return "SubI64";
+        case IR_MUL_I32:      return "MulI32";
+        case IR_MUL_I64:      return "MulI64";
+        case IR_DIV_I32:      return "DivI32";
+        case IR_DIV_I64:      return "DivI64";
+        case IR_MOD_I32:      return "ModI32";
+        case IR_MOD_I64:      return "ModI64";
+        case IR_NEG_I32:      return "NegI32";
+        case IR_NEG_I64:      return "NegI64";
+        case IR_SHL:          return "Shl";
+        case IR_SHR:          return "Shr";
+        case IR_AND:          return "And";
+        case IR_OR:           return "Or";
+        case IR_XOR:          return "Xor";
+        case IR_ADD_F32:      return "AddF32";
+        case IR_ADD_F64:      return "AddF64";
+        case IR_SUB_F32:      return "SubF32";
+        case IR_SUB_F64:      return "SubF64";
+        case IR_MUL_F32:      return "MulF32";
+        case IR_MUL_F64:      return "MulF64";
+        case IR_DIV_F32:      return "DivF32";
+        case IR_DIV_F64:      return "DivF64";
+        case IR_CMP_EQ:       return "CmpEq";
+        case IR_CMP_NE:       return "CmpNe";
+        case IR_CMP_LT:       return "CmpLt";
+        case IR_CMP_LE:       return "CmpLe";
+        case IR_CMP_GT:       return "CmpGt";
+        case IR_CMP_GE:       return "CmpGe";
+        case IR_LOAD:         return "Load";
+        case IR_STORE:        return "Store";
+        case IR_LOAD_FIELD:   return "LoadField";
+        case IR_STORE_FIELD:  return "StoreField";
+        case IR_LOAD_ELEMENT: return "LoadElement";
+        case IR_STORE_ELEMENT:return "StoreElement";
+        case IR_NEW_OBJECT:   return "NewObject";
+        case IR_NEW_ARRAY:    return "NewArray";
+        case IR_NEW_CLOSURE:  return "NewClosure";
+        case IR_CALL:         return "Call";
+        case IR_CALL_DIRECT:  return "CallDirect";
+        case IR_CALL_INDIRECT:return "CallIndirect";
+        case IR_CHECK_MAP:    return "CheckMap";
+        case IR_CHECK_BOUNDS: return "CheckBounds";
+        case IR_CHECK_NULL:   return "CheckNull";
+        case IR_DEOPT:        return "Deopt";
+        case IR_CONST_I32:    return "ConstI32";
+        case IR_CONST_I64:    return "ConstI64";
+        case IR_CONST_F32:    return "ConstF32";
+        case IR_CONST_F64:    return "ConstF64";
+        case IR_CONST_NULL:   return "ConstNull";
+        case IR_CONST_UNDEF:  return "ConstUndef";
+        case IR_CONST_TRUE:   return "ConstTrue";
+        case IR_CONST_FALSE:  return "ConstFalse";
+        case IR_PARAMETER:    return "Parameter";
+        case IR_ARGUMENT:     return "Argument";
+        case IR_EFFECT:       return "Effect";
+        case IR_MEMORY:       return "Memory";
+        case IR_NOP:          return "Nop";
+        default:              return "?";
+    }
+}
+
+void kyir_node_print(const KyNode *n) {
+    if (!n) return;
+    printf("  n%-4u %-14s", n->id, opcode_name((KyIROpcode)n->opcode));
+
+    if (n->flags & KYIR_FLAG_CONSTANT) {
+        if (n->opcode == IR_CONST_I64 || n->opcode == IR_CONST_I32) {
+            printf(" = %lld", (long long)n->constant.i64);
+        } else if (n->opcode == IR_CONST_F32 || n->opcode == IR_CONST_F64) {
+            printf(" = %f", n->constant.f64);
+        }
+    }
+
+    printf("  [in: %u/%u/%u, out: %u]\n",
+           n->num_values, n->num_controls, n->num_effects, n->num_uses);
+}
+
+void kyir_graph_print(const KyGraph *g) {
+    if (!g) return;
+    printf("Graph: %u nodes, %u blocks\n", g->node_count, g->block_count);
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        kyir_node_print(g->nodes[i]);
+    }
+}
+
+/* ============================================================
+ * Utility
+ * ============================================================ */
+
+uint32_t kyir_node_use_count(const KyNode *n) {
+    return n ? n->num_uses : 0;
+}
+
+/* ============================================================
+ * Layer 2: Blocks
+ * ============================================================ */
+
+KyBlock *kyir_block_create(KyGraph *g) {
+    if (!g) return NULL;
+
+    KyBlock *b = (KyBlock *)calloc(1, sizeof(KyBlock));
+    if (!b) return NULL;
+
+    b->id = g->block_count;
+    b->node_capacity = 16;
+    b->nodes = (KyNode **)calloc(b->node_capacity, sizeof(KyNode *));
+
+    if (g->block_count >= g->block_capacity) {
+        uint32_t new_cap = g->block_capacity * 2;
+        KyBlock **new_arr = (KyBlock **)realloc(g->blocks, new_cap * sizeof(KyBlock *));
+        if (!new_arr) { free(b->nodes); free(b); return NULL; }
+        g->blocks = new_arr;
+        g->block_capacity = new_cap;
+    }
+    g->blocks[g->block_count++] = b;
+
+    return b;
+}
+
+void kyir_block_add_node(KyBlock *b, KyNode *n) {
+    if (!b || !n) return;
+    if (b->num_nodes >= b->node_capacity) {
+        uint32_t new_cap = b->node_capacity * 2;
+        KyNode **new_arr = (KyNode **)realloc(b->nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        b->nodes = new_arr;
+        b->node_capacity = new_cap;
+    }
+    b->nodes[b->num_nodes++] = n;
+    n->block = b;
+}
+
+void kyir_block_add_successor(KyBlock *b, KyBlock *succ) {
+    if (!b || !succ) return;
+    if (b->num_successors >= b->num_succ_capacity) {
+        uint16_t new_cap = b->num_succ_capacity ? (uint16_t)(b->num_succ_capacity * 2) : 4;
+        KyBlock **new_arr = (KyBlock **)realloc(b->successors, new_cap * sizeof(KyBlock *));
+        if (!new_arr) return;
+        b->successors = new_arr;
+        b->num_succ_capacity = new_cap;
+    }
+    b->successors[b->num_successors++] = succ;
+}
+
+void kyir_block_add_predecessor(KyBlock *b, KyBlock *pred) {
+    if (!b || !pred) return;
+    if (b->num_predecessors >= b->num_pred_capacity) {
+        uint16_t new_cap = b->num_pred_capacity ? (uint16_t)(b->num_pred_capacity * 2) : 4;
+        KyBlock **new_arr = (KyBlock **)realloc(b->predecessors, new_cap * sizeof(KyBlock *));
+        if (!new_arr) return;
+        b->predecessors = new_arr;
+        b->num_pred_capacity = new_cap;
+    }
+    b->predecessors[b->num_predecessors++] = pred;
+}
+
+void kyir_block_set_terminator(KyBlock *b, KyNode *n) {
+    if (!b || !n) return;
+    /* Terminator is the last node in the block */
+    kyir_block_add_node(b, n);
+}
+
+void kyir_block_print(const KyBlock *b) {
+    if (!b) return;
+    printf("  b%-3u [%u nodes, %u succ, %u pred]\n",
+           b->id, b->num_nodes, b->num_successors, b->num_predecessors);
+}
+
+/* ============================================================
+ * Layer 3: Dominator Tree
+ *
+ * Uses the iterative Cooper-Harvey-Kennedy algorithm:
+ *   1. Postorder DFS to number blocks
+ *   2. Intersect function using postorder numbers
+ *   3. Iterate until fixed point
+ * ============================================================ */
+
+static uint32_t *g_rpo_num = NULL;
+static uint32_t *g_rpo = NULL;
+static uint32_t  g_rpo_count = 0;
+
+static void postorder_dfs(KyBlock *b, int *visited, uint32_t *temp_order, uint32_t *temp_count) {
+    if (!b || visited[b->id]) return;
+    visited[b->id] = 1;
+    for (uint16_t i = 0; i < b->num_successors; i++) {
+        postorder_dfs(b->successors[i], visited, temp_order, temp_count);
+    }
+    temp_order[(*temp_count)++] = b->id;
+}
+
+KyDomTree *kyir_domtree_build(KyGraph *g) {
+    if (!g || g->block_count == 0) return NULL;
+
+    KyDomTree *dt = (KyDomTree *)calloc(1, sizeof(KyDomTree));
+    if (!dt) return NULL;
+
+    dt->num_blocks = g->block_count;
+    dt->idom = (KyBlock **)calloc(g->block_count, sizeof(KyBlock *));
+    dt->dom_depth = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+    dt->postorder = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+    dt->postorder_num = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+
+    /* 1. Postorder DFS from entry block */
+    int *visited = (int *)calloc(g->block_count, sizeof(int));
+    uint32_t *temp = (uint32_t *)calloc(g->block_count, sizeof(uint32_t));
+    uint32_t temp_count = 0;
+    postorder_dfs(g->blocks[0], visited, temp, &temp_count);
+    free(visited);
+
+    /* Convert postorder to RPO (reverse postorder) */
+    /* RPO[0] = entry (highest number) */
+    for (uint32_t i = 0; i < temp_count; i++) {
+        uint32_t block_id = temp[temp_count - 1 - i];
+        dt->postorder[i] = block_id;
+        dt->postorder_num[block_id] = i;
+        /* RPO 0 is entry, RPO 1 is next, etc. */
+    }
+    free(temp);
+
+    /* Set RPO numbers: entry = 0, higher = later */
+    g_rpo = dt->postorder;
+    g_rpo_num = dt->postorder_num;
+    g_rpo_count = temp_count;
+
+    /* 2. Initialize idom: entry has self, others NULL */
+    dt->idom[g->blocks[0]->id] = g->blocks[0];
+    dt->dom_depth[g->blocks[0]->id] = 0;
+
+    /* 3. Iterate intersect until fixed point */
+    int changed = 1;
+    int iterations = 0;
+    while (changed && iterations < 1000) {
+        changed = 0;
+        iterations++;
+        /* Process in RPO (skip entry) */
+        for (uint32_t i = 1; i < g_rpo_count; i++) {
+            KyBlock *b = g->blocks[g_rpo[i]];
+            if (!b) continue;
+
+            KyBlock *new_idom = NULL;
+            for (uint16_t j = 0; j < b->num_predecessors; j++) {
+                KyBlock *pred = b->predecessors[j];
+                if (!dt->idom[pred->id]) continue;
+
+                if (!new_idom) {
+                    new_idom = pred;
+                } else {
+                    /* Cooper-Harvey-Kennedy intersect */
+                    KyBlock *a = new_idom;
+                    KyBlock *c = pred;
+                    int guard = 0;
+                    while (a != c && guard < 10000) {
+                        guard++;
+                        while (dt->postorder_num[a->id] > dt->postorder_num[c->id]) {
+                            if (!dt->idom[a->id] || dt->idom[a->id] == a) break;
+                            a = dt->idom[a->id];
+                        }
+                        while (dt->postorder_num[c->id] > dt->postorder_num[a->id]) {
+                            if (!dt->idom[c->id] || dt->idom[c->id] == c) break;
+                            c = dt->idom[c->id];
+                        }
+                    }
+                    new_idom = a;
+                }
+            }
+            if (new_idom && dt->idom[b->id] != new_idom) {
+                dt->idom[b->id] = new_idom;
+                dt->dom_depth[b->id] = dt->dom_depth[new_idom->id] + 1;
+                changed = 1;
+            }
+        }
+    }
+
+    return dt;
+}
+
+void kyir_domtree_destroy(KyDomTree *dt) {
+    if (!dt) return;
+    free(dt->idom);
+    free(dt->dom_depth);
+    free(dt->postorder);
+    free(dt->postorder_num);
+    free(dt);
+}
+
+int kyir_domtree_dominates(KyDomTree *dt, KyBlock *a, KyBlock *b) {
+    if (!dt || !a || !b) return 0;
+    if (a == b) return 1;
+
+    KyBlock *cur = b;
+    uint32_t guard = 0;
+    while (cur && cur != a && guard++ < 10000) {
+        KyBlock *next = dt->idom[cur->id];
+        if (!next || next == cur) break;  /* reached root or self-loop */
+        cur = next;
+    }
+    return cur == a;
+}
+
+KyBlock *kyir_domtree_lca(KyDomTree *dt, KyBlock *a, KyBlock *b) {
+    if (!dt || !a || !b) return NULL;
+    if (a == b) return a;
+
+    /* Walk up from a until it dominates b */
+    uint32_t guard = 0;
+    while (!kyir_domtree_dominates(dt, a, b) && guard++ < 10000) {
+        KyBlock *next = dt->idom[a->id];
+        if (!next || next == a) return NULL;
+        a = next;
+    }
+    return (guard < 10000) ? a : NULL;
+}
+
+
+/* ============================================================
+ * Layer 5: IR Builder
+ * ============================================================ */
+
+KyIRBuilder *kyir_builder_create(KyGraph *g) {
+    if (!g) return NULL;
+
+    KyIRBuilder *b = (KyIRBuilder *)calloc(1, sizeof(KyIRBuilder));
+    if (!b) return NULL;
+
+    b->graph = g;
+    b->var_capacity = 64;
+    b->var_nodes = (KyNode **)calloc(b->var_capacity, sizeof(KyNode *));
+
+    return b;
+}
+
+void kyir_builder_destroy(KyIRBuilder *b) {
+    if (!b) return;
+    free(b->var_nodes);
+    free(b->loop_stack);
+    free(b);
+}
+
+void kyir_builder_set_block(KyIRBuilder *b, KyBlock *block) {
+    if (!b || !block) return;
+    b->current_block = block;
+}
+
+KyNode *kyir_builder_get_var(KyIRBuilder *b, uint32_t var_id) {
+    if (!b || var_id >= b->num_vars) return NULL;
+    return b->var_nodes[var_id];
+}
+
+void kyir_builder_set_var(KyIRBuilder *b, uint32_t var_id, KyNode *value) {
+    if (!b) return;
+    if (var_id >= b->var_capacity) {
+        uint32_t new_cap = b->var_capacity;
+        while (new_cap <= var_id) new_cap *= 2;
+        KyNode **new_arr = (KyNode **)realloc(b->var_nodes, new_cap * sizeof(KyNode *));
+        if (!new_arr) return;
+        b->var_nodes = new_arr;
+        b->var_capacity = new_cap;
+    }
+    b->var_nodes[var_id] = value;
+    if (var_id >= b->num_vars) b->num_vars = var_id + 1;
+}
+
+KyNode *kyir_build_const(KyIRBuilder *b, int64_t value) {
+    return kyir_const_i64(b->graph, value);
+}
+
+KyNode *kyir_build_add(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_add(b->graph, a, c);
+}
+
+KyNode *kyir_build_sub(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_sub(b->graph, a, c);
+}
+
+KyNode *kyir_build_mul(KyIRBuilder *b, KyNode *a, KyNode *c) {
+    return kyir_mul(b->graph, a, c);
+}
+
+KyNode *kyir_build_shl(KyIRBuilder *b, KyNode *a, KyNode *s) { return kyir_shl(b->graph, a, s); }
+KyNode *kyir_build_shr(KyIRBuilder *b, KyNode *a, KyNode *s) { return kyir_shr(b->graph, a, s); }
+KyNode *kyir_build_sar(KyIRBuilder *b, KyNode *a, KyNode *s) { return kyir_sar(b->graph, a, s); }
+KyNode *kyir_build_and(KyIRBuilder *b, KyNode *a, KyNode *c) { return kyir_and(b->graph, a, c); }
+KyNode *kyir_build_or (KyIRBuilder *b, KyNode *a, KyNode *c) { return kyir_or (b->graph, a, c); }
+KyNode *kyir_build_xor(KyIRBuilder *b, KyNode *a, KyNode *c) { return kyir_xor(b->graph, a, c); }
+KyNode *kyir_build_neg(KyIRBuilder *b, KyNode *a) { return kyir_neg(b->graph, a); }
+KyNode *kyir_build_not(KyIRBuilder *b, KyNode *a) { return kyir_not(b->graph, a); }
+
+KyNode *kyir_build_load_field(KyIRBuilder *b, KyNode *obj, int32_t offset) {
+    if (!b || !obj) return NULL;
+    KyNode *ld = kyir_node_create(b->graph, IR_LOAD_FIELD);
+    if (!ld) return NULL;
+    kyir_node_add_value_input(ld, obj);
+    kyir_node_add_use(obj, ld);
+    ld->constant.i64 = offset;
+    ld->type = KYIR_TYPE_INT64;
+    if (b->current_block) kyir_block_add_node(b->current_block, ld);
+    return ld;
+}
+
+KyNode *kyir_build_store_field(KyIRBuilder *b, KyNode *obj, int32_t offset,
+                               KyNode *value) {
+    if (!b || !obj || !value) return NULL;
+    KyNode *st = kyir_node_create(b->graph, IR_STORE_FIELD);
+    if (!st) return NULL;
+    kyir_node_add_value_input(st, obj);
+    kyir_node_add_value_input(st, value);
+    kyir_node_add_use(obj, st);
+    kyir_node_add_use(value, st);
+    st->constant.i64 = offset;
+    if (b->current_block) kyir_block_add_node(b->current_block, st);
+    return st;
+}
+
+KyNode *kyir_build_return(KyIRBuilder *b, KyNode *value) {
+    if (!b || !value) return NULL;
+    KyNode *ret = kyir_node_create(b->graph, IR_RETURN);
+    if (!ret) return NULL;
+    kyir_node_add_value_input(ret, value);
+    kyir_node_add_use(value, ret);
+    /* Attach control (last control node in block) */
+    if (b->current_control) {
+        kyir_node_add_control_input(ret, b->current_control);
+    }
+    if (b->current_block) {
+        kyir_block_add_node(b->current_block, ret);
+    }
+    return ret;
+}
+
+
+/* ============================================================
+ * Layer 6: Optimizations
+ * ============================================================ */
+
+/* ---------- Utility: replace uses of one node with another ---------- */
+
+void kyir_node_remove_use(KyNode *n, KyNode *use) {
+    if (!n || !use) return;
+    for (uint16_t i = 0; i < n->num_uses; i++) {
+        if (n->uses[i] == use) {
+            n->uses[i] = n->uses[n->num_uses - 1];
+            n->num_uses--;
+            return;
+        }
+    }
+}
+
+void kyir_node_replace_uses(KyGraph *g, KyNode *old_node, KyNode *new_node) {
+    if (!g || !old_node || !new_node) return;
+
+    /* Update all uses of old_node to use new_node */
+    for (uint16_t u = 0; u < old_node->num_uses; u++) {
+        KyNode *user = old_node->uses[u];
+        if (!user) continue;
+
+        /* Replace in value_inputs */
+        for (uint16_t i = 0; i < user->num_values; i++) {
+            if (user->value_inputs[i] == old_node) {
+                user->value_inputs[i] = new_node;
+                kyir_node_add_use(new_node, user);
+            }
+        }
+        /* Replace in control_inputs */
+        for (uint16_t i = 0; i < user->num_controls; i++) {
+            if (user->control_inputs[i] == old_node) {
+                user->control_inputs[i] = new_node;
+            }
+        }
+        /* Replace in effect_inputs */
+        for (uint16_t i = 0; i < user->num_effects; i++) {
+            if (user->effect_inputs[i] == old_node) {
+                user->effect_inputs[i] = new_node;
+            }
+        }
+    }
+    old_node->num_uses = 0;
+}
+
+int kyir_node_is_constant(const KyNode *n) {
+    return n && (n->flags & KYIR_FLAG_CONSTANT);
+}
+
+int64_t kyir_node_const_i64(const KyNode *n) {
+    if (!n) return 0;
+    if (n->opcode == IR_CONST_I32) return (int64_t)n->constant.i32;
+    return n->constant.i64;
+}
+
+/* ---------- Constant Folding ---------- */
+
+int kyir_opt_constfold(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+
+        /* Skip non-arithmetic nodes */
+        if (n->num_values != 2) continue;
+
+        KyNode *a = n->value_inputs[0];
+        KyNode *b = n->value_inputs[1];
+        if (!kyir_node_is_constant(a) || !kyir_node_is_constant(b)) continue;
+
+        int64_t va = kyir_node_const_i64(a);
+        int64_t vb = kyir_node_const_i64(b);
+        int64_t result = 0;
+        int folded = 0;
+
+        switch (n->opcode) {
+            case IR_ADD_I32:
+            case IR_ADD_I64: result = va + vb; folded = 1; break;
+            case IR_SUB_I32:
+            case IR_SUB_I64: result = va - vb; folded = 1; break;
+            case IR_MUL_I32:
+            case IR_MUL_I64: result = va * vb; folded = 1; break;
+            case IR_DIV_I32:
+            case IR_DIV_I64: if (vb != 0) { result = va / vb; folded = 1; } break;
+            case IR_MOD_I32:
+            case IR_MOD_I64: if (vb != 0) { result = va % vb; folded = 1; } break;
+            case IR_AND: result = va & vb; folded = 1; break;
+            case IR_OR:  result = va | vb; folded = 1; break;
+            case IR_XOR: result = va ^ vb; folded = 1; break;
+            default: break;
+        }
+
+        if (folded) {
+            /* Replace node with constant */
+            KyNode *c = kyir_const_i64(g, result);
+            kyir_node_replace_uses(g, n, c);
+            n->flags |= KYIR_FLAG_DEAD;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Algebraic Simplify ---------- */
+
+static int is_const_zero(KyNode *n) {
+    return kyir_node_is_constant(n) && kyir_node_const_i64(n) == 0;
+}
+
+static int is_const_one(KyNode *n) {
+    return kyir_node_is_constant(n) && kyir_node_const_i64(n) == 1;
+}
+
+int kyir_opt_algebraic(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->num_values != 2) continue;
+
+        KyNode *a = n->value_inputs[0];
+        KyNode *b = n->value_inputs[1];
+        KyNode *replacement = NULL;
+
+        switch (n->opcode) {
+            case IR_ADD_I32: case IR_ADD_I64:
+                if (is_const_zero(a)) replacement = b;
+                else if (is_const_zero(b)) replacement = a;
+                break;
+
+            case IR_SUB_I32: case IR_SUB_I64:
+                if (is_const_zero(b)) replacement = a;
+                /* x - x = 0 */
+                if (a == b) {
+                    KyNode *c = kyir_const_i64(g, 0);
+                    replacement = c;
+                }
+                break;
+
+            case IR_MUL_I32: case IR_MUL_I64:
+                if (is_const_zero(a) || is_const_zero(b)) {
+                    KyNode *c = kyir_const_i64(g, 0);
+                    replacement = c;
+                } else if (is_const_one(a)) {
+                    replacement = b;
+                } else if (is_const_one(b)) {
+                    replacement = a;
+                }
+                break;
+
+            default: break;
+        }
+
+        if (replacement && replacement != n) {
+            kyir_node_replace_uses(g, n, replacement);
+            n->flags |= KYIR_FLAG_DEAD;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Dead Code Elimination ---------- */
+
+int kyir_opt_dce(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    /* A node is dead if:
+     * 1. It's marked DEAD, OR
+     * 2. It has no uses AND no side effects AND is not a terminator */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+
+        /* Skip constants — they can be reused */
+        if (kyir_node_is_constant(n)) continue;
+
+        /* Skip terminators and control nodes */
+        if (n->flags & KYIR_FLAG_CONTROL) continue;
+
+        /* Skip side effects */
+        if (n->flags & KYIR_FLAG_HAS_SIDE_EFFECT) continue;
+
+        /* If unused, mark dead */
+        if (n->num_uses == 0) {
+            n->flags |= KYIR_FLAG_DEAD;
+            /* Remove uses from its inputs */
+            for (uint16_t j = 0; j < n->num_values; j++) {
+                kyir_node_remove_use(n->value_inputs[j], n);
+            }
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ---------- Global Value Numbering (basic) ---------- */
+
+int kyir_opt_gvn(KyGraph *g) {
+    if (!g) return 0;
+    int changed = 0;
+
+    /* Simple O(n²) GVN — for each pair of nodes, if they compute the same
+     * thing, replace uses of the second with the first. */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *a = g->nodes[i];
+        if (!a || (a->flags & KYIR_FLAG_DEAD)) continue;
+        if (a->flags & (KYIR_FLAG_HAS_SIDE_EFFECT | KYIR_FLAG_CONTROL)) continue;
+        if (a->num_values != 2) continue;
+
+        for (uint32_t j = i + 1; j < g->node_count; j++) {
+            KyNode *b = g->nodes[j];
+            if (!b || (b->flags & KYIR_FLAG_DEAD)) continue;
+            if (b->opcode != a->opcode) continue;
+            if (b->num_values != a->num_values) continue;
+
+            /* Check if same inputs */
+            int same = 1;
+            for (uint16_t k = 0; k < a->num_values; k++) {
+                if (a->value_inputs[k] != b->value_inputs[k]) {
+                    /* Try commutative swap for ADD/MUL */
+                    if (a->opcode == IR_ADD_I32 || a->opcode == IR_ADD_I64 ||
+                        a->opcode == IR_MUL_I32 || a->opcode == IR_MUL_I64) {
+                        if (a->value_inputs[0] == b->value_inputs[1] &&
+                            a->value_inputs[1] == b->value_inputs[0]) {
+                            continue;
+                        }
+                    }
+                    same = 0;
+                    break;
+                }
+            }
+            if (same) {
+                kyir_node_replace_uses(g, b, a);
+                b->flags |= KYIR_FLAG_DEAD;
+                changed++;
+            }
+        }
+    }
+    return changed;
+}
+
+/* ---------- Optimize Driver ---------- */
+
+int kyir_optimize(KyGraph *g) {
+    if (!g) return 0;
+    int total_changes = 0;
+    int iteration = 0;
+    int changed;
+
+    do {
+        changed = 0;
+        changed |= kyir_opt_constfold(g);
+        changed |= kyir_opt_algebraic(g);
+        changed |= kyir_opt_gvn(g);
+        changed |= kyir_opt_dce(g);
+        total_changes += changed;
+        iteration++;
+    } while (changed > 0 && iteration < 20);
+
+    return total_changes;
+}
+
+/* ============================================================
+ * Layer 7: Graph Verifier
+ * ============================================================ */
+
+KyVerifyResult kyir_graph_verify(KyGraph *g) {
+    KyVerifyResult r;
+    memset(&r, 0, sizeof(r));
+    r.ok = 1;
+
+    if (!g) {
+        r.ok = 0;
+        snprintf(r.messages[r.errors++], 128, "graph is NULL");
+        return r;
+    }
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) {
+            r.ok = 0;
+            snprintf(r.messages[r.errors++], 128, "node %u is NULL", i);
+            if (r.errors >= 16) break;
+            continue;
+        }
+
+        /* Every node should have valid id */
+        if (n->id != i) {
+            r.ok = 0;
+            snprintf(r.messages[r.errors++], 128,
+                     "node at %u has id %u", i, n->id);
+            if (r.errors >= 16) break;
+        }
+
+        /* Every value input should be non-NULL */
+        for (uint16_t j = 0; j < n->num_values; j++) {
+            if (!n->value_inputs[j]) {
+                r.ok = 0;
+                snprintf(r.messages[r.errors++], 128,
+                         "node %u has NULL value input %u", n->id, j);
+                if (r.errors >= 16) break;
+            }
+        }
+        if (r.errors >= 16) break;
+    }
+
+    return r;
+}
+
+
+/* ============================================================
+ * Layer 8: Dominance Frontier
+ *
+ * DF(X) = { Y | X dominates a predecessor of Y, but X does not
+ *            strictly dominate Y }
+ *
+ * Algorithm (Cooper-Harvey-Kennedy):
+ *   for each block Y:
+ *       for each predecessor P of Y:
+ *           runner = P
+ *           while runner != idom(Y):
+ *               add Y to DF(runner)
+ *               runner = idom(runner)
+ * ============================================================ */
+
+KyDominanceFrontier *kyir_domfrontier_build(KyGraph *g, KyDomTree *dt) {
+    if (!g || !dt) return NULL;
+
+    KyDominanceFrontier *df = (KyDominanceFrontier *)calloc(g->block_count,
+                                                             sizeof(KyDominanceFrontier));
+    if (!df) return NULL;
+
+    for (uint32_t i = 0; i < g->block_count; i++) {
+        df[i].num_blocks = 0;
+        df[i].capacity = 4;
+        df[i].frontier = (KyBlock **)calloc(df[i].capacity, sizeof(KyBlock *));
+    }
+
+    for (uint32_t i = 0; i < g->block_count; i++) {
+        KyBlock *y = g->blocks[i];
+        if (!y || y->num_predecessors < 2) continue;
+
+        for (uint16_t j = 0; j < y->num_predecessors; j++) {
+            KyBlock *p = y->predecessors[j];
+            KyBlock *runner = p;
+            uint32_t guard = 0;
+            while (runner && runner != dt->idom[y->id] && guard++ < 10000) {
+                /* Add y to DF(runner) */
+                KyDominanceFrontier *f = &df[runner->id];
+                int found = 0;
+                for (uint32_t k = 0; k < f->num_blocks; k++) {
+                    if (f->frontier[k] == y) { found = 1; break; }
+                }
+                if (!found) {
+                    if (f->num_blocks >= f->capacity) {
+                        f->capacity *= 2;
+                        f->frontier = (KyBlock **)realloc(f->frontier,
+                                        f->capacity * sizeof(KyBlock *));
+                    }
+                    f->frontier[f->num_blocks++] = y;
+                }
+                KyBlock *next = dt->idom[runner->id];
+                if (!next || next == runner) break;
+                runner = next;
+            }
+        }
+    }
+
+    return df;
+}
+
+void kyir_domfrontier_destroy(KyDominanceFrontier *df) {
+    if (!df) return;
+    /* df is an array — need to free inner arrays */
+    /* We don't know the count here, but the caller knows */
+    /* For safety, we free the array of frontiers externally */
+    free(df);
+}
+
+/* ============================================================
+ * SSA Context
+ * ============================================================ */
+
+KySSAContext *kyir_ssa_create(KyGraph *g, KyDomTree *dt) {
+    if (!g || !dt) return NULL;
+
+    KySSAContext *ssa = (KySSAContext *)calloc(1, sizeof(KySSAContext));
+    if (!ssa) return NULL;
+
+    ssa->graph = g;
+    ssa->domtree = dt;
+    ssa->num_vars = 64;
+
+    ssa->var_defs = (void *)calloc(ssa->num_vars, sizeof(*ssa->var_defs));
+    for (uint32_t i = 0; i < ssa->num_vars; i++) {
+        ssa->var_defs[i].capacity = 8;
+        ssa->var_defs[i].defs = (KyNode **)calloc(8, sizeof(KyNode *));
+        ssa->var_defs[i].depth = 0;
+    }
+
+    ssa->phi_capacity = 64;
+    ssa->phis = (KyNode **)calloc(ssa->phi_capacity, sizeof(KyNode *));
+
+    return ssa;
+}
+
+void kyir_ssa_destroy(KySSAContext *ssa) {
+    if (!ssa) return;
+    if (ssa->var_defs) {
+        for (uint32_t i = 0; i < ssa->num_vars; i++) {
+            free(ssa->var_defs[i].defs);
+        }
+        free(ssa->var_defs);
+    }
+    free(ssa->phis);
+    free(ssa);
+}
+
+/* ============================================================
+ * Phi Node
+ * ============================================================ */
+
+KyNode *kyir_phi_create(KyGraph *g, uint32_t num_inputs) {
+    if (!g) return NULL;
+
+    KyNode *phi = kyir_node_create(g, IR_PHI);
+    if (!phi) return NULL;
+
+    phi->type = KYIR_TYPE_UNKNOWN;
+
+    /* Reserve space for num_inputs value inputs */
+    if (num_inputs > 0) {
+        phi->value_inputs = (KyNode **)calloc(num_inputs, sizeof(KyNode *));
+        phi->num_values = 0;
+    }
+
+    return phi;
+}
+
+/* ============================================================
+ * SSA Print
+ * ============================================================ */
+
+void kyir_ssa_print(KySSAContext *ssa) {
+    if (!ssa) return;
+    printf("SSA Context:\n");
+    printf("  Graph: %u nodes, %u blocks\n",
+           ssa->graph->node_count, ssa->graph->block_count);
+    printf("  Phi nodes inserted: %u\n", ssa->num_phis);
+    for (uint32_t i = 0; i < ssa->num_phis; i++) {
+        KyNode *phi = ssa->phis[i];
+        printf("    phi n%u in block b%u (%u inputs)\n",
+               phi->id, phi->block ? phi->block->id : 0, phi->num_values);
+    }
+}
+
+/* ============================================================
+ * Main SSA Construction
+ *
+ * This is a simplified SSA construction that:
+ *   1. Builds dominator tree (caller passes it)
+ *   2. Computes dominance frontiers
+ *   3. Inserts phi nodes at DF for each variable
+ *   4. Renames variables
+ *
+ * For simplicity, this version handles the case where each
+ * block has at most one variable definition and does not
+ * implement full Braun's algorithm (which requires def tracking).
+ * ============================================================ */
+
+int kyir_ssa_construct_full(KyGraph *g) {
+    if (!g) return -1;
+
+    /* Step 1: build dominator tree */
+    KyDomTree *dt = kyir_domtree_build(g);
+    if (!dt) return -1;
+
+    /* Step 2: build dominance frontiers */
+    KyDominanceFrontier *df = kyir_domfrontier_build(g, dt);
+    if (!df) {
+        kyir_domtree_destroy(dt);
+        return -1;
+    }
+
+    /* Step 3: find variables (nodes that are redefined across blocks) */
+    /* For this simplified version, we track per-variable defs and insert
+     * phi nodes at dominance frontiers */
+
+    /* Count how many blocks define each "variable"
+     * Since our IR doesn't have explicit variables yet, we use a simple
+     * heuristic: any node used in a block that's dominated by different
+     * predecessor paths */
+
+    /* Placeholder: for now, just mark that SSA ran */
+    /* Full implementation of Braun's algorithm needs:
+     * - explicit variable IDs
+     * - per-variable def stacks
+     * - dominator tree DFS with rename */
+
+    /* Clean up */
+    kyir_domfrontier_destroy(df);
+    kyir_domtree_destroy(dt);
+    return 0;
+}
+
+
+/* ============================================================
+ * Layer 9: Loop Detection
+ * ============================================================ */
+
+/* Check if a block is in the loop body */
+static int loop_has_block(KyLoop *loop, KyBlock *b) {
+    for (uint32_t i = 0; i < loop->num_body; i++) {
+        if (loop->body[i] == b) return 1;
+    }
+    return 0;
+}
+
+/* Add block to loop body */
+static void loop_add_block(KyLoop *loop, KyBlock *b) {
+    if (loop_has_block(loop, b)) return;
+    if (loop->num_body >= loop->body_capacity) {
+        loop->body_capacity *= 2;
+        loop->body = (KyBlock **)realloc(loop->body,
+                                          loop->body_capacity * sizeof(KyBlock *));
+    }
+    loop->body[loop->num_body++] = b;
+}
+
+/* Add exit to loop */
+static void loop_add_exit(KyLoop *loop, KyBlock *b) {
+    for (uint32_t i = 0; i < loop->num_exits; i++) {
+        if (loop->exits[i] == b) return;
+    }
+    if (loop->num_exits >= loop->exit_capacity) {
+        loop->exit_capacity = loop->exit_capacity ? loop->exit_capacity * 2 : 4;
+        loop->exits = (KyBlock **)realloc(loop->exits,
+                                          loop->exit_capacity * sizeof(KyBlock *));
+    }
+    loop->exits[loop->num_exits++] = b;
+}
+
+/* Find natural loop for back edge b -> h */
+static KyLoop *find_natural_loop(KyGraph *g, KyBlock *h, KyBlock *b) {
+    (void)g;
+
+    KyLoop *loop = (KyLoop *)calloc(1, sizeof(KyLoop));
+    if (!loop) return NULL;
+
+    loop->header = h;
+    loop->latch = b;
+    loop->body_capacity = 8;
+    loop->body = (KyBlock **)calloc(loop->body_capacity, sizeof(KyBlock *));
+    loop->exit_capacity = 4;
+    loop->exits = (KyBlock **)calloc(loop->exit_capacity, sizeof(KyBlock *));
+    loop->child_capacity = 4;
+    loop->children = (KyLoop **)calloc(loop->child_capacity, sizeof(KyLoop *));
+
+    /* Start from header */
+    loop_add_block(loop, h);
+
+    if (b == h) return loop;
+
+    /* Worklist: start from latch, add predecessors that aren't in loop */
+    KyBlock **stack = (KyBlock **)calloc(1024, sizeof(KyBlock *));
+    uint32_t stack_top = 0;
+    stack[stack_top++] = b;
+
+    while (stack_top > 0) {
+        KyBlock *n = stack[--stack_top];
+        if (loop_has_block(loop, n)) continue;
+
+        loop_add_block(loop, n);
+
+        for (uint16_t i = 0; i < n->num_predecessors; i++) {
+            KyBlock *p = n->predecessors[i];
+            if (!loop_has_block(loop, p)) {
+                if (stack_top < 1024) {
+                    stack[stack_top++] = p;
+                }
+            }
+        }
+    }
+    free(stack);
+
+    /* Find exits: successors outside the loop */
+    for (uint32_t i = 0; i < loop->num_body; i++) {
+        KyBlock *bb = loop->body[i];
+        for (uint16_t j = 0; j < bb->num_successors; j++) {
+            KyBlock *succ = bb->successors[j];
+            if (!loop_has_block(loop, succ)) {
+                loop_add_exit(loop, succ);
+            }
+        }
+    }
+
+    return loop;
+}
+
+/* Add loop to loop info */
+static void loopinfo_add(KyLoopInfo *li, KyLoop *loop) {
+    if (li->num_loops >= li->capacity) {
+        li->capacity = li->capacity ? li->capacity * 2 : 8;
+        li->loops = (KyLoop **)realloc(li->loops, li->capacity * sizeof(KyLoop *));
+    }
+    li->loops[li->num_loops++] = loop;
+}
+
+KyLoopInfo *kyir_loopinfo_build(KyGraph *g, KyDomTree *dt) {
+    if (!g || !dt) return NULL;
+
+    KyLoopInfo *li = (KyLoopInfo *)calloc(1, sizeof(KyLoopInfo));
+    if (!li) return NULL;
+
+    li->capacity = 8;
+    li->loops = (KyLoop **)calloc(li->capacity, sizeof(KyLoop *));
+    li->block_loop = (KyLoop **)calloc(g->block_count, sizeof(KyLoop *));
+
+    /* Step 1: find back edges */
+    for (uint32_t i = 0; i < g->block_count; i++) {
+        KyBlock *b = g->blocks[i];
+        if (!b) continue;
+
+        for (uint16_t j = 0; j < b->num_successors; j++) {
+            KyBlock *succ = b->successors[j];
+
+            /* Back edge: b -> succ where succ dominates b */
+            if (kyir_domtree_dominates(dt, succ, b)) {
+                /* Find or create loop for this header */
+                KyLoop *existing = NULL;
+                for (uint32_t k = 0; k < li->num_loops; k++) {
+                    if (li->loops[k]->header == succ) {
+                        existing = li->loops[k];
+                        break;
+                    }
+                }
+
+                if (existing) {
+                    /* Merge: add blocks from new loop to existing */
+                    KyLoop *new_loop = find_natural_loop(g, succ, b);
+                    if (new_loop) {
+                        for (uint32_t k = 0; k < new_loop->num_body; k++) {
+                            loop_add_block(existing, new_loop->body[k]);
+                        }
+                        for (uint32_t k = 0; k < new_loop->num_exits; k++) {
+                            loop_add_exit(existing, new_loop->exits[k]);
+                        }
+                        free(new_loop->body);
+                        free(new_loop->exits);
+                        free(new_loop->children);
+                        free(new_loop);
+                    }
+                } else {
+                    KyLoop *loop = find_natural_loop(g, succ, b);
+                    if (loop) {
+                        loopinfo_add(li, loop);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Step 2: compute preheaders and block_loop map */
+    for (uint32_t i = 0; i < li->num_loops; i++) {
+        KyLoop *loop = li->loops[i];
+
+        /* Preheader: unique predecessor outside loop */
+        KyBlock *preheader = NULL;
+        int outside_count = 0;
+        for (uint16_t j = 0; j < loop->header->num_predecessors; j++) {
+            KyBlock *p = loop->header->predecessors[j];
+            if (!loop_has_block(loop, p)) {
+                preheader = p;
+                outside_count++;
+            }
+        }
+        if (outside_count == 1) loop->preheader = preheader;
+
+        /* Update block_loop map (innermost) */
+        for (uint32_t k = 0; k < loop->num_body; k++) {
+            KyBlock *b = loop->body[k];
+            KyLoop *current = li->block_loop[b->id];
+            if (!current || loop->num_body < current->num_body) {
+                li->block_loop[b->id] = loop;
+            }
+        }
+    }
+
+    /* Step 3: build loop nest tree (by size) */
+    for (uint32_t i = 0; i < li->num_loops; i++) {
+        KyLoop *inner = li->loops[i];
+        KyLoop *parent = NULL;
+        for (uint32_t j = 0; j < li->num_loops; j++) {
+            if (i == j) continue;
+            KyLoop *outer = li->loops[j];
+            if (outer->num_body > inner->num_body &&
+                loop_has_block(outer, inner->header)) {
+                if (!parent || outer->num_body < parent->num_body) {
+                    parent = outer;
+                }
+            }
+        }
+        inner->parent = parent;
+        if (parent) {
+            if (parent->num_children >= parent->child_capacity) {
+                parent->child_capacity *= 2;
+                parent->children = (KyLoop **)realloc(parent->children,
+                    parent->child_capacity * sizeof(KyLoop *));
+            }
+            parent->children[parent->num_children++] = inner;
+        }
+    }
+
+    /* Step 4: compute depth and innermost flags */
+    for (uint32_t i = 0; i < li->num_loops; i++) {
+        KyLoop *loop = li->loops[i];
+        uint32_t depth = 0;
+        KyLoop *cur = loop->parent;
+        while (cur) { depth++; cur = cur->parent; }
+        loop->depth = depth;
+        loop->is_innermost = (loop->num_children == 0);
+    }
+
+    return li;
+}
+
+void kyir_loopinfo_destroy(KyLoopInfo *li) {
+    if (!li) return;
+    for (uint32_t i = 0; i < li->num_loops; i++) {
+        KyLoop *l = li->loops[i];
+        free(l->body);
+        free(l->exits);
+        free(l->children);
+        free(l);
+    }
+    free(li->loops);
+    free(li->block_loop);
+    free(li);
+}
+
+KyLoop *kyir_loop_of_block(KyLoopInfo *li, KyBlock *b) {
+    if (!li || !b) return NULL;
+    return li->block_loop[b->id];
+}
+
+int kyir_loop_contains(KyLoop *loop, KyBlock *b) {
+    if (!loop || !b) return 0;
+    return loop_has_block(loop, b);
+}
+
+void kyir_loopinfo_print(KyLoopInfo *li) {
+    if (!li) return;
+    printf("Loop Info: %u loops\n", li->num_loops);
+    for (uint32_t i = 0; i < li->num_loops; i++) {
+        KyLoop *l = li->loops[i];
+        printf("  loop %u: header=b%u latch=b%u body=%u exits=%u depth=%u%s\n",
+               i, l->header->id, l->latch ? l->latch->id : 0,
+               l->num_body, l->num_exits, l->depth,
+               l->is_innermost ? " (innermost)" : "");
+    }
+}
+
+/* ============================================================
+ * LICM — Loop Invariant Code Motion
+ *
+ * For each loop (innermost first):
+ *   For each node in loop:
+ *     If node is loop-invariant (all inputs defined outside loop):
+ *       If node is safe to hoist (no side effects, no control):
+ *         Hoist to preheader
+ * ============================================================ */
+
+static int node_is_loop_invariant(KyNode *n, KyLoop *loop, KyLoopInfo *li) {
+    if (!n || !loop) return 0;
+
+    /* Skip control nodes, phis, side effects */
+    if (n->flags & KYIR_FLAG_CONTROL) return 0;
+    if (n->opcode == IR_PHI) return 0;
+    if (n->flags & KYIR_FLAG_HAS_SIDE_EFFECT) return 0;
+
+    /* Check all value inputs */
+    for (uint16_t i = 0; i < n->num_values; i++) {
+        KyNode *in = n->value_inputs[i];
+        if (!in) continue;
+
+        /* If input is in the loop, not invariant */
+        if (in->block) {
+            KyLoop *in_loop = kyir_loop_of_block(li, in->block);
+            if (in_loop == loop) return 0;
+            /* Or in a nested loop of this loop */
+            KyLoop *p = in_loop;
+            while (p) {
+                if (p == loop) return 0;
+                p = p->parent;
+            }
+        }
+    }
+
+    return 1;
+}
+
+static int node_dominates_loop_exits(KyNode *n, KyLoop *loop, KyDomTree *dt) {
+    if (!n || !n->block || !loop || !dt) return 0;
+    for (uint32_t i = 0; i < loop->num_exits; i++) {
+        if (!kyir_domtree_dominates(dt, n->block, loop->exits[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+KyLICMResult kyir_licm(KyGraph *g, KyLoopInfo *li, KyDomTree *dt) {
+    KyLICMResult result = {0};
+    if (!g || !li || !dt) return result;
+
+    /* Process innermost first */
+    for (uint32_t pass = 0; pass < li->num_loops; pass++) {
+        for (uint32_t i = 0; i < li->num_loops; i++) {
+            KyLoop *loop = li->loops[i];
+            if (!loop->preheader) continue;
+            if (!loop->is_innermost && pass < li->num_loops - 1) continue;
+
+            result.loops_processed++;
+
+            int changed = 1;
+            int iterations = 0;
+            while (changed && iterations++ < 10) {
+                changed = 0;
+                for (uint32_t j = 0; j < g->node_count; j++) {
+                    KyNode *n = g->nodes[j];
+                    if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+                    if (!n->block) continue;
+                    if (!loop_has_block(loop, n->block)) continue;
+
+                    if (node_is_loop_invariant(n, loop, li) &&
+                        node_dominates_loop_exits(n, loop, dt)) {
+                        /* Hoist to preheader */
+                        n->block = loop->preheader;
+                        kyir_block_add_node(loop->preheader, n);
+                        result.nodes_hoisted++;
+                        changed = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/* ============================================================
+ * Loop Unrolling — duplicate body N times
+ * ============================================================ */
+
+KyUnrollResult kyir_loop_unroll(KyGraph *g, KyLoopInfo *li, KyDomTree *dt,
+                                uint32_t factor) {
+    KyUnrollResult result = {0};
+    (void)g; (void)li; (void)dt; (void)factor;
+    /* Placeholder — real unrolling requires cloning nodes + blocks */
+    return result;
+}
+
+
+/* ============================================================
+ * Layer 10: Type Inference
+ * ============================================================ */
+
+const char *kyir_type_name(KyIRType t) {
+    switch (t) {
+        case KYIR_TYPE_UNKNOWN:   return "Unknown";
+        case KYIR_TYPE_INT32:     return "Int32";
+        case KYIR_TYPE_INT64:     return "Int64";
+        case KYIR_TYPE_FLOAT32:   return "Float32";
+        case KYIR_TYPE_FLOAT64:   return "Float64";
+        case KYIR_TYPE_PTR:       return "Ptr";
+        case KYIR_TYPE_OBJECT:    return "Object";
+        case KYIR_TYPE_ARRAY:     return "Array";
+        case KYIR_TYPE_STRING:    return "String";
+        case KYIR_TYPE_FUNCTION:  return "Function";
+        case KYIR_TYPE_NULL:      return "Null";
+        case KYIR_TYPE_UNDEFINED: return "Undefined";
+        case KYIR_TYPE_BOOLEAN:   return "Boolean";
+        case KYIR_TYPE_ANY:       return "Any";
+        default:                  return "?";
+    }
+}
+
+/* Find the "union" or "meet" of two types.
+ * Since our lattice is a flat list of specific types, we implement:
+ *   - Same type: return it
+ *   - INT32 + INT64 = INT64 (wider)
+ *   - Any + T = Any
+ *   - Otherwise: UNKNOWN */
+static KyIRType meet_types(KyIRType a, KyIRType b) {
+    if (a == b) return a;
+    if (a == KYIR_TYPE_UNKNOWN) return b;
+    if (b == KYIR_TYPE_UNKNOWN) return a;
+    if (a == KYIR_TYPE_ANY || b == KYIR_TYPE_ANY) return KYIR_TYPE_ANY;
+
+    /* Numeric widening */
+    int a_int = (a == KYIR_TYPE_INT32 || a == KYIR_TYPE_INT64);
+    int b_int = (b == KYIR_TYPE_INT32 || b == KYIR_TYPE_INT64);
+    if (a_int && b_int) {
+        return (a == KYIR_TYPE_INT64 || b == KYIR_TYPE_INT64)
+               ? KYIR_TYPE_INT64 : KYIR_TYPE_INT32;
+    }
+
+    int a_f = (a == KYIR_TYPE_FLOAT32 || a == KYIR_TYPE_FLOAT64);
+    int b_f = (b == KYIR_TYPE_FLOAT32 || b == KYIR_TYPE_FLOAT64);
+    if (a_f && b_f) {
+        return (a == KYIR_TYPE_FLOAT64 || b == KYIR_TYPE_FLOAT64)
+               ? KYIR_TYPE_FLOAT64 : KYIR_TYPE_FLOAT32;
+    }
+
+    int a_num = a_int || a_f;
+    int b_num = b_int || b_f;
+    if (a_num && b_num) return KYIR_TYPE_FLOAT64;  /* int + float = float64 */
+
+    return KYIR_TYPE_UNKNOWN;
+}
+
+static KyTypeLattice type_from_opcode(KyIROpcode op) {
+    KyTypeLattice t = {0};
+    t.base = KYIR_TYPE_UNKNOWN;
+    t.min = INT64_MIN;
+    t.max = INT64_MAX;
+
+    switch (op) {
+        case IR_CONST_I32:
+            t.base = KYIR_TYPE_INT32;
+            break;
+        case IR_CONST_I64:
+            t.base = KYIR_TYPE_INT64;
+            break;
+        case IR_CONST_F32:
+            t.base = KYIR_TYPE_FLOAT32;
+            break;
+        case IR_CONST_F64:
+            t.base = KYIR_TYPE_FLOAT64;
+            break;
+        case IR_CONST_TRUE:
+        case IR_CONST_FALSE:
+            t.base = KYIR_TYPE_BOOLEAN;
+            break;
+        case IR_CONST_NULL:
+            t.base = KYIR_TYPE_NULL;
+            break;
+        case IR_CONST_UNDEF:
+            t.base = KYIR_TYPE_UNDEFINED;
+            break;
+
+        case IR_ADD_I32: case IR_SUB_I32: case IR_MUL_I32: case IR_DIV_I32:
+        case IR_MOD_I32: case IR_NEG_I32:
+        case IR_SHL: case IR_SHR: case IR_AND: case IR_OR: case IR_XOR:
+            t.base = KYIR_TYPE_INT32;
+            break;
+
+        case IR_ADD_I64: case IR_SUB_I64: case IR_MUL_I64: case IR_DIV_I64:
+        case IR_MOD_I64: case IR_NEG_I64:
+            t.base = KYIR_TYPE_INT64;
+            break;
+
+        case IR_ADD_F32: case IR_SUB_F32: case IR_MUL_F32: case IR_DIV_F32:
+            t.base = KYIR_TYPE_FLOAT32;
+            break;
+
+        case IR_ADD_F64: case IR_SUB_F64: case IR_MUL_F64: case IR_DIV_F64:
+            t.base = KYIR_TYPE_FLOAT64;
+            break;
+
+        case IR_CMP_EQ: case IR_CMP_NE: case IR_CMP_LT:
+        case IR_CMP_LE: case IR_CMP_GT: case IR_CMP_GE:
+            t.base = KYIR_TYPE_BOOLEAN;
+            break;
+
+        case IR_NEW_OBJECT:
+            t.base = KYIR_TYPE_OBJECT;
+            break;
+        case IR_NEW_ARRAY:
+            t.base = KYIR_TYPE_ARRAY;
+            break;
+        case IR_NEW_CLOSURE:
+            t.base = KYIR_TYPE_FUNCTION;
+            break;
+
+        default:
+            t.base = KYIR_TYPE_UNKNOWN;
+            break;
+    }
+    return t;
+}
+
+/* Infer type for a single node based on opcode + inputs */
+static int infer_node_type(KyTypeInference *ti, KyNode *n) {
+    KyTypeLattice old = ti->info[n->id].type;
+    KyTypeLattice new_type = type_from_opcode((KyIROpcode)n->opcode);
+
+    /* Constant values override */
+    if (n->opcode == IR_CONST_I32) {
+        new_type.base = KYIR_TYPE_INT32;
+        new_type.is_const = 1;
+        new_type.const_val = n->constant.i32;
+        new_type.min = new_type.max = n->constant.i32;
+        new_type.is_exact = 1;
+    } else if (n->opcode == IR_CONST_I64) {
+        new_type.base = KYIR_TYPE_INT64;
+        new_type.is_const = 1;
+        new_type.const_val = n->constant.i64;
+        new_type.min = new_type.max = n->constant.i64;
+        new_type.is_exact = 1;
+    } else if (n->opcode == IR_CONST_F32) {
+        new_type.base = KYIR_TYPE_FLOAT32;
+        new_type.is_const = 1;
+        new_type.is_exact = 1;
+    } else if (n->opcode == IR_CONST_F64) {
+        new_type.base = KYIR_TYPE_FLOAT64;
+        new_type.is_const = 1;
+        new_type.is_exact = 1;
+    } else if (n->opcode == IR_CONST_TRUE || n->opcode == IR_CONST_FALSE) {
+        new_type.base = KYIR_TYPE_BOOLEAN;
+        new_type.is_const = 1;
+        new_type.is_exact = 1;
+    } else if (n->opcode == IR_PHI) {
+        /* Phi: meet of all inputs */
+        KyIRType t = KYIR_TYPE_UNKNOWN;
+        for (uint16_t i = 0; i < n->num_values; i++) {
+            KyNode *in = n->value_inputs[i];
+            if (!in) continue;
+            t = meet_types(t, ti->info[in->id].type.base);
+        }
+        new_type.base = t;
+    } else if (n->num_values >= 2 &&
+               (n->opcode == IR_ADD_I32 || n->opcode == IR_ADD_I64 ||
+                n->opcode == IR_SUB_I32 || n->opcode == IR_SUB_I64 ||
+                n->opcode == IR_MUL_I32 || n->opcode == IR_MUL_I64)) {
+        /* Arithmetic: meet of inputs */
+        KyTypeLattice t1 = ti->info[n->value_inputs[0]->id].type;
+        KyTypeLattice t2 = ti->info[n->value_inputs[1]->id].type;
+        new_type.base = meet_types(t1.base, t2.base);
+
+        /* Range analysis for +, -, * */
+        if (n->opcode == IR_ADD_I64 || n->opcode == IR_ADD_I32) {
+            if (t1.min != INT64_MIN && t2.min != INT64_MIN) {
+                new_type.min = t1.min + t2.min;
+            }
+            if (t1.max != INT64_MAX && t2.max != INT64_MAX) {
+                new_type.max = t1.max + t2.max;
+            }
+        } else if (n->opcode == IR_SUB_I64 || n->opcode == IR_SUB_I32) {
+            if (t1.min != INT64_MIN && t2.max != INT64_MAX) {
+                new_type.min = t1.min - t2.max;
+            }
+            if (t1.max != INT64_MAX && t2.min != INT64_MIN) {
+                new_type.max = t1.max - t2.min;
+            }
+        } else if (n->opcode == IR_MUL_I64 || n->opcode == IR_MUL_I32) {
+            if (t1.min != INT64_MIN && t2.min != INT64_MIN &&
+                t1.max != INT64_MAX && t2.max != INT64_MAX) {
+                int64_t a = t1.min * t2.min, b = t1.min * t2.max;
+                int64_t c = t1.max * t2.min, d = t1.max * t2.max;
+                int64_t mn = a, mx = a;
+                if (b < mn) mn = b; if (b > mx) mx = b;
+                if (c < mn) mn = c; if (c > mx) mx = c;
+                if (d < mn) mn = d; if (d > mx) mx = d;
+                new_type.min = mn;
+                new_type.max = mx;
+            }
+        }
+
+        /* If range is exact, mark as constant */
+        if (new_type.min == new_type.max &&
+            new_type.min != INT64_MIN && new_type.max != INT64_MAX) {
+            new_type.is_const = 1;
+            new_type.const_val = new_type.min;
+            new_type.is_exact = 1;
+        }
+    }
+
+    /* Check for changes */
+    int changed = 0;
+    if (old.base != new_type.base ||
+        old.min != new_type.min ||
+        old.max != new_type.max ||
+        old.is_const != new_type.is_const) {
+        changed = 1;
+    }
+
+    ti->info[n->id].type = new_type;
+    return changed;
+}
+
+KyTypeInference *kyir_types_infer(KyGraph *g, KyDomTree *dt) {
+    (void)dt;
+    if (!g) return NULL;
+
+    KyTypeInference *ti = (KyTypeInference *)calloc(1, sizeof(KyTypeInference));
+    if (!ti) return NULL;
+
+    ti->graph = g;
+    ti->info = (KyNodeTypeInfo *)calloc(g->node_count, sizeof(KyNodeTypeInfo));
+
+    /* Initialize all types to UNKNOWN */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        ti->info[i].type.base = KYIR_TYPE_UNKNOWN;
+        ti->info[i].type.min = INT64_MIN;
+        ti->info[i].type.max = INT64_MAX;
+    }
+
+    /* Fixed-point iteration */
+    int changed = 1;
+    uint32_t iterations = 0;
+    while (changed && iterations < 100) {
+        changed = 0;
+        iterations++;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            KyNode *n = g->nodes[i];
+            if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+            if (infer_node_type(ti, n)) changed = 1;
+        }
+    }
+
+    ti->num_iterations = iterations;
+    return ti;
+}
+
+void kyir_types_destroy(KyTypeInference *ti) {
+    if (!ti) return;
+    free(ti->info);
+    free(ti);
+}
+
+KyTypeLattice kyir_types_get(KyTypeInference *ti, KyNode *n) {
+    KyTypeLattice empty = {0};
+    if (!ti || !n) return empty;
+    return ti->info[n->id].type;
+}
+
+int kyir_types_is_const(KyTypeInference *ti, KyNode *n, int64_t *out) {
+    if (!ti || !n) return 0;
+    KyTypeLattice t = ti->info[n->id].type;
+    if (t.is_const) {
+        if (out) *out = t.const_val;
+        return 1;
+    }
+    return 0;
+}
+
+int kyir_types_is_int(KyTypeInference *ti, KyNode *n) {
+    if (!ti || !n) return 0;
+    KyIRType t = ti->info[n->id].type.base;
+    return t == KYIR_TYPE_INT32 || t == KYIR_TYPE_INT64;
+}
+
+int kyir_types_is_float(KyTypeInference *ti, KyNode *n) {
+    if (!ti || !n) return 0;
+    KyIRType t = ti->info[n->id].type.base;
+    return t == KYIR_TYPE_FLOAT32 || t == KYIR_TYPE_FLOAT64;
+}
+
+void kyir_types_print(KyTypeInference *ti) {
+    if (!ti) return;
+    printf("Type Inference: %u nodes, %u iterations\n",
+           ti->graph->node_count, ti->num_iterations);
+    for (uint32_t i = 0; i < ti->graph->node_count; i++) {
+        KyNode *n = ti->graph->nodes[i];
+        if (!n) continue;
+        KyTypeLattice t = ti->info[i].type;
+        printf("  n%-4u %-14s type=%-10s", n->id,
+               opcode_name((KyIROpcode)n->opcode),
+               kyir_type_name(t.base));
+        if (t.is_const) {
+            printf(" const=%lld", (long long)t.const_val);
+        } else if (t.min != INT64_MIN || t.max != INT64_MAX) {
+            printf(" range=[%lld, %lld]", (long long)t.min, (long long)t.max);
+        }
+        printf("\n");
+    }
+}
+
+/* ============================================================
+ * SCCP — Sparse Conditional Constant Propagation
+ *
+ * Uses type info to propagate constants through the graph.
+ * ============================================================ */
+
+int kyir_opt_sccp(KyGraph *g, KyTypeInference *ti) {
+    if (!g || !ti) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->flags & KYIR_FLAG_CONSTANT) continue;
+
+        /* If all inputs are constants, fold */
+        int all_const = 1;
+        int64_t vals[4];
+        for (uint16_t j = 0; j < n->num_values; j++) {
+            KyNode *in = n->value_inputs[j];
+            if (!in || !ti->info[in->id].type.is_const) {
+                all_const = 0;
+                break;
+            }
+            if (j < 4) vals[j] = ti->info[in->id].type.const_val;
+        }
+        if (!all_const || n->num_values < 2) continue;
+
+        int64_t result = 0;
+        int folded = 0;
+        switch (n->opcode) {
+            case IR_ADD_I32: case IR_ADD_I64:
+                result = vals[0] + vals[1]; folded = 1; break;
+            case IR_SUB_I32: case IR_SUB_I64:
+                result = vals[0] - vals[1]; folded = 1; break;
+            case IR_MUL_I32: case IR_MUL_I64:
+                result = vals[0] * vals[1]; folded = 1; break;
+            case IR_AND: result = vals[0] & vals[1]; folded = 1; break;
+            case IR_OR:  result = vals[0] | vals[1]; folded = 1; break;
+            case IR_XOR: result = vals[0] ^ vals[1]; folded = 1; break;
+            default: break;
+        }
+
+        if (folded) {
+            KyNode *c = kyir_const_i64(g, result);
+            kyir_node_replace_uses(g, n, c);
+            n->flags |= KYIR_FLAG_DEAD;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* ============================================================
+ * Bounds Check Elimination
+ *
+ * If we can prove that an index is within [0, length), remove the check.
+ * (Placeholder — needs array type + range info)
+ * ============================================================ */
+
+int kyir_opt_bounds_check(KyGraph *g, KyTypeInference *ti) {
+    if (!g || !ti) return 0;
+    int changed = 0;
+
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->opcode != IR_CHECK_BOUNDS) continue;
+
+        /* Get the index node and its range */
+        if (n->num_values < 1) continue;
+        KyNode *idx = n->value_inputs[0];
+        KyTypeLattice t = ti->info[idx->id].type;
+
+        /* If we know range [min, max] and it's within bounds, remove check */
+        /* (Placeholder — real implementation needs array length) */
+        if (t.min >= 0 && t.max < 1000000) {
+            /* Would remove the check */
+            changed++;
+        }
+    }
+    return changed;
+}
+
+
+/* ============================================================
+ * Layer 11: Escape Analysis
+ * ============================================================ */
+
+/* Add a points-to edge to the connection graph */
+static void cg_add_edge(KyConnectionGraph *cg, KyNode *from, KyNode *to, uint16_t kind) {
+    if (!cg || !from || !to) return;
+    if (to->id >= cg->edge_capacity) return;
+
+    KyConnectionEdge *e = (KyConnectionEdge *)calloc(1, sizeof(KyConnectionEdge));
+    if (!e) return;
+
+    e->from = from;
+    e->to = to;
+    e->kind = kind;
+    e->next = cg->edges[to->id];
+    cg->edges[to->id] = e;
+}
+
+/* Track allocation nodes */
+static void cg_add_allocation(KyConnectionGraph *cg, KyNode *n) {
+    if (!cg || !n) return;
+    if (cg->num_allocations >= cg->alloc_capacity) {
+        cg->alloc_capacity = cg->alloc_capacity ? cg->alloc_capacity * 2 : 16;
+        cg->allocations = (KyNode **)realloc(cg->allocations,
+            cg->alloc_capacity * sizeof(KyNode *));
+    }
+    cg->allocations[cg->num_allocations++] = n;
+}
+
+KyConnectionGraph *kyir_escape_build(KyGraph *g) {
+    if (!g) return NULL;
+
+    KyConnectionGraph *cg = (KyConnectionGraph *)calloc(1, sizeof(KyConnectionGraph));
+    if (!cg) return NULL;
+
+    cg->edge_capacity = g->node_count + 16;
+    cg->edges = (KyConnectionEdge **)calloc(cg->edge_capacity, sizeof(KyConnectionEdge *));
+    cg->states = (KyEscapeState *)calloc(cg->edge_capacity, sizeof(KyEscapeState));
+    cg->num_nodes = g->node_count;
+
+    /* Step 1: find allocation nodes */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+        if (n->opcode == IR_NEW_OBJECT ||
+            n->opcode == IR_NEW_ARRAY ||
+            n->opcode == IR_NEW_CLOSURE) {
+            cg_add_allocation(cg, n);
+        }
+    }
+
+    /* Step 2: build points-to edges based on data flow */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+
+        switch (n->opcode) {
+            case IR_STORE:
+            case IR_STORE_FIELD:
+            case IR_STORE_ELEMENT:
+                /* If we store obj to another object's field, first escapes */
+                if (n->num_values >= 2) {
+                    KyNode *obj = n->value_inputs[0];
+                    KyNode *value = n->value_inputs[1];
+                    if (obj && value) {
+                        cg_add_edge(cg, obj, value, 1);  /* points-to */
+                    }
+                }
+                break;
+
+            case IR_RETURN:
+                /* Anything returned escapes */
+                if (n->num_values >= 1) {
+                    KyNode *ret = n->value_inputs[0];
+                    if (ret) cg_add_edge(cg, ret, n, 2);  /* return edge */
+                }
+                break;
+
+            case IR_CALL:
+            case IR_CALL_DIRECT:
+            case IR_CALL_INDIRECT:
+            case IR_CALL_RUNTIME:
+                /* Anything passed to unknown call escapes */
+                for (uint16_t j = 0; j < n->num_values; j++) {
+                    cg_add_edge(cg, n->value_inputs[j], n, 3);  /* arg escape */
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    return cg;
+}
+
+void kyir_escape_destroy(KyConnectionGraph *cg) {
+    if (!cg) return;
+    for (uint32_t i = 0; i < cg->edge_capacity; i++) {
+        KyConnectionEdge *e = cg->edges[i];
+        while (e) {
+            KyConnectionEdge *next = e->next;
+            free(e);
+            e = next;
+        }
+    }
+    free(cg->edges);
+    free(cg->states);
+    free(cg->allocations);
+    free(cg->worklist);
+    free(cg);
+}
+
+void kyir_escape_analyze(KyConnectionGraph *cg, KyGraph *g) {
+    if (!cg || !g) return;
+
+    /* Initialize all allocations to NO_ESCAPE */
+    for (uint32_t i = 0; i < cg->num_allocations; i++) {
+        cg->states[cg->allocations[i]->id] = KYIR_ESCAPE_NO_ESCAPE;
+    }
+
+    /* Propagate escape states based on edges */
+    int changed = 1;
+    uint32_t iterations = 0;
+    while (changed && iterations < 50) {
+        changed = 0;
+        iterations++;
+
+        for (uint32_t i = 0; i < cg->num_allocations; i++) {
+            KyNode *alloc = cg->allocations[i];
+            KyEscapeState state = cg->states[alloc->id];
+
+            /* Look at outgoing edges */
+            for (uint32_t j = 0; j < g->node_count; j++) {
+                KyNode *user = g->nodes[j];
+                if (!user) continue;
+
+                /* Check if user consumes alloc */
+                int consumes = 0;
+                for (uint16_t k = 0; k < user->num_values; k++) {
+                    if (user->value_inputs[k] == alloc) {
+                        consumes = 1;
+                        break;
+                    }
+                }
+                if (!consumes) continue;
+
+                KyEscapeState new_state = state;
+
+                if (user->opcode == IR_RETURN) {
+                    new_state = KYIR_ESCAPE_RETURN_ESCAPE;
+                } else if (user->opcode == IR_STORE ||
+                           user->opcode == IR_STORE_FIELD ||
+                           user->opcode == IR_STORE_ELEMENT) {
+                    /* alloc as target (input[0]) is fine — it's the object
+                     * being written to. Only escape if alloc is the VALUE
+                     * being stored to another object (input[1]). */
+                    if (user->num_values >= 2 &&
+                        user->value_inputs[1] == alloc) {
+                        new_state = KYIR_ESCAPE_HEAP_ESCAPE;
+                    }
+                    /* If alloc is input[0] (the target), it doesn't escape */
+                } else if (user->opcode == IR_CALL ||
+                           user->opcode == IR_CALL_DIRECT ||
+                           user->opcode == IR_CALL_INDIRECT ||
+                           user->opcode == IR_CALL_RUNTIME) {
+                    new_state = KYIR_ESCAPE_UNKNOWN;
+                }
+
+                if (new_state > state) {
+                    cg->states[alloc->id] = new_state;
+                    state = new_state;
+                    changed = 1;
+                }
+            }
+        }
+    }
+}
+
+KyEscapeState kyir_escape_get(KyConnectionGraph *cg, KyNode *n) {
+    if (!cg || !n) return KYIR_ESCAPE_UNKNOWN;
+    if (n->id >= cg->edge_capacity) return KYIR_ESCAPE_UNKNOWN;
+    return cg->states[n->id];
+}
+
+void kyir_escape_print(KyConnectionGraph *cg, KyGraph *g) {
+    if (!cg || !g) return;
+    printf("Escape Analysis: %u allocations\n", cg->num_allocations);
+    for (uint32_t i = 0; i < cg->num_allocations; i++) {
+        KyNode *n = cg->allocations[i];
+        const char *state_str = "UNKNOWN";
+        switch (cg->states[n->id]) {
+            case KYIR_ESCAPE_NO_ESCAPE:     state_str = "NO_ESCAPE"; break;
+            case KYIR_ESCAPE_ARG_ESCAPE:    state_str = "ARG_ESCAPE"; break;
+            case KYIR_ESCAPE_RETURN_ESCAPE: state_str = "RETURN_ESCAPE"; break;
+            case KYIR_ESCAPE_HEAP_ESCAPE:   state_str = "HEAP_ESCAPE"; break;
+            case KYIR_ESCAPE_UNKNOWN:       state_str = "UNKNOWN"; break;
+        }
+        printf("  n%-4u %-14s state=%s\n",
+               n->id, opcode_name((KyIROpcode)n->opcode), state_str);
+    }
+}
+
+/* ============================================================
+ * SROA — Scalar Replacement of Aggregates
+ *
+ * For each NO_ESCAPE allocation:
+ *   1. Find all LOAD_FIELD/STORE_FIELD on the object
+ *   2. Track the field values as SSA scalars
+ *   3. Remove the allocation node
+ * ============================================================ */
+
+KySROAResult kyir_sroa(KyGraph *g, KyConnectionGraph *cg) {
+    KySROAResult result = {0};
+    if (!g || !cg) return result;
+
+    for (uint32_t i = 0; i < cg->num_allocations; i++) {
+        KyNode *alloc = cg->allocations[i];
+        if (cg->states[alloc->id] != KYIR_ESCAPE_NO_ESCAPE) continue;
+
+        /* Track field values: offset -> current node */
+        struct { uint32_t offset; KyNode *value; } fields[64];
+        uint32_t num_fields = 0;
+
+        /* Walk all uses of alloc */
+        int eliminated = 1;
+        for (uint16_t u = 0; u < alloc->num_uses; u++) {
+            KyNode *user = alloc->uses[u];
+            if (!user) continue;
+
+            if (user->opcode == IR_STORE_FIELD) {
+                /* Store: extract offset and value */
+                if (user->num_values >= 2) {
+                    KyNode *value = user->value_inputs[1];
+                    /* Use node id as fake offset for now */
+                    uint32_t offset = user->id;
+                    int found = 0;
+                    for (uint32_t k = 0; k < num_fields; k++) {
+                        if (fields[k].offset == offset) {
+                            fields[k].value = value;
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found && num_fields < 64) {
+                        fields[num_fields].offset = offset;
+                        fields[num_fields].value = value;
+                        num_fields++;
+                    }
+                    /* Mark store for removal */
+                    user->flags |= KYIR_FLAG_DEAD;
+                    result.stores_replaced++;
+                }
+            } else if (user->opcode == IR_LOAD_FIELD) {
+                /* Load: replace with the last stored value */
+                KyNode *replacement = NULL;
+                for (uint32_t k = 0; k < num_fields; k++) {
+                    if (fields[k].offset == alloc->id + user->id) {
+                        replacement = fields[k].value;
+                        break;
+                    }
+                }
+                if (replacement) {
+                    kyir_node_replace_uses(g, user, replacement);
+                    user->flags |= KYIR_FLAG_DEAD;
+                    result.loads_replaced++;
+                }
+                /* Load without prior store means the alloc was read before write */
+                /* In that case, we can't eliminate */
+                if (!replacement) eliminated = 0;
+            } else if (user->opcode == IR_LOAD_ELEMENT ||
+                       user->opcode == IR_STORE_ELEMENT) {
+                /* Element access — cannot SROA */
+                eliminated = 0;
+            }
+        }
+
+        if (eliminated) {
+            /* Remove the allocation */
+            alloc->flags |= KYIR_FLAG_DEAD;
+            result.allocations_eliminated++;
+        }
+    }
+
+    return result;
+}
+
+
+/* ============================================================
+ * Layer 12: Click's Global Code Motion
+ * ============================================================ */
+
+/* Helper: is block A dominated by all blocks in array? */
+static int all_dominate(KyDomTree *dt, KyNode **inputs, uint16_t n, KyBlock *target) {
+    for (uint16_t i = 0; i < n; i++) {
+        KyNode *in = inputs[i];
+        if (!in) continue;
+        KyBlock *ib = in->block;
+        if (!ib) {
+            /* Unscheduled input — check if it has been assigned */
+            if (in->block) ib = in->block;
+            else continue;
+        }
+        if (!kyir_domtree_dominates(dt, ib, target)) return 0;
+    }
+    return 1;
+}
+
+/* LCA of two blocks in dominator tree */
+static KyBlock *block_lca(KyDomTree *dt, KyBlock *a, KyBlock *b) {
+    if (!a) return b;
+    if (!b) return a;
+    return kyir_domtree_lca(dt, a, b);
+}
+
+/* Compute LCA of all uses of a node */
+static KyBlock *uses_lca(KyDomTree *dt, KyNode *n) {
+    if (!n || n->num_uses == 0) return NULL;
+    KyBlock *lca = NULL;
+    for (uint16_t i = 0; i < n->num_uses; i++) {
+        KyNode *user = n->uses[i];
+        if (!user) continue;
+        KyBlock *ub = user->block;
+        if (!ub) continue;
+        if (!lca) lca = ub;
+        else lca = block_lca(dt, lca, ub);
+    }
+    return lca;
+}
+
+/* Get node priority (for ordering within block) */
+static uint32_t node_priority(KyNode *n) {
+    /* Higher priority = scheduled earlier
+     * Data nodes: 100 (they should be computed first)
+     * Control: 50 (they go last)
+     * Constants: 10 (they can go anywhere) */
+    if (n->flags & KYIR_FLAG_CONSTANT) return 10;
+    if (n->flags & KYIR_FLAG_CONTROL) return 50;
+    if (n->opcode == IR_PHI) return 5;
+    return 100;
+}
+
+KySchedule *kyir_schedule_build(KyGraph *g, KyDomTree *dt) {
+    if (!g || !dt) return NULL;
+
+    KySchedule *s = (KySchedule *)calloc(1, sizeof(KySchedule));
+    if (!s) return NULL;
+
+    s->graph = g;
+    s->domtree = dt;
+    s->node_block = (KyBlock **)calloc(g->node_count, sizeof(KyBlock *));
+    s->node_index = (uint32_t *)calloc(g->node_count, sizeof(uint32_t));
+    s->node_priority = (uint32_t *)calloc(g->node_count, sizeof(uint32_t));
+
+    /* Phase 1: Schedule late — assign each node to a block */
+    /* Process in reverse postorder of dominator tree */
+
+    for (uint32_t pass = 0; pass < g->node_count; pass++) {
+        int progressed = 0;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            KyNode *n = g->nodes[i];
+            if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+            if (s->node_block[n->id]) continue;  /* already scheduled */
+
+            /* Start/End nodes: assign to first/last block */
+            if (n->opcode == IR_START) {
+                s->node_block[n->id] = g->blocks[0];
+                progressed = 1;
+                continue;
+            }
+            if (n->opcode == IR_END) {
+                s->node_block[n->id] = g->blocks[g->block_count - 1];
+                progressed = 1;
+                continue;
+            }
+
+            /* Find candidate block = LCA of uses */
+            KyBlock *candidate = uses_lca(dt, n);
+            if (!candidate) {
+                /* No uses: place at start block */
+                candidate = g->blocks[0];
+            }
+
+            /* Walk up until all inputs dominate */
+            KyBlock *valid = candidate;
+            uint32_t guard = 0;
+            while (valid && guard++ < 10000) {
+                /* Check all inputs dominate 'valid' */
+                int ok = 1;
+                for (uint16_t j = 0; j < n->num_values; j++) {
+                    KyNode *in = n->value_inputs[j];
+                    if (!in) continue;
+                    KyBlock *ib = s->node_block[in->id];
+                    if (!ib) { ok = 0; break; }
+                    if (!kyir_domtree_dominates(dt, ib, valid)) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                /* Check control inputs */
+                for (uint16_t j = 0; j < n->num_controls; j++) {
+                    KyNode *in = n->control_inputs[j];
+                    if (!in) continue;
+                    KyBlock *ib = s->node_block[in->id];
+                    if (!ib) { ok = 0; break; }
+                    if (!kyir_domtree_dominates(dt, ib, valid)) {
+                        ok = 0;
+                        break;
+                    }
+                }
+
+                if (ok) {
+                    s->node_block[n->id] = valid;
+                    progressed = 1;
+                    break;
+                }
+
+                /* Move up to immediate dominator */
+                KyBlock *idom = dt->idom[valid->id];
+                if (!idom || idom == valid) break;
+                valid = idom;
+            }
+
+            /* If we get here without scheduling, place at first block */
+            if (!s->node_block[n->id]) {
+                s->node_block[n->id] = g->blocks[0];
+            }
+        }
+
+        if (!progressed) break;
+    }
+
+    /* Phase 2: Assign indices within each block based on priority */
+    /* Higher priority first (data before control) */
+    for (uint32_t b = 0; b < g->block_count; b++) {
+        KyBlock *blk = g->blocks[b];
+        if (!blk) continue;
+
+        /* Count nodes in block */
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            if (s->node_block[i] == blk) count++;
+        }
+
+        /* Sort by priority */
+        uint32_t *ids = (uint32_t *)calloc(count, sizeof(uint32_t));
+        uint32_t *prio = (uint32_t *)calloc(count, sizeof(uint32_t));
+        uint32_t idx = 0;
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            if (s->node_block[i] == blk) {
+                ids[idx] = i;
+                prio[idx] = node_priority(g->nodes[i]);
+                idx++;
+            }
+        }
+
+        /* Sort by priority descending */
+        for (uint32_t i = 0; i < count; i++) {
+            for (uint32_t j = i + 1; j < count; j++) {
+                if (prio[j] > prio[i]) {
+                    uint32_t t = prio[i]; prio[i] = prio[j]; prio[j] = t;
+                    t = ids[i]; ids[i] = ids[j]; ids[j] = t;
+                }
+            }
+        }
+
+        /* Assign indices */
+        for (uint32_t i = 0; i < count; i++) {
+            s->node_index[ids[i]] = i;
+        }
+
+        free(ids);
+        free(prio);
+    }
+
+    /* Count stats */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (s->node_block[i]) s->num_scheduled++;
+        else s->num_unscheduled++;
+    }
+
+    return s;
+}
+
+void kyir_schedule_destroy(KySchedule *s) {
+    if (!s) return;
+    free(s->node_block);
+    free(s->node_index);
+    free(s->node_priority);
+    free(s);
+}
+
+int kyir_schedule_apply(KyGraph *g, KySchedule *s) {
+    if (!g || !s) return -1;
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n) continue;
+        if (s->node_block[i]) {
+            n->block = s->node_block[i];
+            n->schedule_idx = s->node_index[i];
+        }
+    }
+    return 0;
+}
+
+void kyir_schedule_print(KySchedule *s) {
+    if (!s) return;
+    printf("Schedule: %u scheduled, %u unscheduled\n",
+           s->num_scheduled, s->num_unscheduled);
+    KyGraph *g = s->graph;
+    for (uint32_t b = 0; b < g->block_count; b++) {
+        KyBlock *blk = g->blocks[b];
+        if (!blk) continue;
+        printf("  block b%u:\n", blk->id);
+        for (uint32_t i = 0; i < g->node_count; i++) {
+            if (s->node_block[i] == blk) {
+                KyNode *n = g->nodes[i];
+                printf("    [%u] n%u: %s\n",
+                       s->node_index[i], i, opcode_name((KyIROpcode)n->opcode));
+            }
+        }
+    }
+}
+
+
+/* ============================================================
+ * Layer 13: x86-64 Backend
+ * ============================================================ */
+
+const char *kyx64_op_name(KyX64Op op) {
+    switch (op) {
+        case X64_MOV_REG_REG: return "mov";
+        case X64_MOV_REG_IMM: return "mov";
+        case X64_ADD_REG_REG: return "add";
+        case X64_ADD_REG_IMM: return "add";
+        case X64_SUB_REG_REG: return "sub";
+        case X64_SUB_REG_IMM: return "sub";
+        case X64_MUL_REG_REG: return "imul";
+        case X64_IMUL_REG_REG_IMM: return "imul";
+        case X64_AND_REG_REG: return "and";
+        case X64_OR_REG_REG: return "or";
+        case X64_XOR_REG_REG: return "xor";
+        case X64_SHL_REG_IMM: return "shl";
+        case X64_SHR_REG_IMM: return "shr";
+        case X64_CMP_REG_REG: return "cmp";
+        case X64_CMP_REG_IMM: return "cmp";
+        case X64_JMP: return "jmp";
+        case X64_JZ: return "jz";
+        case X64_JNZ: return "jnz";
+        case X64_RET: return "ret";
+        case X64_PUSH: return "push";
+        case X64_POP: return "pop";
+        case X64_MOV_REG_MEM: return "mov(mem->reg)";
+        case X64_MOV_MEM_REG: return "mov(reg->mem)";
+        case X64_LEA: return "lea";
+        case X64_NOP: return "nop";
+        case X64_LABEL: return "label";
+        default: return "?";
+    }
+}
+
+const char *kyx64_reg_name(KyX64Reg r) {
+    static const char *names[] = {
+        "rax", "rbx", "rcx", "rdx",
+        "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11",
+        "r12", "r13", "r14", "r15"
+    };
+    if (r < X64_REG_COUNT) return names[r];
+    return "?";
+}
+
+KyX64Backend *kyx64_backend_create(KyGraph *g, KySchedule *s, KyDomTree *dt) {
+    if (!g) return NULL;
+
+    KyX64Backend *b = (KyX64Backend *)calloc(1, sizeof(KyX64Backend));
+    if (!b) return NULL;
+
+    b->graph = g;
+    b->schedule = s;
+    b->domtree = dt;
+
+    /* Explicit init of label fields */
+    b->labels = NULL;
+    b->label_capacity = 0;
+    b->num_labels = 0;
+    b->next_label = 0;
+
+    b->vreg_capacity = g->node_count + 16;
+    b->vregs = (KyVReg **)calloc(b->vreg_capacity, sizeof(KyVReg *));
+
+    b->insn_capacity = g->node_count * 4 + 16;
+    b->insns = (KyX64Ins **)calloc(b->insn_capacity, sizeof(KyX64Ins *));
+
+    b->vreg_phys = (KyX64Reg *)malloc(b->vreg_capacity * sizeof(KyX64Reg));
+    for (uint32_t i = 0; i < b->vreg_capacity; i++) {
+        b->vreg_phys[i] = X64_REG_NONE;
+    }
+
+    return b;
+}
+
+void kyx64_backend_destroy(KyX64Backend *b) {
+    if (!b) return;
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        if (b->vregs[i]) free(b->vregs[i]);
+    }
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        if (b->insns[i]) free(b->insns[i]);
+    }
+    if (b->labels) {
+        for (uint32_t i = 0; i < b->num_labels; i++) {
+            if (b->labels[i]) {
+                free(b->labels[i]->patch_offsets);
+                free(b->labels[i]);
+            }
+        }
+        free(b->labels);
+    }
+    free(b->vregs);
+    free(b->insns);
+    free(b->vreg_phys);
+    free(b);
+}
+
+/* Create a virtual register for an IR node */
+KyVReg *new_vreg(KyX64Backend *b, uint32_t node_id) {
+    if (b->num_vregs >= b->vreg_capacity) return NULL;
+
+    KyVReg *vr = (KyVReg *)calloc(1, sizeof(KyVReg));
+    vr->id = b->num_vregs;
+    vr->kind = VREG_VIRTUAL;
+    vr->phys = X64_REG_NONE;
+    vr->spill_slot = -1;
+
+    b->vregs[b->num_vregs++] = vr;
+    b->vreg_phys[vr->id] = X64_REG_NONE;
+
+    /* Store the IR node id for later mapping */
+    if (node_id < b->vreg_capacity) {
+        /* We store node-to-vreg mapping separately */
+    }
+
+    return vr;
+}
+
+/* Create or get a physical vreg for an ABI register */
+static KyVReg *get_phys_vreg(KyX64Backend *b, KyX64Reg reg) {
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        KyVReg *vr = b->vregs[i];
+        if (vr && vr->kind == VREG_PHYSICAL && vr->phys == reg) return vr;
+    }
+    KyVReg *vr = new_vreg(b, 0xFFFFFFFF);
+    if (vr) {
+        vr->kind = VREG_PHYSICAL;
+        vr->phys = reg;
+        b->vreg_phys[vr->id] = reg;
+    }
+    return vr;
+}
+
+/* Add a machine instruction */
+KyX64Ins *add_insn(KyX64Backend *b, KyX64Op op) {
+    if (b->num_insns >= b->insn_capacity) {
+        b->insn_capacity *= 2;
+        b->insns = (KyX64Ins **)realloc(b->insns, b->insn_capacity * sizeof(KyX64Ins *));
+    }
+    KyX64Ins *ins = (KyX64Ins *)calloc(1, sizeof(KyX64Ins));
+    ins->op = op;
+    b->insns[b->num_insns++] = ins;
+    return ins;
+}
+
+/* ============================================================
+ * Stage 1: Linearize — assign vregs to IR nodes, no ordering yet
+ * ============================================================ */
+
+int kyx64_linearize(KyX64Backend *b) {
+    if (!b) return -1;
+
+    /* Create a vreg for every IR node that produces a value */
+    for (uint32_t i = 0; i < b->graph->node_count; i++) {
+        KyNode *n = b->graph->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->flags & KYIR_FLAG_CONTROL) continue;
+        if (n->opcode == IR_START || n->opcode == IR_END) continue;
+
+        new_vreg(b, i);
+    }
+
+    return 0;
+}
+
+/* ============================================================
+ * Stage 2: Instruction Selection
+ *
+ * For each IR node, emit machine instructions.
+ * Simple non-optimal selection: 1 IR op → 1-3 machine ops.
+ * ============================================================ */
+
+static KyX64Ins *emit_mov_imm(KyX64Backend *b, KyVReg *dst, int64_t imm) {
+    KyX64Ins *ins = add_insn(b, X64_MOV_REG_IMM);
+    ins->dst = dst;
+    ins->imm = imm;
+    return ins;
+}
+
+static KyX64Ins *emit_mov_reg(KyX64Backend *b, KyVReg *dst, KyVReg *src) {
+    KyX64Ins *ins = add_insn(b, X64_MOV_REG_REG);
+    ins->dst = dst;
+    ins->src1 = src;
+    /* CRITICAL: X64_MOV_REG_REG's emitter branches on ins->imm.
+     *   - if (imm >= 0 && imm < X64_REG_COUNT): treat imm as a hardcoded
+     *     physical destination register (used by test_funcs.c's mov_ret trick).
+     *   - else: use ins->dst->phys and ins->src1->phys normally.
+     * add_insn() callocs the insn, so imm defaults to 0 (= X64_RAX), which
+     * silently routes to the hardcoded-destination branch and ignores dst.
+     * Force imm = -1 so we take the normal vreg path. */
+    ins->imm = -1;
+    return ins;
+}
+
+static KyX64Ins *emit_binop(KyX64Backend *b, KyX64Op op, KyVReg *dst, KyVReg *a, KyVReg *b2) {
+    KyX64Ins *ins = add_insn(b, op);
+    ins->dst = dst;
+    ins->src1 = a;
+    ins->src2 = b2;
+    return ins;
+}
+
+int kyx64_select(KyX64Backend *b) {
+    if (!b) return -1;
+
+    /* Map node id → vreg */
+    uint32_t *node_vreg = (uint32_t *)malloc(b->graph->node_count * sizeof(uint32_t));
+    for (uint32_t i = 0; i < b->graph->node_count; i++) node_vreg[i] = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        /* vregs are indexed by order of creation, node ids are separate */
+        /* This simplified version uses vreg index = node id where possible */
+        (void)i;
+    }
+
+    /* Rebuild: assign vreg per node in order */
+    uint32_t vidx = 0;
+    for (uint32_t i = 0; i < b->graph->node_count; i++) {
+        KyNode *n = b->graph->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+        if (n->flags & KYIR_FLAG_CONTROL) continue;
+        if (n->opcode == IR_START || n->opcode == IR_END) continue;
+        if (vidx < b->num_vregs) {
+            node_vreg[i] = vidx;
+            vidx++;
+        }
+    }
+
+    for (uint32_t i = 0; i < b->graph->node_count; i++) {
+        KyNode *n = b->graph->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+
+        switch (n->opcode) {
+            case IR_CONST_I32:
+            case IR_CONST_I64: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                emit_mov_imm(b, dst, n->constant.i64);
+                break;
+            }
+
+            case IR_PARAMETER: {
+                /* SysV x86-64 ABI: integer args 0..5 arrive in
+                 * rdi, rsi, rdx, rcx, r8, r9. Emit a mov from the
+                 * physical ABI register into the parameter's vreg,
+                 * so downstream ops see the incoming value. */
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                static const KyX64Reg sysv_args[6] = {
+                    X64_RDI, X64_RSI, X64_RDX, X64_RCX, X64_R8, X64_R9
+                };
+                int idx = (int)n->constant.i64;
+                if (idx < 0 || idx >= 6) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyVReg *phys = get_phys_vreg(b, sysv_args[idx]);
+                if (!phys) break;
+                emit_mov_reg(b, dst, phys);
+                break;
+            }
+
+            case IR_ADD_I32:
+            case IR_ADD_I64: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                KyNode *c = n->value_inputs[1];
+                if (a && c &&
+                    node_vreg[a->id] != 0xFFFFFFFF &&
+                    node_vreg[c->id] != 0xFFFFFFFF) {
+                    emit_binop(b, X64_ADD_REG_REG, dst,
+                              b->vregs[node_vreg[a->id]],
+                              b->vregs[node_vreg[c->id]]);
+                }
+                break;
+            }
+
+            case IR_SUB_I32:
+            case IR_SUB_I64: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                KyNode *c = n->value_inputs[1];
+                if (a && c &&
+                    node_vreg[a->id] != 0xFFFFFFFF &&
+                    node_vreg[c->id] != 0xFFFFFFFF) {
+                    emit_binop(b, X64_SUB_REG_REG, dst,
+                              b->vregs[node_vreg[a->id]],
+                              b->vregs[node_vreg[c->id]]);
+                }
+                break;
+            }
+
+            case IR_MUL_I32:
+            case IR_MUL_I64: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                KyNode *c = n->value_inputs[1];
+                if (a && c &&
+                    node_vreg[a->id] != 0xFFFFFFFF &&
+                    node_vreg[c->id] != 0xFFFFFFFF) {
+                    emit_binop(b, X64_MUL_REG_REG, dst,
+                              b->vregs[node_vreg[a->id]],
+                              b->vregs[node_vreg[c->id]]);
+                }
+                break;
+            }
+
+            case IR_AND:
+            case IR_OR:
+            case IR_XOR: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                KyNode *c = n->value_inputs[1];
+                if (a && c &&
+                    node_vreg[a->id] != 0xFFFFFFFF &&
+                    node_vreg[c->id] != 0xFFFFFFFF) {
+                    KyX64Op op = (n->opcode == IR_AND) ? X64_AND_REG_REG :
+                                 (n->opcode == IR_OR)  ? X64_OR_REG_REG  :
+                                                         X64_XOR_REG_REG;
+                    emit_binop(b, op, dst,
+                              b->vregs[node_vreg[a->id]],
+                              b->vregs[node_vreg[c->id]]);
+                }
+                break;
+            }
+
+            case IR_SHL:
+            case IR_SHR:
+            case IR_SAR: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                KyNode *c = n->value_inputs[1];
+                if (!a || !c) break;
+                if (node_vreg[a->id] == 0xFFFFFFFF) break;
+                /* Shift amount must be a compile-time constant (we don't
+                 * have SHL/SHR/SAR by CL yet). */
+                if (!(c->flags & KYIR_FLAG_CONSTANT)) break;
+                KyVReg *src = b->vregs[node_vreg[a->id]];
+                if (src != dst) {
+                    KyX64Ins *mv = add_insn(b, X64_MOV_REG_REG);
+                    mv->dst = dst; mv->src1 = src; mv->imm = -1;
+                }
+                KyX64Op op = (n->opcode == IR_SHL) ? X64_SHL_REG_IMM :
+                             (n->opcode == IR_SHR) ? X64_SHR_REG_IMM :
+                                                     X64_SAR_REG_IMM;
+                KyX64Ins *ins = add_insn(b, op);
+                ins->dst = dst;
+                ins->imm = c->constant.i64 & 0x3F;
+                break;
+            }
+
+            case IR_NEG_I32:
+            case IR_NEG_I64: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                if (!a || node_vreg[a->id] == 0xFFFFFFFF) break;
+                KyVReg *src = b->vregs[node_vreg[a->id]];
+                if (src != dst) {
+                    KyX64Ins *mv = add_insn(b, X64_MOV_REG_REG);
+                    mv->dst = dst; mv->src1 = src; mv->imm = -1;
+                }
+                KyX64Ins *ins = add_insn(b, X64_NEG);
+                ins->dst = dst;
+                break;
+            }
+
+            case IR_NOT: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *a = n->value_inputs[0];
+                if (!a || node_vreg[a->id] == 0xFFFFFFFF) break;
+                KyVReg *src = b->vregs[node_vreg[a->id]];
+                if (src != dst) {
+                    KyX64Ins *mv = add_insn(b, X64_MOV_REG_REG);
+                    mv->dst = dst; mv->src1 = src; mv->imm = -1;
+                }
+                KyX64Ins *ins = add_insn(b, X64_NOT);
+                ins->dst = dst;
+                break;
+            }
+
+            case IR_LOAD_FIELD: {
+                if (node_vreg[i] == 0xFFFFFFFF) break;
+                KyVReg *dst = b->vregs[node_vreg[i]];
+                KyNode *obj = n->value_inputs[0];
+                if (!obj || node_vreg[obj->id] == 0xFFFFFFFF) break;
+                KyVReg *base = b->vregs[node_vreg[obj->id]];
+                kyx64_emit_load(b, dst, base, (int32_t)n->constant.i64);
+                break;
+            }
+
+            case IR_STORE_FIELD: {
+                KyNode *obj = n->value_inputs[0];
+                KyNode *val = n->value_inputs[1];
+                if (!obj || !val) break;
+                if (node_vreg[obj->id] == 0xFFFFFFFF) break;
+                if (node_vreg[val->id] == 0xFFFFFFFF) break;
+                KyVReg *base = b->vregs[node_vreg[obj->id]];
+                KyVReg *value = b->vregs[node_vreg[val->id]];
+                kyx64_emit_store(b, base, (int32_t)n->constant.i64, value);
+                break;
+            }
+
+            case IR_RETURN: {
+                KyNode *val = n->value_inputs[0];
+                if (val && node_vreg[val->id] != 0xFFFFFFFF) {
+                    /* mov rax, vreg */
+                    KyX64Ins *ins = add_insn(b, X64_MOV_REG_REG);
+                    ins->dst = NULL;  /* physical rax */
+                    ins->src1 = b->vregs[node_vreg[val->id]];
+                    ins->imm = X64_RAX;  /* target register */
+                    add_insn(b, X64_RET);
+                } else {
+                    add_insn(b, X64_RET);
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+
+    free(node_vreg);
+    return 0;
+}
+
+/* ============================================================
+ * Stage 3: Register Allocation (simplified linear scan)
+ *
+ * For now: assign vregs to physical registers in round-robin
+ * fashion. Real allocator would compute live intervals.
+ * ============================================================ */
+
+int kyx64_allocate(KyX64Backend *b) {
+    if (!b) return -1;
+
+    /* Registers available for allocation.
+     *
+     * All general-purpose regs except RSP (stack pointer) and RBP
+     * (frame pointer, unused). Callee-saved regs (RBX, R12-R15) are
+     * safe because kyx64_compile now emits push/pop in the prologue
+     * and epilogue for any that are used. See scan_used_callee_saved
+     * and splice_prologue_epilogue above.
+     */
+    KyX64Reg free_regs[] = {
+        X64_RAX, X64_RBX, X64_RCX, X64_RDX,
+        X64_RSI, X64_RDI,
+        X64_R8, X64_R9, X64_R10, X64_R11,
+        X64_R12, X64_R13, X64_R14, X64_R15
+    };
+    uint32_t num_free = sizeof(free_regs) / sizeof(free_regs[0]);
+    uint32_t next_reg = 0;
+
+    for (uint32_t i = 0; i < b->num_vregs; i++) {
+        KyVReg *vr = b->vregs[i];
+        if (!vr) continue;
+        if (vr->kind == VREG_PHYSICAL) continue;
+
+        if (vr->kind == VREG_VIRTUAL) {
+            if (next_reg < num_free) {
+                vr->phys = free_regs[next_reg++];
+                b->vreg_phys[vr->id] = vr->phys;
+            } else {
+                /* Spill */
+                vr->spilled = 1;
+                vr->spill_slot = (int32_t)(b->num_spills++);
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* ============================================================
+ * Stage 4: Code Emission — write x86-64 bytes
+ *
+ * Simplified: only supports a few instruction formats.
+ * ============================================================ */
+
+int emit_bytes(uint8_t *code, size_t code_size, size_t *off,
+                      const uint8_t *bytes, size_t len) {
+    if (*off + len > code_size) return -1;
+    memcpy(code + *off, bytes, len);
+    *off += len;
+    return 0;
+}
+
+/* REX.W prefix: 0x48 for 64-bit */
+#define REX_W 0x48
+
+/* Encode mov reg, imm64 */
+int encode_mov_imm64(uint8_t *code, size_t code_size, size_t *off,
+                            KyX64Reg dst, int64_t imm) {
+    uint8_t buf[10];
+    uint8_t enc = ky_x64_enc[dst & 15];
+    uint8_t rex = REX_W;
+    if (enc >= 8) rex |= 0x01;
+    buf[0] = rex;
+    buf[1] = 0xB8 + (enc & 7);
+    memcpy(buf + 2, &imm, 8);
+    return emit_bytes(code, code_size, off, buf, 10);
+}
+
+/* Encode add dst, src */
+int encode_add_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src) {
+    uint8_t buf[3];
+    uint8_t e_dst = ky_x64_enc[dst & 15];
+    uint8_t e_src = ky_x64_enc[src & 15];
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;
+    if (e_dst >= 8) rex |= 0x01;
+    buf[0] = rex;
+    buf[1] = 0x01;
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+int encode_sub_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src) {
+    uint8_t buf[3];
+    uint8_t e_dst = ky_x64_enc[dst & 15];
+    uint8_t e_src = ky_x64_enc[src & 15];
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;
+    if (e_dst >= 8) rex |= 0x01;
+    buf[0] = rex;
+    buf[1] = 0x29;
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+int encode_imul_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                               KyX64Reg dst, KyX64Reg src) {
+    uint8_t buf[4];
+    uint8_t e_dst = ky_x64_enc[dst & 15];
+    uint8_t e_src = ky_x64_enc[src & 15];
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x04;
+    if (e_src >= 8) rex |= 0x01;
+    buf[0] = rex;
+    buf[1] = 0x0F;
+    buf[2] = 0xAF;
+    buf[3] = 0xC0 | ((e_dst & 7) << 3) | (e_src & 7);
+    return emit_bytes(code, code_size, off, buf, 4);
+}
+
+int encode_mov_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src) {
+    uint8_t buf[3];
+    uint8_t e_dst = ky_x64_enc[dst & 15];
+    uint8_t e_src = ky_x64_enc[src & 15];
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;
+    if (e_dst >= 8) rex |= 0x01;
+    buf[0] = rex;
+    buf[1] = 0x89;
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+int kyx64_emit(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len) {
+    if (!b || !code || !code_len) return -1;
+
+    size_t off = 0;
+
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+
+        int rc = 0;
+        switch (ins->op) {
+            case X64_MOV_REG_IMM: {
+                if (ins->dst && ins->dst->phys != X64_REG_NONE) {
+                    rc = encode_mov_imm64(code, code_size, &off,
+                                          ins->dst->phys, ins->imm);
+                }
+                break;
+            }
+
+            case X64_MOV_REG_REG: {
+                if (ins->imm >= 0 && ins->imm < X64_REG_COUNT) {
+                    /* Physical target */
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE) {
+                        rc = encode_mov_reg_reg(code, code_size, &off,
+                                                (KyX64Reg)ins->imm,
+                                                ins->src1->phys);
+                    }
+                } else if (ins->dst && ins->src1 &&
+                          ins->dst->phys != X64_REG_NONE &&
+                          ins->src1->phys != X64_REG_NONE) {
+                    rc = encode_mov_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src1->phys);
+                }
+                break;
+            }
+
+            case X64_ADD_REG_REG: {
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    /* mov dst, src1; add dst, src2 */
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_add_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+            }
+
+            case X64_SUB_REG_REG: {
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_sub_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+            }
+
+            case X64_MUL_REG_REG: {
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_imul_reg_reg(code, code_size, &off,
+                                             ins->dst->phys, ins->src2->phys);
+                }
+                break;
+            }
+
+            case X64_MOV_REG_MEM:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_load(code, code_size, &off,
+                                    ins->dst->phys, ins->src1->phys,
+                                    ins->mem_offset);
+                break;
+
+            case X64_MOV_MEM_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_store(code, code_size, &off,
+                                     ins->dst->phys, ins->mem_offset,
+                                     ins->src1->phys);
+                break;
+
+            case X64_LEA:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_lea(code, code_size, &off,
+                                   ins->dst->phys, ins->src1->phys,
+                                   ins->mem_offset);
+                break;
+
+            case X64_AND_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_and_reg(code, code_size, &off,
+                                        ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_OR_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_or_reg(code, code_size, &off,
+                                       ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_XOR_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_xor_reg(code, code_size, &off,
+                                        ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_CMP_REG_IMM:
+                /* Matches extended emitter: operand is in src1, not dst. */
+                if (ins->src1 && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_cmp_imm(code, code_size, &off,
+                                        ins->src1->phys, (int32_t)ins->imm);
+                break;
+
+            case X64_CMP_REG_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys  != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_cmp_reg(code, code_size, &off,
+                                        ins->dst->phys, ins->src1->phys);
+                break;
+
+            case X64_SHL_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shl_imm(code, code_size, &off,
+                                        ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_SHR_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shr_imm(code, code_size, &off,
+                                        ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_SAR_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_sar_imm(code, code_size, &off,
+                                        ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_NEG:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_neg(code, code_size, &off, ins->dst->phys);
+                break;
+
+            case X64_NOT:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_not(code, code_size, &off, ins->dst->phys);
+                break;
+
+
+            case X64_RET: {
+                uint8_t ret = 0xC3;
+                rc = emit_bytes(code, code_size, &off, &ret, 1);
+                break;
+            }
+
+            case X64_PUSH: {
+                KyX64Reg reg = ins->src1 ? ins->src1->phys : (KyX64Reg)ins->imm;
+                if (reg != X64_REG_NONE)
+                    rc = encode_push(code, code_size, &off, reg);
+                break;
+            }
+
+            case X64_POP: {
+                KyX64Reg reg = ins->dst ? ins->dst->phys : (KyX64Reg)ins->imm;
+                if (reg != X64_REG_NONE)
+                    rc = encode_pop(code, code_size, &off, reg);
+                break;
+            }
+
+            case X64_NOP:
+            default:
+                break;
+        }
+
+        if (rc < 0) return -1;
+    }
+
+    *code_len = off;
+    return 0;
+}
+
+/* ============================================================
+ * Convenience: full compile
+ * ============================================================ */
+
+/* ============================================================
+ * Callee-saved register handling (SysV ABI)
+ *
+ * The register allocator may assign RBX, R12-R15 to vregs. Those
+ * are callee-saved: our function must push them on entry and pop
+ * them on exit, or we corrupt the caller's state.
+ *
+ * Strategy:
+ *   1. After allocation, scan emitted insns for used callee-saved regs.
+ *   2. Prepend push insns, append pop insns (reverse order).
+ * ============================================================ */
+
+static int is_callee_saved_reg(KyX64Reg r) {
+    return r == X64_RBX || r == X64_R12 || r == X64_R13 ||
+           r == X64_R14 || r == X64_R15;
+}
+
+static void scan_used_callee_saved(KyX64Backend *b) {
+    b->frame.num_callee_saved = 0;
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+
+        if (ins->dst  && ins->dst->phys  != X64_REG_NONE &&
+            is_callee_saved_reg(ins->dst->phys))
+            kyx64_frame_add_callee_saved(&b->frame, ins->dst->phys);
+        if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+            is_callee_saved_reg(ins->src1->phys))
+            kyx64_frame_add_callee_saved(&b->frame, ins->src1->phys);
+        if (ins->src2 && ins->src2->phys != X64_REG_NONE &&
+            is_callee_saved_reg(ins->src2->phys))
+            kyx64_frame_add_callee_saved(&b->frame, ins->src2->phys);
+    }
+}
+
+static void splice_prologue_epilogue(KyX64Backend *b) {
+    uint32_t n_save = b->frame.num_callee_saved;
+    if (n_save == 0) return;
+
+    uint32_t old_n = b->num_insns;
+    if (old_n == 0) return;
+
+    /* Find the last X64_RET in the body. We insert pops BEFORE it,
+     * not after — pops after ret execute in the caller's frame. */
+    int32_t last_ret_idx = -1;
+    for (int32_t i = (int32_t)old_n - 1; i >= 0; i--) {
+        if (b->insns[i] && b->insns[i]->op == X64_RET) {
+            last_ret_idx = i;
+            break;
+        }
+    }
+    if (last_ret_idx < 0) {
+        /* No ret in body — bail out of the prologue too, to keep
+         * push/pop balanced. */
+        return;
+    }
+
+    uint32_t new_n = n_save + old_n + n_save;
+    KyX64Ins **new_insns = (KyX64Ins **)calloc(new_n, sizeof(KyX64Ins *));
+    if (!new_insns) return;
+    uint32_t k = 0;
+
+    /* Prologue: push each callee-saved reg */
+    for (uint32_t i = 0; i < n_save; i++) {
+        KyX64Ins *ins = (KyX64Ins *)calloc(1, sizeof(KyX64Ins));
+        ins->op  = X64_PUSH;
+        ins->imm = b->frame.callee_saved[i];
+        new_insns[k++] = ins;
+    }
+
+    /* Body up to (but not including) the ret */
+    for (int32_t i = 0; i < last_ret_idx; i++) new_insns[k++] = b->insns[i];
+
+    /* Epilogue pops (reverse order) */
+    for (int32_t i = (int32_t)n_save - 1; i >= 0; i--) {
+        KyX64Ins *ins = (KyX64Ins *)calloc(1, sizeof(KyX64Ins));
+        ins->op  = X64_POP;
+        ins->imm = b->frame.callee_saved[i];
+        new_insns[k++] = ins;
+    }
+
+    /* Now the ret (and anything after it, e.g. a trailing label) */
+    for (uint32_t i = (uint32_t)last_ret_idx; i < old_n; i++)
+        new_insns[k++] = b->insns[i];
+
+    free(b->insns);
+    b->insns = new_insns;
+    b->num_insns = new_n;
+    b->insn_capacity = new_n;
+}
+
+int kyx64_compile(KyGraph *g, uint8_t *code, size_t code_size, size_t *code_len) {
+    if (!g || !code || !code_len) return -1;
+
+    /* Build dominator tree */
+    KyDomTree *dt = kyir_domtree_build(g);
+    if (!dt) return -1;
+
+    /* Build schedule */
+    KySchedule *s = kyir_schedule_build(g, dt);
+    if (!s) { kyir_domtree_destroy(dt); return -1; }
+
+    /* Build backend */
+    KyX64Backend *b = kyx64_backend_create(g, s, dt);
+    if (!b) { kyir_schedule_destroy(s); kyir_domtree_destroy(dt); return -1; }
+
+    /* Run pipeline */
+    int rc = 0;
+    if (kyx64_linearize(b) < 0) rc = -1;
+    else if (kyx64_select(b) < 0) rc = -1;
+    else if (kyx64_allocate(b) < 0) rc = -1;
+    else {
+        /* Insert ABI prologue/epilogue for any callee-saved regs used.
+         * Must run after allocation (vreg->phys is now final) and
+         * before emit. */
+        scan_used_callee_saved(b);
+        splice_prologue_epilogue(b);
+        if (kyx64_emit(b, code, code_size, code_len) < 0) rc = -1;
+    }
+
+    kyx64_backend_destroy(b);
+    kyir_schedule_destroy(s);
+    kyir_domtree_destroy(dt);
+
+    return rc;
+}
+
+void kyx64_dump(KyX64Backend *b) {
+    if (!b) return;
+    printf("x86-64 Backend: %u vregs, %u insns\n", b->num_vregs, b->num_insns);
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+        printf("  %-20s", kyx64_op_name(ins->op));
+        if (ins->dst && ins->dst->phys != X64_REG_NONE) {
+            printf(" %s", kyx64_reg_name(ins->dst->phys));
+        } else if (ins->dst) {
+            printf(" v%u", ins->dst->id);
+        }
+        if (ins->src1) {
+            if (ins->src1->phys != X64_REG_NONE)
+                printf(", %s", kyx64_reg_name(ins->src1->phys));
+            else
+                printf(", v%u", ins->src1->id);
+        }
+        if (ins->src2) {
+            if (ins->src2->phys != X64_REG_NONE)
+                printf(", %s", kyx64_reg_name(ins->src2->phys));
+            else
+                printf(", v%u", ins->src2->id);
+        }
+        if (ins->imm != 0) printf(", %lld", (long long)ins->imm);
+        printf("\n");
+    }
+}
+
+
+/* ============================================================
+ * Extended x86-64 Backend — labels, branches, memory, calls
+ * ============================================================ */
+
+KyX64Label *kyx64_new_label(KyX64Backend *b) {
+    if (!b) return NULL;
+
+    if (b->label_capacity == 0) {
+        b->label_capacity = 16;
+        b->labels = (KyX64Label **)calloc(b->label_capacity, sizeof(KyX64Label *));
+    }
+    if (b->num_labels >= b->label_capacity) {
+        b->label_capacity *= 2;
+        b->labels = (KyX64Label **)realloc(b->labels, b->label_capacity * sizeof(KyX64Label *));
+    }
+
+    KyX64Label *l = (KyX64Label *)calloc(1, sizeof(KyX64Label));
+    l->id = b->next_label++;
+    l->byte_offset = 0xFFFFFFFF;  /* unset */
+    l->patch_capacity = 4;
+    l->patch_offsets = (uint32_t *)calloc(4, sizeof(uint32_t));
+
+    b->labels[b->num_labels++] = l;
+    return l;
+}
+
+void kyx64_emit_label(KyX64Backend *b, KyX64Label *label) {
+    if (!b || !label) return;
+    KyX64Ins *ins = add_insn(b, X64_LABEL);
+    ins->label_id = label->id;
+}
+
+void kyx64_emit_jump(KyX64Backend *b, KyX64Op op, KyX64Label *target) {
+    if (!b || !target) return;
+    KyX64Ins *ins = add_insn(b, op);
+    ins->label_id = target->id;
+    ins->is_terminator = 1;
+    ins->fixup_label = target->id;
+    ins->fixup_offset = 0xFFFFFFFF;
+}
+
+void kyx64_emit_branch_zero(KyX64Backend *b, KyVReg *cond, KyX64Label *target) {
+    if (!b) return;
+    /* cmp cond, 0; jz target */
+    KyX64Ins *cmp = add_insn(b, X64_CMP_REG_IMM);
+    cmp->src1 = cond;
+    cmp->imm = 0;
+    kyx64_emit_jump(b, X64_JZ, target);
+}
+
+void kyx64_emit_load(KyX64Backend *b, KyVReg *dst, KyVReg *base, int32_t offset) {
+    if (!b) return;
+    KyX64Ins *ins = add_insn(b, X64_MOV_REG_MEM);
+    ins->dst = dst;
+    ins->src1 = base;
+    ins->mem_offset = offset;
+}
+
+void kyx64_emit_store(KyX64Backend *b, KyVReg *base, int32_t offset, KyVReg *value) {
+    if (!b) return;
+    KyX64Ins *ins = add_insn(b, X64_MOV_MEM_REG);
+    ins->dst = base;
+    ins->src1 = value;
+    ins->mem_offset = offset;
+}
+
+void kyx64_emit_call(KyX64Backend *b, void *target, KyVReg *result) {
+    if (!b) return;
+    KyX64Ins *ins = add_insn(b, X64_CALL);
+    ins->imm = (int64_t)(uintptr_t)target;
+    ins->dst = result;
+}
+
+/* ============================================================
+ * Encoding helpers
+ * ============================================================ */
+
+/* mov reg, [base + offset] */
+static int encode_load(uint8_t *code, size_t code_size, size_t *off,
+                       KyX64Reg dst, KyX64Reg base, int32_t offset) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    if ((unsigned)base >= X64_REG_COUNT) return -1;
+    if (base == X64_RSP) {
+        /* rsp as base requires SIB byte — not supported here. */
+        return -1;
+    }
+    uint8_t e_dst  = ky_x64_enc[dst];
+    uint8_t e_base = ky_x64_enc[base];
+
+    /* REX.W, plus REX.R if dst is extended, REX.B if base is extended. */
+    uint8_t rex = REX_W;
+    if (e_dst  >= 8) rex |= 0x04;  /* REX.R */
+    if (e_base >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[8];
+    size_t  n = 0;
+    buf[n++] = rex;
+    buf[n++] = 0x8B;  /* mov r64, r/m64 */
+    /* ModRM: mod=10 (disp32), reg=dst&7, rm=base&7 */
+    buf[n++] = 0x80 | ((e_dst & 7) << 3) | (e_base & 7);
+    memcpy(buf + n, &offset, 4); n += 4;
+    return emit_bytes(code, code_size, off, buf, n);
+}
+
+/* mov [base + offset], src */
+static int encode_store(uint8_t *code, size_t code_size, size_t *off,
+                        KyX64Reg base, int32_t offset, KyX64Reg src) {
+    if ((unsigned)src  >= X64_REG_COUNT) return -1;
+    if ((unsigned)base >= X64_REG_COUNT) return -1;
+    if (base == X64_RSP) return -1;
+
+    uint8_t e_src  = ky_x64_enc[src];
+    uint8_t e_base = ky_x64_enc[base];
+
+    uint8_t rex = REX_W;
+    if (e_src  >= 8) rex |= 0x04;  /* REX.R */
+    if (e_base >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[8];
+    size_t  n = 0;
+    buf[n++] = rex;
+    buf[n++] = 0x89;  /* mov r/m64, r64 */
+    buf[n++] = 0x80 | ((e_src & 7) << 3) | (e_base & 7);
+    memcpy(buf + n, &offset, 4); n += 4;
+    return emit_bytes(code, code_size, off, buf, n);
+}
+
+/* cmp reg, imm32 */
+static int encode_cmp_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg reg, int32_t imm) {
+    if ((unsigned)reg >= X64_REG_COUNT) return -1;
+    uint8_t e_reg = ky_x64_enc[reg];
+
+    uint8_t rex = REX_W;
+    if (e_reg >= 8) rex |= 0x01;  /* REX.B — rm field */
+
+    uint8_t buf[7];
+    buf[0] = rex;
+    buf[1] = 0x81;  /* cmp r/m64, imm32 */
+    buf[2] = 0xF8 | (e_reg & 7);  /* /7 for cmp */
+    memcpy(buf + 3, &imm, 4);
+    return emit_bytes(code, code_size, off, buf, 7);
+}
+
+/* cmp reg, reg */
+static int encode_cmp_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg a, KyX64Reg b) {
+    if ((unsigned)a >= X64_REG_COUNT) return -1;
+    if ((unsigned)b >= X64_REG_COUNT) return -1;
+    uint8_t e_a = ky_x64_enc[a];
+    uint8_t e_b = ky_x64_enc[b];
+
+    uint8_t rex = REX_W;
+    if (e_b >= 8) rex |= 0x04;  /* REX.R — reg field = b */
+    if (e_a >= 8) rex |= 0x01;  /* REX.B — rm field = a */
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0x39;  /* cmp r/m64, r64 */
+    buf[2] = 0xC0 | ((e_b & 7) << 3) | (e_a & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* and reg, reg */
+static int encode_and_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, KyX64Reg src) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    if ((unsigned)src >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+    uint8_t e_src = ky_x64_enc[src];
+
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;  /* REX.R */
+    if (e_dst >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0x21;  /* and r/m64, r64 */
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* or reg, reg */
+static int encode_or_reg(uint8_t *code, size_t code_size, size_t *off,
+                         KyX64Reg dst, KyX64Reg src) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    if ((unsigned)src >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+    uint8_t e_src = ky_x64_enc[src];
+
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;
+    if (e_dst >= 8) rex |= 0x01;
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0x09;  /* or r/m64, r64 */
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* xor reg, reg */
+static int encode_xor_reg(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, KyX64Reg src) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    if ((unsigned)src >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+    uint8_t e_src = ky_x64_enc[src];
+
+    uint8_t rex = REX_W;
+    if (e_src >= 8) rex |= 0x04;
+    if (e_dst >= 8) rex |= 0x01;
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0x31;  /* xor r/m64, r64 */
+    buf[2] = 0xC0 | ((e_src & 7) << 3) | (e_dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* shl reg, imm8 */
+static int encode_shl_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[4];
+    buf[0] = rex;
+    buf[1] = 0xC1;  /* shl r/m64, imm8 */
+    buf[2] = 0xE0 | (e_dst & 7);  /* /4 for shl */
+    buf[3] = imm;
+    return emit_bytes(code, code_size, off, buf, 4);
+}
+
+/* shr reg, imm8 */
+static int encode_shr_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x01;
+
+    uint8_t buf[4];
+    buf[0] = rex;
+    buf[1] = 0xC1;  /* shr r/m64, imm8 */
+    buf[2] = 0xE8 | (e_dst & 7);  /* /5 for shr */
+    buf[3] = imm;
+    return emit_bytes(code, code_size, off, buf, 4);
+}
+
+/* sar reg, imm8 — C1 /7 ib */
+static int encode_sar_imm(uint8_t *code, size_t code_size, size_t *off,
+                          KyX64Reg dst, uint8_t imm) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[4];
+    buf[0] = rex;
+    buf[1] = 0xC1;  /* sar r/m64, imm8 */
+    buf[2] = 0xF8 | (e_dst & 7);  /* /7 */
+    buf[3] = imm;
+    return emit_bytes(code, code_size, off, buf, 4);
+}
+
+/* neg r/m64 — F7 /3 */
+static int encode_neg(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Reg dst) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0xF7;  /* neg r/m64 */
+    buf[2] = 0xD8 | (e_dst & 7);  /* /3 */
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* not r/m64 — F7 /2 */
+static int encode_not(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Reg dst) {
+    if ((unsigned)dst >= X64_REG_COUNT) return -1;
+    uint8_t e_dst = ky_x64_enc[dst];
+
+    uint8_t rex = REX_W;
+    if (e_dst >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[3];
+    buf[0] = rex;
+    buf[1] = 0xF7;  /* not r/m64 */
+    buf[2] = 0xD0 | (e_dst & 7);  /* /2 */
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+static int encode_jcc(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Op op, int32_t rel32) {
+    uint8_t buf[6];
+    uint8_t cc = 0;
+    switch (op) {
+        case X64_JZ:  case X64_JE:  cc = 0x84; break;  /* jz / je */
+        case X64_JNZ: case X64_JNE: cc = 0x85; break;  /* jnz / jne */
+        case X64_JL:  cc = 0x8C; break;
+        case X64_JLE: cc = 0x8E; break;
+        case X64_JG:  cc = 0x8F; break;
+        case X64_JGE: cc = 0x8D; break;
+        default: return -1;
+    }
+    buf[0] = 0x0F;
+    buf[1] = cc;
+    memcpy(buf + 2, &rel32, 4);
+    return emit_bytes(code, code_size, off, buf, 6);
+}
+
+/* JMP rel32 */
+static int encode_jmp(uint8_t *code, size_t code_size, size_t *off, int32_t rel32) {
+    uint8_t buf[5];
+    buf[0] = 0xE9;
+    memcpy(buf + 1, &rel32, 4);
+    return emit_bytes(code, code_size, off, buf, 5);
+}
+
+/* CALL rel32 */
+static int encode_call(uint8_t *code, size_t code_size, size_t *off, int32_t rel32) {
+    uint8_t buf[5];
+    buf[0] = 0xE8;
+    memcpy(buf + 1, &rel32, 4);
+    return emit_bytes(code, code_size, off, buf, 5);
+}
+
+/* LEA reg, [base + offset] */
+static int encode_lea(uint8_t *code, size_t code_size, size_t *off,
+                      KyX64Reg dst, KyX64Reg base, int32_t offset) {
+    if ((unsigned)dst  >= X64_REG_COUNT) return -1;
+    if ((unsigned)base >= X64_REG_COUNT) return -1;
+    if (base == X64_RSP) return -1;  /* SIB unsupported */
+
+    uint8_t e_dst  = ky_x64_enc[dst];
+    uint8_t e_base = ky_x64_enc[base];
+
+    uint8_t rex = REX_W;
+    if (e_dst  >= 8) rex |= 0x04;  /* REX.R */
+    if (e_base >= 8) rex |= 0x01;  /* REX.B */
+
+    uint8_t buf[8];
+    size_t  n = 0;
+    buf[n++] = rex;
+    buf[n++] = 0x8D;  /* lea r64, m */
+    buf[n++] = 0x80 | ((e_dst & 7) << 3) | (e_base & 7);  /* mod=10, disp32 */
+    memcpy(buf + n, &offset, 4); n += 4;
+    return emit_bytes(code, code_size, off, buf, n);
+}
+
+/* ============================================================
+ * Extended emitter — handles all new opcodes
+ * ============================================================ */
+
+int kyx64_emit_extended(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len) {
+    if (!b || !code || !code_len) return -1;
+
+    size_t off = 0;
+
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+
+        int rc = 0;
+        switch (ins->op) {
+            case X64_MOV_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_mov_imm64(code, code_size, &off, ins->dst->phys, ins->imm);
+                break;
+
+            case X64_MOV_REG_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_mov_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src1->phys);
+                break;
+
+            case X64_ADD_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_add_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_SUB_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_sub_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_MUL_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != X64_REG_NONE &&
+                        ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_imul_reg_reg(code, code_size, &off,
+                                             ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_AND_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_and_reg(code, code_size, &off,
+                                        ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_OR_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_or_reg(code, code_size, &off,
+                                       ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_XOR_REG_REG:
+                if (ins->dst && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src2->phys != X64_REG_NONE) {
+                    if (ins->src1 && ins->src1->phys != ins->dst->phys)
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    rc = encode_xor_reg(code, code_size, &off,
+                                        ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_SHL_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shl_imm(code, code_size, &off,
+                                        ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_SHR_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shr_imm(code, code_size, &off,
+                                        ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_CMP_REG_IMM:
+                if (ins->src1 && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_cmp_imm(code, code_size, &off,
+                                        ins->src1->phys, (int32_t)ins->imm);
+                break;
+
+            case X64_CMP_REG_REG:
+                if (ins->src1 && ins->src2 &&
+                    ins->src1->phys != X64_REG_NONE && ins->src2->phys != X64_REG_NONE)
+                    rc = encode_cmp_reg(code, code_size, &off,
+                                        ins->src1->phys, ins->src2->phys);
+                break;
+
+            case X64_MOV_REG_MEM:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_load(code, code_size, &off,
+                                    ins->dst->phys, ins->src1->phys, ins->mem_offset);
+                break;
+
+            case X64_MOV_MEM_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_store(code, code_size, &off,
+                                     ins->dst->phys, ins->mem_offset, ins->src1->phys);
+                break;
+
+            case X64_LEA:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_lea(code, code_size, &off,
+                                   ins->dst->phys, ins->src1->phys, ins->mem_offset);
+                break;
+
+            case X64_JMP:
+            case X64_JZ: case X64_JNZ:
+            case X64_JE: case X64_JNE:
+            case X64_JL: case X64_JLE:
+            case X64_JG: case X64_JGE: {
+                /* The rel32 operand goes at:
+                 *   JMP: off + 1 (after 0xE9)
+                 *   Jcc: off + 2 (after 0x0F 0x8x)
+                 */
+                uint32_t fixup_pos = (ins->op == X64_JMP)
+                                     ? (uint32_t)off + 1
+                                     : (uint32_t)off + 2;
+                ins->fixup_offset = fixup_pos;
+
+                if (ins->op == X64_JMP)
+                    rc = encode_jmp(code, code_size, &off, 0);
+                else
+                    rc = encode_jcc(code, code_size, &off, ins->op, 0);
+
+                /* Register fixup with target label */
+                for (uint32_t k = 0; k < b->num_labels; k++) {
+                    if (b->labels[k]->id == ins->label_id) {
+                        KyX64Label *l = b->labels[k];
+                        if (l->num_patches >= l->patch_capacity) {
+                            l->patch_capacity *= 2;
+                            l->patch_offsets = (uint32_t *)realloc(
+                                l->patch_offsets, l->patch_capacity * sizeof(uint32_t));
+                        }
+                        l->patch_offsets[l->num_patches++] = fixup_pos;
+                        break;
+                    }
+                }
+                break;
+            }
+
+            case X64_LABEL: {
+                /* Record current offset in label */
+                for (uint32_t k = 0; k < b->num_labels; k++) {
+                    if (b->labels[k]->id == ins->label_id) {
+                        b->labels[k]->byte_offset = (uint32_t)off;
+                        break;
+                    }
+                }
+                break;
+            }
+
+            case X64_CALL: {
+                int32_t rel = 0;  /* placeholder for now */
+                (void)rel;
+                uint8_t buf[5];
+                buf[0] = 0xE8;
+                memcpy(buf + 1, &ins->imm, 4);
+                rc = emit_bytes(code, code_size, &off, buf, 5);
+                break;
+            }
+
+            case X64_RET: {
+                uint8_t ret = 0xC3;
+                rc = emit_bytes(code, code_size, &off, &ret, 1);
+                break;
+            }
+
+            case X64_NOP:
+            default:
+                break;
+        }
+
+        if (rc < 0) return -1;
+    }
+
+    *code_len = off;
+    return 0;
+}
+
+/* Patch jump targets after all code is emitted */
+void kyx64_patch_labels(KyX64Backend *b, uint8_t *code, size_t code_size) {
+    if (!b || !code) return;
+
+    for (uint32_t i = 0; i < b->num_labels; i++) {
+        KyX64Label *l = b->labels[i];
+        if (l->byte_offset == 0xFFFFFFFF) continue;  /* label never emitted */
+
+        for (uint32_t j = 0; j < l->num_patches; j++) {
+            uint32_t patch_off = l->patch_offsets[j];
+            if (patch_off + 4 > code_size) continue;
+
+            /* Compute relative offset: target - (patch_off + 4) */
+            int32_t rel = (int32_t)l->byte_offset - (int32_t)(patch_off + 4);
+            memcpy(code + patch_off, &rel, 4);
+        }
+    }
+}
+
+
+/* ============================================================
+ * Layer 14: Chaitin-Briggs Register Allocation
+ * ============================================================ */
+
+KyRegAlloc *kyregalloc_create(KyX64Backend *b) {
+    if (!b) return NULL;
+
+    KyRegAlloc *ra = (KyRegAlloc *)calloc(1, sizeof(KyRegAlloc));
+    if (!ra) return NULL;
+
+    ra->backend = b;
+
+    /* Available physical registers (exclude rsp, rbp) */
+    KyX64Reg avail[] = {
+        X64_RAX, X64_RCX, X64_RDX,
+        X64_RSI, X64_RDI,
+        X64_R8, X64_R9, X64_R10, X64_R11
+    };
+    ra->num_regs = sizeof(avail) / sizeof(avail[0]);
+    for (uint32_t i = 0; i < ra->num_regs; i++) ra->regs[i] = avail[i];
+
+    /* Allocate nodes array (one per vreg) */
+    ra->num_nodes = b->num_vregs;
+    ra->nodes = (KyRegNode **)calloc(ra->num_nodes + 1, sizeof(KyRegNode *));
+
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        KyRegNode *n = (KyRegNode *)calloc(1, sizeof(KyRegNode));
+        n->vreg_id = i;
+        n->color = KYREG_UNASSIGNED;
+        n->neighbor_capacity = 4;
+        n->neighbors = (uint32_t *)calloc(4, sizeof(uint32_t));
+        ra->nodes[i] = n;
+
+        /* Pre-color physical vregs */
+        if (i < b->num_vregs && b->vregs[i] &&
+            b->vregs[i]->kind == VREG_PHYSICAL) {
+            n->color = b->vregs[i]->phys;
+            n->removed = 1;  /* don't process in simplify/select */
+        }
+    }
+
+    ra->stack_capacity = ra->num_nodes + 1;
+    ra->stack = (uint32_t *)calloc(ra->stack_capacity, sizeof(uint32_t));
+
+    ra->spill_capacity = 16;
+    ra->spilled = (uint32_t *)calloc(ra->spill_capacity, sizeof(uint32_t));
+
+    return ra;
+}
+
+void kyregalloc_destroy(KyRegAlloc *ra) {
+    if (!ra) return;
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        if (ra->nodes[i]) {
+            free(ra->nodes[i]->neighbors);
+            free(ra->nodes[i]);
+        }
+    }
+    free(ra->nodes);
+    free(ra->stack);
+    free(ra->spilled);
+    free(ra);
+}
+
+/* ---------- Live interval computation ---------- */
+
+static void compute_live_intervals(KyRegAlloc *ra) {
+    KyX64Backend *b = ra->backend;
+
+    /* Initialize intervals to empty */
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        ra->nodes[i]->live_start = UINT32_MAX;
+        ra->nodes[i]->live_end = 0;
+    }
+
+    /* Map vreg id → node index */
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+
+        uint32_t pos = i;  /* instruction position is the "time" unit */
+
+        /* Each use/def extends the live interval */
+        KyVReg *vregs[3] = { ins->dst, ins->src1, ins->src2 };
+        for (int j = 0; j < 3; j++) {
+            KyVReg *vr = vregs[j];
+            if (!vr) continue;
+            if (vr->id >= ra->num_nodes) continue;
+
+            KyRegNode *node = ra->nodes[vr->id];
+            if (pos < node->live_start) node->live_start = pos;
+            if (pos > node->live_end) node->live_end = pos;
+        }
+    }
+}
+
+/* ---------- Interference graph ---------- */
+
+static void add_interference(KyRegAlloc *ra, uint32_t a, uint32_t b) {
+    if (a == b) return;
+    if (a >= ra->num_nodes || b >= ra->num_nodes) return;
+
+    KyRegNode *na = ra->nodes[a];
+    KyRegNode *nb = ra->nodes[b];
+
+    /* Check if already exists */
+    for (uint32_t i = 0; i < na->num_neighbors; i++) {
+        if (na->neighbors[i] == b) return;
+    }
+
+    /* Add b to a's neighbors */
+    if (na->num_neighbors >= na->neighbor_capacity) {
+        na->neighbor_capacity *= 2;
+        na->neighbors = (uint32_t *)realloc(na->neighbors,
+                                             na->neighbor_capacity * sizeof(uint32_t));
+    }
+    na->neighbors[na->num_neighbors++] = b;
+
+    /* Add a to b's neighbors */
+    if (nb->num_neighbors >= nb->neighbor_capacity) {
+        nb->neighbor_capacity *= 2;
+        nb->neighbors = (uint32_t *)realloc(nb->neighbors,
+                                             nb->neighbor_capacity * sizeof(uint32_t));
+    }
+    nb->neighbors[nb->num_neighbors++] = a;
+
+    na->degree++;
+    nb->degree++;
+}
+
+static void build_interference_graph(KyRegAlloc *ra) {
+    uint32_t n = ra->num_nodes;
+
+    /* O(n²) — check each pair of overlapping intervals */
+    for (uint32_t i = 0; i < n; i++) {
+        KyRegNode *a = ra->nodes[i];
+        if (a->live_start == UINT32_MAX) continue;  /* unused vreg */
+
+        for (uint32_t j = i + 1; j < n; j++) {
+            KyRegNode *b = ra->nodes[j];
+            if (b->live_start == UINT32_MAX) continue;
+
+            /* Interfere if intervals overlap */
+            if (a->live_start <= b->live_end && b->live_start <= a->live_end) {
+                add_interference(ra, i, j);
+            }
+        }
+    }
+}
+
+/* ---------- Simplify phase ---------- */
+
+static void push_stack(KyRegAlloc *ra, uint32_t node_id) {
+    if (ra->stack_top >= ra->stack_capacity) {
+        ra->stack_capacity *= 2;
+        ra->stack = (uint32_t *)realloc(ra->stack,
+                                         ra->stack_capacity * sizeof(uint32_t));
+    }
+    ra->stack[ra->stack_top++] = node_id;
+}
+
+static void mark_for_spill(KyRegAlloc *ra, uint32_t node_id) {
+    if (ra->num_spills >= ra->spill_capacity) {
+        ra->spill_capacity *= 2;
+        ra->spilled = (uint32_t *)realloc(ra->spilled,
+                                           ra->spill_capacity * sizeof(uint32_t));
+    }
+    ra->spilled[ra->num_spills++] = node_id;
+    ra->nodes[node_id]->spilled = 1;
+}
+
+static void simplify(KyRegAlloc *ra) {
+    uint32_t K = ra->num_regs;
+
+    /* Worklist of all nodes */
+    uint32_t *worklist = (uint32_t *)calloc(ra->num_nodes, sizeof(uint32_t));
+    uint32_t work_count = 0;
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        if (ra->nodes[i]->live_start != UINT32_MAX) {
+            worklist[work_count++] = i;
+        }
+    }
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+
+        for (uint32_t i = 0; i < work_count; i++) {
+            uint32_t id = worklist[i];
+            KyRegNode *n = ra->nodes[id];
+            if (n->removed) continue;
+
+            if (n->degree < K) {
+                /* Push to stack, mark removed */
+                push_stack(ra, id);
+                n->removed = 1;
+                changed = 1;
+
+                /* Decrement degree of neighbors */
+                for (uint32_t j = 0; j < n->num_neighbors; j++) {
+                    KyRegNode *nb = ra->nodes[n->neighbors[j]];
+                    if (!nb->removed && nb->degree > 0) {
+                        nb->degree--;
+                    }
+                }
+            }
+        }
+
+        /* If no progress, spill the highest-degree node */
+        if (!changed) {
+            uint32_t max_deg = 0;
+            int32_t spill_id = -1;
+            for (uint32_t i = 0; i < work_count; i++) {
+                KyRegNode *n = ra->nodes[worklist[i]];
+                if (n->removed) continue;
+                if (n->degree > max_deg) {
+                    max_deg = n->degree;
+                    spill_id = (int32_t)worklist[i];
+                }
+            }
+            if (spill_id >= 0) {
+                uint32_t id = (uint32_t)spill_id;
+                mark_for_spill(ra, id);
+                push_stack(ra, id);
+                ra->nodes[id]->removed = 1;
+                changed = 1;
+
+                for (uint32_t j = 0; j < ra->nodes[id]->num_neighbors; j++) {
+                    KyRegNode *nb = ra->nodes[ra->nodes[id]->neighbors[j]];
+                    if (!nb->removed && nb->degree > 0) {
+                        nb->degree--;
+                    }
+                }
+            }
+        }
+    }
+
+    free(worklist);
+}
+
+/* ---------- Select phase ---------- */
+
+static void select_colors(KyRegAlloc *ra) {
+    uint32_t K = ra->num_regs;
+
+    /* Pop from stack in reverse order */
+    while (ra->stack_top > 0) {
+        uint32_t id = ra->stack[--ra->stack_top];
+        KyRegNode *n = ra->nodes[id];
+
+        if (n->spilled) {
+            n->color = KYREG_UNASSIGNED;
+            continue;
+        }
+
+        /* Bitmap of colors used by neighbors */
+        uint8_t used[X64_REG_COUNT];
+        memset(used, 0, sizeof(used));
+
+        for (uint32_t j = 0; j < n->num_neighbors; j++) {
+            KyRegNode *nb = ra->nodes[n->neighbors[j]];
+            if (nb->color != KYREG_UNASSIGNED && nb->color < K) {
+                used[nb->color] = 1;
+            }
+        }
+
+        /* Assign the lowest available color */
+        uint32_t color = KYREG_UNASSIGNED;
+        for (uint32_t c = 0; c < K; c++) {
+            if (!used[c]) {
+                color = c;
+                break;
+            }
+        }
+
+        if (color == KYREG_UNASSIGNED) {
+            /* Should have been spilled in simplify */
+            n->spilled = 1;
+            mark_for_spill(ra, id);
+        }
+        n->color = color;
+    }
+}
+
+/* ---------- Apply colors to backend vregs ---------- */
+
+static void apply_colors(KyRegAlloc *ra) {
+    KyX64Backend *b = ra->backend;
+
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        KyRegNode *n = ra->nodes[i];
+        if (i >= b->num_vregs) break;
+
+        KyVReg *vr = b->vregs[i];
+        if (!vr) continue;
+        if (vr->kind == VREG_PHYSICAL) continue;  /* skip physical */
+
+        if (n->spilled) {
+            vr->spilled = 1;
+            vr->spill_slot = (int32_t)ra->num_spills;
+            vr->phys = X64_REG_NONE;
+        } else if (n->color != KYREG_UNASSIGNED && n->color < ra->num_regs) {
+            vr->phys = ra->regs[n->color];
+            b->vreg_phys[vr->id] = vr->phys;
+        }
+    }
+}
+
+/* ---------- Main entry point ---------- */
+
+int kyregalloc_run(KyX64Backend *b) {
+    if (!b) return -1;
+
+    KyRegAlloc *ra = kyregalloc_create(b);
+    if (!ra) return -1;
+
+    compute_live_intervals(ra);
+    build_interference_graph(ra);
+    simplify(ra);
+    select_colors(ra);
+    apply_colors(ra);
+
+    kyregalloc_destroy(ra);
+    return 0;
+}
+
+void kyregalloc_print(KyRegAlloc *ra) {
+    if (!ra) return;
+    printf("Register Allocator: %u nodes, %u physical regs\n",
+           ra->num_nodes, ra->num_regs);
+    for (uint32_t i = 0; i < ra->num_nodes; i++) {
+        KyRegNode *n = ra->nodes[i];
+        if (n->live_start == UINT32_MAX) continue;
+        printf("  v%-4u interval [%u, %u] degree=%u",
+               n->vreg_id, n->live_start, n->live_end, n->degree);
+        if (n->spilled) printf(" SPILLED");
+        else if (n->color != KYREG_UNASSIGNED && n->color < ra->num_regs)
+            printf(" color=%s", kyx64_reg_name(ra->regs[n->color]));
+        printf("\n");
+    }
+}
+
+
+/* ============================================================
+ * Layer 15: Function Calls (SysV x86-64 ABI)
+ * ============================================================ */
+
+/* Add a callee-saved register to the frame */
+void kyx64_frame_add_callee_saved(KyFuncFrame *frame, KyX64Reg reg) {
+    if (!frame) return;
+    for (uint32_t i = 0; i < frame->num_callee_saved; i++) {
+        if (frame->callee_saved[i] == reg) return;
+    }
+    if (frame->num_callee_saved < 6) {
+        frame->callee_saved[frame->num_callee_saved++] = reg;
+    }
+}
+
+/* Emit function prologue:
+ *   push rbp
+ *   mov rbp, rsp
+ *   sub rsp, frame_size
+ *   push callee-saved regs
+ */
+KyX64Ins *kyx64_emit_prologue(KyX64Backend *b, KyFuncFrame *frame) {
+    if (!b || !frame) return NULL;
+
+    /* push rbp */
+    KyX64Ins *ins = add_insn(b, X64_PUSH);
+    ins->imm = X64_RBP;
+    ins->is_terminator = 0;
+
+    /* mov rbp, rsp */
+    ins = add_insn(b, X64_MOV_REG_REG);
+    ins->imm = (X64_RBP << 8) | X64_RSP;  /* custom encoding: dst<<8 | src */
+    ins->is_terminator = 0;
+
+    /* push callee-saved registers used */
+    for (uint32_t i = 0; i < frame->num_callee_saved; i++) {
+        ins = add_insn(b, X64_PUSH);
+        ins->imm = frame->callee_saved[i];
+    }
+
+    /* sub rsp, frame_size (if nonzero) */
+    if (frame->frame_size > 0) {
+        ins = add_insn(b, X64_SUB_REG_IMM);
+        ins->imm = frame->frame_size;
+        /* dst is rsp implicitly */
+    }
+
+    return ins;
+}
+
+/* Emit function epilogue:
+ *   add rsp, frame_size
+ *   pop callee-saved regs (reverse order)
+ *   pop rbp
+ *   ret
+ */
+KyX64Ins *kyx64_emit_epilogue(KyX64Backend *b, KyFuncFrame *frame) {
+    if (!b || !frame) return NULL;
+
+    /* add rsp, frame_size (if nonzero) */
+    if (frame->frame_size > 0) {
+        KyX64Ins *ins = add_insn(b, X64_ADD_REG_IMM);
+        ins->imm = frame->frame_size;
+    }
+
+    /* pop callee-saved registers in reverse order */
+    for (int32_t i = (int32_t)frame->num_callee_saved - 1; i >= 0; i--) {
+        KyX64Ins *ins = add_insn(b, X64_POP);
+        ins->imm = frame->callee_saved[i];
+    }
+
+    /* pop rbp */
+    KyX64Ins *ins = add_insn(b, X64_POP);
+    ins->imm = X64_RBP;
+
+    /* ret */
+    ins = add_insn(b, X64_RET);
+    return ins;
+}
+
+/* Emit a push */
+KyX64Ins *kyx64_emit_push(KyX64Backend *b, KyVReg *reg) {
+    if (!b || !reg) return NULL;
+    KyX64Ins *ins = add_insn(b, X64_PUSH);
+    ins->src1 = reg;
+    return ins;
+}
+
+/* Emit a pop */
+KyX64Ins *kyx64_emit_pop(KyX64Backend *b, KyVReg *reg) {
+    if (!b || !reg) return NULL;
+    KyX64Ins *ins = add_insn(b, X64_POP);
+    ins->dst = reg;
+    return ins;
+}
+
+/* Emit an indirect call through a register */
+KyX64Ins *kyx64_emit_call_reg(KyX64Backend *b, KyVReg *target_reg,
+                               KyVReg **args, uint32_t num_args,
+                               KyVReg *result) {
+    if (!b || !target_reg) return NULL;
+
+    /* Move args to ABI registers rdi..r9 (in reverse to avoid clobber) */
+    for (int32_t i = (int32_t)num_args - 1; i >= 0; i--) {
+        KyX64Reg arg_reg;
+        switch (i) {
+            case 0: arg_reg = KYFUNC_ARG0; break;
+            case 1: arg_reg = KYFUNC_ARG1; break;
+            case 2: arg_reg = KYFUNC_ARG2; break;
+            case 3: arg_reg = KYFUNC_ARG3; break;
+            case 4: arg_reg = KYFUNC_ARG4; break;
+            case 5: arg_reg = KYFUNC_ARG5; break;
+            default: return NULL;
+        }
+        KyX64Ins *mov = add_insn(b, X64_MOV_REG_REG);
+        mov->imm = (arg_reg << 8) | 0;  /* dst = phys, src = vreg */
+        mov->src1 = args[i];
+    }
+
+    /* call *reg */
+    KyX64Ins *call = add_insn(b, X64_CALL);
+    call->src1 = target_reg;
+    call->dst = result;  /* result captured from rax */
+    call->is_terminator = 0;
+    return call;
+}
+
+/* Emit a direct call to a known address */
+KyX64Ins *kyx64_emit_call_direct(KyX64Backend *b, void *target,
+                                  KyVReg **args, uint32_t num_args,
+                                  KyVReg *result) {
+
+    /* Move args to ABI registers */
+    for (uint32_t i = 0; i < num_args && i < 6; i++) {
+        KyX64Reg arg_reg = X64_RDI;
+        switch (i) {
+            case 0: arg_reg = X64_RDI; break;
+            case 1: arg_reg = X64_RSI; break;
+            case 2: arg_reg = X64_RDX; break;
+            case 3: arg_reg = X64_RCX; break;
+            case 4: arg_reg = X64_R8; break;
+            case 5: arg_reg = X64_R9; break;
+        }
+        KyVReg *dst_phys = get_phys_vreg(b, arg_reg);
+        KyX64Ins *mov = add_insn(b, X64_MOV_REG_REG);
+        mov->dst = dst_phys;
+        mov->src1 = args[i];
+    }
+
+    /* call target */
+    KyX64Ins *call = add_insn(b, X64_CALL);
+    call->imm = (int64_t)(uintptr_t)target;
+    call->is_terminator = 0;
+
+    /* Move rax to result vreg */
+    if (result) {
+        KyVReg *rax_phys = get_phys_vreg(b, X64_RAX);
+        KyX64Ins *mv = add_insn(b, X64_MOV_REG_REG);
+        mv->dst = result;
+        mv->src1 = rax_phys;
+    }
+    return call;
+}
+
+/* ============================================================
+ * Extended encoding for new instructions
+ * ============================================================ */
+
+/* Encode push reg */
+static int encode_push(uint8_t *code, size_t code_size, size_t *off, KyX64Reg reg) {
+    uint8_t buf[2];
+    /* Convert our enum order to x86 encoding order (RAX=0, RCX=1, ...).
+     * Our enum has RBX=1 but x86 encoding 1 is RCX; without this table
+     * push rbx emits push rcx. */
+    if ((unsigned)reg >= X64_REG_COUNT) return -1;
+    uint8_t enc = ky_x64_enc[reg];
+    if (enc >= 8) {
+        buf[0] = 0x41;  /* REX.B */
+        buf[1] = 0x50 + (enc & 7);
+        return emit_bytes(code, code_size, off, buf, 2);
+    }
+    buf[0] = 0x50 + enc;
+    return emit_bytes(code, code_size, off, buf, 1);
+}
+
+/* Encode pop reg */
+static int encode_pop(uint8_t *code, size_t code_size, size_t *off, KyX64Reg reg) {
+    uint8_t buf[2];
+    if ((unsigned)reg >= X64_REG_COUNT) return -1;
+    uint8_t enc = ky_x64_enc[reg];
+    if (enc >= 8) {
+        buf[0] = 0x41;  /* REX.B */
+        buf[1] = 0x58 + (enc & 7);
+        return emit_bytes(code, code_size, off, buf, 2);
+    }
+    buf[0] = 0x58 + enc;
+    return emit_bytes(code, code_size, off, buf, 1);
+}
+
+/* Encode mov r/m64, r64 with REX.B for extended regs */
+static int encode_mov_reg_reg_ext(uint8_t *code, size_t code_size, size_t *off,
+                                   KyX64Reg dst, KyX64Reg src) {
+    uint8_t buf[3];
+    uint8_t rex = REX_W;
+    if (dst >= 8) rex |= 0x01;  /* REX.B */
+    if (src >= 8) rex |= 0x04;  /* REX.R */
+    buf[0] = rex;
+    buf[1] = 0x89;  /* mov r/m64, r64 */
+    buf[2] = 0xC0 | ((src & 7) << 3) | (dst & 7);
+    return emit_bytes(code, code_size, off, buf, 3);
+}
+
+/* Encode call rel32 */
+static int encode_call_rel32(uint8_t *code, size_t code_size, size_t *off,
+                              int32_t rel32) {
+    uint8_t buf[5];
+    buf[0] = 0xE8;
+    memcpy(buf + 1, &rel32, 4);
+    return emit_bytes(code, code_size, off, buf, 5);
+}
+
+/* ============================================================
+ * Enhanced emitter — handles push/pop/call
+ * ============================================================ */
+
+int kyx64_emit_with_calls(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len) {
+    if (!b || !code || !code_len) return -1;
+
+    size_t off = 0;
+
+    for (uint32_t i = 0; i < b->num_insns; i++) {
+        KyX64Ins *ins = b->insns[i];
+        if (!ins) continue;
+
+        int rc = 0;
+        switch (ins->op) {
+            case X64_MOV_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_mov_imm64(code, code_size, &off, ins->dst->phys, ins->imm);
+                break;
+
+            case X64_MOV_REG_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE)
+                    rc = encode_mov_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src1->phys);
+                break;
+
+            case X64_ADD_REG_REG:
+                if (ins->dst && ins->src1 && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->dst->phys != ins->src1->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_add_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_SUB_REG_REG:
+                if (ins->dst && ins->src1 && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->dst->phys != ins->src1->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_sub_reg_reg(code, code_size, &off,
+                                            ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_MUL_REG_REG:
+                if (ins->dst && ins->src1 && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->dst->phys != ins->src1->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    rc = encode_imul_reg_reg(code, code_size, &off,
+                                             ins->dst->phys, ins->src2->phys);
+                }
+                break;
+
+            case X64_AND_REG_REG:
+            case X64_OR_REG_REG:
+            case X64_XOR_REG_REG: {
+                if (ins->dst && ins->src1 && ins->src2 &&
+                    ins->dst->phys != X64_REG_NONE &&
+                    ins->src1->phys != X64_REG_NONE &&
+                    ins->src2->phys != X64_REG_NONE) {
+                    if (ins->dst->phys != ins->src1->phys) {
+                        encode_mov_reg_reg(code, code_size, &off,
+                                          ins->dst->phys, ins->src1->phys);
+                    }
+                    if (ins->op == X64_AND_REG_REG)
+                        rc = encode_and_reg(code, code_size, &off, ins->dst->phys, ins->src2->phys);
+                    else if (ins->op == X64_OR_REG_REG)
+                        rc = encode_or_reg(code, code_size, &off, ins->dst->phys, ins->src2->phys);
+                    else
+                        rc = encode_xor_reg(code, code_size, &off, ins->dst->phys, ins->src2->phys);
+                }
+                break;
+            }
+
+            case X64_SHL_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shl_imm(code, code_size, &off, ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_SHR_REG_IMM:
+                if (ins->dst && ins->dst->phys != X64_REG_NONE)
+                    rc = encode_shr_imm(code, code_size, &off, ins->dst->phys, (uint8_t)ins->imm);
+                break;
+
+            case X64_CMP_REG_IMM:
+                if (ins->src1 && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_cmp_imm(code, code_size, &off, ins->src1->phys, (int32_t)ins->imm);
+                break;
+
+            case X64_CMP_REG_REG:
+                if (ins->src1 && ins->src2 &&
+                    ins->src1->phys != X64_REG_NONE && ins->src2->phys != X64_REG_NONE)
+                    rc = encode_cmp_reg(code, code_size, &off, ins->src1->phys, ins->src2->phys);
+                break;
+
+            case X64_MOV_REG_MEM:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_load(code, code_size, &off,
+                                    ins->dst->phys, ins->src1->phys, ins->mem_offset);
+                break;
+
+            case X64_MOV_MEM_REG:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_store(code, code_size, &off,
+                                     ins->dst->phys, ins->mem_offset, ins->src1->phys);
+                break;
+
+            case X64_LEA:
+                if (ins->dst && ins->src1 &&
+                    ins->dst->phys != X64_REG_NONE && ins->src1->phys != X64_REG_NONE)
+                    rc = encode_lea(code, code_size, &off,
+                                   ins->dst->phys, ins->src1->phys, ins->mem_offset);
+                break;
+
+            case X64_JMP:
+            case X64_JZ: case X64_JNZ:
+            case X64_JE: case X64_JNE:
+            case X64_JL: case X64_JLE:
+            case X64_JG: case X64_JGE: {
+                uint32_t fixup_pos = (ins->op == X64_JMP)
+                                     ? (uint32_t)off + 1
+                                     : (uint32_t)off + 2;
+                if (ins->op == X64_JMP)
+                    rc = encode_jmp(code, code_size, &off, 0);
+                else
+                    rc = encode_jcc(code, code_size, &off, ins->op, 0);
+                for (uint32_t k = 0; k < b->num_labels; k++) {
+                    if (b->labels[k]->id == ins->label_id) {
+                        KyX64Label *l = b->labels[k];
+                        if (l->num_patches >= l->patch_capacity) {
+                            l->patch_capacity *= 2;
+                            l->patch_offsets = (uint32_t *)realloc(
+                                l->patch_offsets, l->patch_capacity * sizeof(uint32_t));
+                        }
+                        l->patch_offsets[l->num_patches++] = fixup_pos;
+                        break;
+                    }
+                }
+                break;
+            }
+
+            case X64_LABEL: {
+                for (uint32_t k = 0; k < b->num_labels; k++) {
+                    if (b->labels[k]->id == ins->label_id) {
+                        b->labels[k]->byte_offset = (uint32_t)off;
+                        break;
+                    }
+                }
+                break;
+            }
+
+            case X64_PUSH: {
+                KyX64Reg reg = ins->src1 ? ins->src1->phys : (KyX64Reg)ins->imm;
+                if (reg != X64_REG_NONE)
+                    rc = encode_push(code, code_size, &off, reg);
+                break;
+            }
+
+            case X64_POP: {
+                KyX64Reg reg = ins->dst ? ins->dst->phys : (KyX64Reg)ins->imm;
+                if (reg != X64_REG_NONE)
+                    rc = encode_pop(code, code_size, &off, reg);
+                break;
+            }
+
+            case X64_CALL: {
+                if (ins->src1 && ins->src1->phys != X64_REG_NONE) {
+                    /* Indirect call through register: call *reg */
+                    uint8_t buf[3];
+                    uint8_t rex = 0x40;
+                    if (ins->src1->phys >= 8) rex |= 0x01;
+                    buf[0] = rex;
+                    buf[1] = 0xFF;
+                    buf[2] = 0xD0 | (ins->src1->phys & 7);
+                    rc = emit_bytes(code, code_size, &off, buf, 3);
+                } else if (ins->imm != 0) {
+                    /* Direct call: mov rax, target; call rax */
+                    uint8_t buf[12];
+                    buf[0] = 0x48; buf[1] = 0xB8;
+                    int64_t target = ins->imm;
+                    memcpy(buf + 2, &target, 8);
+                    buf[10] = 0xFF; buf[11] = 0xD0;
+                    rc = emit_bytes(code, code_size, &off, buf, 12);
+                }
+                break;
+            }
+
+            case X64_RET: {
+                uint8_t ret = 0xC3;
+                rc = emit_bytes(code, code_size, &off, &ret, 1);
+                break;
+            }
+
+            case X64_NOP:
+            default:
+                break;
+        }
+        if (rc < 0) return -1;
+    }
+
+    *code_len = off;
+    return 0;
+}
+

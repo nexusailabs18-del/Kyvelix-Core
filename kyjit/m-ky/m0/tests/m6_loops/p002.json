@@ -1,0 +1,9 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 5, "upper": 8, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [1], "elem_size": 8, "offset": 0 },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "index_kind": { "Product": { "Mul": [{ "IV": 0 }, { "IV": 0 }] } } }
+  ]
+}

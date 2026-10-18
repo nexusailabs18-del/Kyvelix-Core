@@ -1,0 +1,9 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 4, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [0], "elem_size": 8, "offset": 0 },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 1 }
+  ],
+  "chase": { "var": "p", "table": [1,5,3], "init": 0, "max_steps": 4, "accessed_base": "A" }
+}

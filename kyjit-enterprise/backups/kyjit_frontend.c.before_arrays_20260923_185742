@@ -1,0 +1,855 @@
+/*
+ * kyjit_frontend.c — lexer + recursive-descent parser for .ky.
+ *
+ * Parses source text and drives KyIRBuilder directly (no AST).
+ * Every parse_* function returns a KyNode* for expressions or
+ * emits statements into the current block.
+ *
+ * Error handling: on any error, sets ctx->err (a char buffer),
+ * sets ctx->err_flagged, and returns NULL / does nothing. The
+ * caller checks err_flagged after parse_program.
+ */
+
+#define _GNU_SOURCE
+#include "kyjit_frontend.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <stdarg.h>
+
+/* ============================================================
+ * Tokens
+ * ============================================================ */
+
+typedef enum {
+    TK_EOF = 0,
+    TK_INT,          /* integer literal */
+    TK_STRING,       /* string literal */
+    TK_IDENT,        /* identifier */
+    TK_KW_INT,       /* 'int' keyword */
+    TK_IF, TK_ELSE, TK_RETURN, TK_WRITE,
+    TK_LPAREN, TK_RPAREN,
+    TK_LBRACE, TK_RBRACE,
+    TK_SEMI, TK_COMMA,
+    TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT,
+    TK_AMP, TK_PIPE, TK_CARET, TK_TILDE,
+    TK_SHL, TK_SHR,
+    TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE,
+    TK_ASSIGN,
+    TK_UNKNOWN
+} TokKind;
+
+typedef struct {
+    TokKind  kind;
+    int64_t  ival;      /* for TK_INT */
+    char    *sval;      /* for TK_STRING (heap; caller frees) */
+    size_t   slen;      /* decoded length of sval */
+    int      line;
+    int      col;
+} Token;
+
+typedef struct {
+    char     name[64];
+    int32_t  offset;
+} LocalVar;
+
+typedef struct {
+    const char *src;
+    const char *filename;
+    size_t      pos;
+    int         line;
+    int         col;
+
+    Token       cur;
+    Token       peeked;   /* one-token lookahead buffer */
+    int         have_peek;
+
+    KyGraph    *graph;
+    KyIRBuilder*b;
+    KyBlock    *entry_block;
+    int         parsed_return;   /* set after first top-level return */
+
+    char       *errbuf;
+    size_t      errlen;
+    int         err_flagged;
+
+    LocalVar    locals[64];
+    int         num_locals;
+    int32_t     next_local_offset;
+} ParseCtx;
+
+/* Forward declarations for parser helpers used before their
+ * definitions. */
+static int   find_local(ParseCtx *ctx, const char *name);
+static int32_t alloc_local(ParseCtx *ctx, const char *name);
+static void  parse_stmt(ParseCtx *ctx);
+
+/* ============================================================
+ * Errors
+ * ============================================================ */
+
+static void set_err(ParseCtx *ctx, int line, int col, const char *fmt, ...) {
+    if (!ctx || ctx->err_flagged) return;
+    ctx->err_flagged = 1;
+    if (!ctx->errbuf || ctx->errlen == 0) return;
+
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    snprintf(ctx->errbuf, ctx->errlen, "%s:%d:%d: %s",
+             ctx->filename ? ctx->filename : "<source>",
+             line, col, msg);
+}
+
+/* ============================================================
+ * Lexer
+ * ============================================================ */
+
+static int is_ident_start(int c) { return isalpha(c) || c == '_'; }
+static int is_ident_cont(int c)  { return isalnum(c) || c == '_'; }
+
+static void skip_ws_and_comments(ParseCtx *ctx) {
+    for (;;) {
+        char c = ctx->src[ctx->pos];
+        if (c == '\0') return;
+
+        if (c == '\n') { ctx->line++; ctx->col = 1; ctx->pos++; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') { ctx->pos++; ctx->col++; continue; }
+
+        /* // line comment */
+        if (c == '/' && ctx->src[ctx->pos + 1] == '/') {
+            while (ctx->src[ctx->pos] && ctx->src[ctx->pos] != '\n') {
+                ctx->pos++; ctx->col++;
+            }
+            continue;
+        }
+        /* /* block comment * / */
+        if (c == '/' && ctx->src[ctx->pos + 1] == '*') {
+            ctx->pos += 2; ctx->col += 2;
+            while (ctx->src[ctx->pos]) {
+                if (ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/') {
+                    ctx->pos += 2; ctx->col += 2;
+                    break;
+                }
+                if (ctx->src[ctx->pos] == '\n') { ctx->line++; ctx->col = 1; }
+                else ctx->col++;
+                ctx->pos++;
+            }
+            continue;
+        }
+        return;
+    }
+}
+
+static Token lex_one(ParseCtx *ctx) {
+    skip_ws_and_comments(ctx);
+
+    Token t;
+    memset(&t, 0, sizeof(t));
+    t.line = ctx->line;
+    t.col  = ctx->col;
+
+    char c = ctx->src[ctx->pos];
+
+    if (c == '\0') { t.kind = TK_EOF; return t; }
+
+    /* Integer literal */
+    if (isdigit((unsigned char)c)) {
+        t.kind = TK_INT;
+        if (c == '0' && (ctx->src[ctx->pos + 1] == 'x' || ctx->src[ctx->pos + 1] == 'X')) {
+            ctx->pos += 2; ctx->col += 2;
+            int64_t v = 0;
+            while (isxdigit((unsigned char)ctx->src[ctx->pos])) {
+                char h = ctx->src[ctx->pos];
+                int d = (h >= '0' && h <= '9') ? (h - '0')
+                      : (h >= 'a' && h <= 'f') ? (h - 'a' + 10)
+                      : (h - 'A' + 10);
+                v = v * 16 + d;
+                ctx->pos++; ctx->col++;
+            }
+            t.ival = v;
+        } else {
+            int64_t v = 0;
+            while (isdigit((unsigned char)ctx->src[ctx->pos])) {
+                v = v * 10 + (ctx->src[ctx->pos] - '0');
+                ctx->pos++; ctx->col++;
+            }
+            t.ival = v;
+        }
+        return t;
+    }
+
+    /* String literal (double-quoted). Processes standard escapes:
+     *   \n \t \r \\ \" \0 \xNN
+     * The token's slen holds the decoded length. */
+    if (c == '"') {
+        ctx->pos++; ctx->col++;
+
+        /* Upper bound: one output byte per input byte. */
+        size_t cap = 64;
+        char  *buf = (char *)malloc(cap);
+        if (!buf) { set_err(ctx, t.line, t.col, "oom"); t.kind = TK_UNKNOWN; return t; }
+        size_t  n = 0;
+
+        while (ctx->src[ctx->pos] && ctx->src[ctx->pos] != '"' &&
+               ctx->src[ctx->pos] != '\n') {
+            char ch = ctx->src[ctx->pos];
+
+            if (n + 1 >= cap) {
+                cap *= 2;
+                char *nb = (char *)realloc(buf, cap);
+                if (!nb) { free(buf); set_err(ctx, t.line, t.col, "oom"); t.kind = TK_UNKNOWN; return t; }
+                buf = nb;
+            }
+
+            if (ch == '\\') {
+                ctx->pos++; ctx->col++;
+                char esc = ctx->src[ctx->pos];
+                switch (esc) {
+                    case 'n': buf[n++] = '\n'; break;
+                    case 't': buf[n++] = '\t'; break;
+                    case 'r': buf[n++] = '\r'; break;
+                    case '\\': buf[n++] = '\\'; break;
+                    case '"': buf[n++] = '"'; break;
+                    case '0': buf[n++] = '\0'; break;
+                    case 'x': {
+                        ctx->pos++; ctx->col++;
+                        int v = 0, k = 0;
+                        while (k < 2 && isxdigit((unsigned char)ctx->src[ctx->pos])) {
+                            char h = ctx->src[ctx->pos];
+                            int d = (h >= '0' && h <= '9') ? (h - '0')
+                                  : (h >= 'a' && h <= 'f') ? (h - 'a' + 10)
+                                  : (h - 'A' + 10);
+                            v = v * 16 + d;
+                            ctx->pos++; ctx->col++; k++;
+                        }
+                        buf[n++] = (char)v;
+                        continue;   /* pos already advanced */
+                    }
+                    default:
+                        /* Unknown escape: emit the char verbatim. */
+                        buf[n++] = esc;
+                        break;
+                }
+                ctx->pos++; ctx->col++;
+                continue;
+            }
+
+            buf[n++] = ch;
+            ctx->pos++; ctx->col++;
+        }
+
+        if (ctx->src[ctx->pos] != '"') {
+            free(buf);
+            set_err(ctx, t.line, t.col, "unterminated string literal");
+            t.kind = TK_UNKNOWN;
+            return t;
+        }
+        buf[n] = '\0';
+        t.kind = TK_STRING;
+        t.sval = buf;
+        t.slen = n;
+        ctx->pos++; ctx->col++;
+        return t;
+    }
+
+    /* Identifier or keyword */
+    if (is_ident_start(c)) {
+        size_t start = ctx->pos;
+        while (is_ident_cont(ctx->src[ctx->pos])) {
+            ctx->pos++; ctx->col++;
+        }
+        size_t len = ctx->pos - start;
+        char buf[32];
+        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+        memcpy(buf, ctx->src + start, len);
+        buf[len] = '\0';
+
+        if      (!strcmp(buf, "if"))     t.kind = TK_IF;
+        else if (!strcmp(buf, "else"))   t.kind = TK_ELSE;
+        else if (!strcmp(buf, "return")) t.kind = TK_RETURN;
+        else if (!strcmp(buf, "write"))  t.kind = TK_WRITE;
+        else if (!strcmp(buf, "int"))    t.kind = TK_KW_INT;
+        else {
+            t.kind = TK_IDENT;
+            t.sval = (char *)malloc(len + 1);
+            if (t.sval) { memcpy(t.sval, buf, len); t.sval[len] = 0; }
+            t.slen = len;
+        }
+        return t;
+    }
+
+    /* Two-char operators */
+    char c1 = ctx->src[ctx->pos + 1];
+    if (c == '<' && c1 == '<') { ctx->pos += 2; ctx->col += 2; t.kind = TK_SHL; return t; }
+    if (c == '>' && c1 == '>') { ctx->pos += 2; ctx->col += 2; t.kind = TK_SHR; return t; }
+    if (c == '=' && c1 == '=') { ctx->pos += 2; ctx->col += 2; t.kind = TK_EQ;  return t; }
+    if (c == '!' && c1 == '=') { ctx->pos += 2; ctx->col += 2; t.kind = TK_NE;  return t; }
+    if (c == '<' && c1 == '=') { ctx->pos += 2; ctx->col += 2; t.kind = TK_LE;  return t; }
+    if (c == '>' && c1 == '=') { ctx->pos += 2; ctx->col += 2; t.kind = TK_GE;  return t; }
+
+    /* Single-char */
+    ctx->pos++; ctx->col++;
+    switch (c) {
+        case '(': t.kind = TK_LPAREN;  return t;
+        case ')': t.kind = TK_RPAREN;  return t;
+        case '{': t.kind = TK_LBRACE;  return t;
+        case '}': t.kind = TK_RBRACE;  return t;
+        case ';': t.kind = TK_SEMI;    return t;
+        case ',': t.kind = TK_COMMA;   return t;
+        case '+': t.kind = TK_PLUS;    return t;
+        case '-': t.kind = TK_MINUS;   return t;
+        case '*': t.kind = TK_STAR;    return t;
+        case '/': t.kind = TK_SLASH;   return t;
+        case '%': t.kind = TK_PERCENT; return t;
+        case '&': t.kind = TK_AMP;     return t;
+        case '|': t.kind = TK_PIPE;    return t;
+        case '^': t.kind = TK_CARET;   return t;
+        case '~': t.kind = TK_TILDE;   return t;
+        case '<': t.kind = TK_LT;      return t;
+        case '>': t.kind = TK_GT;      return t;
+        case '=': t.kind = TK_ASSIGN;  return t;
+    }
+
+    set_err(ctx, t.line, t.col, "unexpected character '%c' (0x%02x)",
+            (c >= 32 && c < 127) ? c : '?', (unsigned char)c);
+    t.kind = TK_UNKNOWN;
+    return t;
+}
+
+/* Advance to next token. Frees any heap string in the old cur. */
+static void next_tok(ParseCtx *ctx) {
+    if (ctx->cur.sval) { free(ctx->cur.sval); ctx->cur.sval = NULL; }
+    if (ctx->have_peek) {
+        ctx->cur = ctx->peeked;
+        ctx->have_peek = 0;
+        ctx->peeked.sval = NULL;
+    } else {
+        ctx->cur = lex_one(ctx);
+    }
+}
+
+/* One-token lookahead. */
+static Token *peek_tok(ParseCtx *ctx) {
+    if (!ctx->have_peek) {
+        ctx->peeked = lex_one(ctx);
+        ctx->have_peek = 1;
+    }
+    return &ctx->peeked;
+}
+
+/* ============================================================
+ * Parser — expression grammar (precedence climbing)
+ * ============================================================ */
+
+static KyNode *parse_expr(ParseCtx *ctx);
+
+static KyNode *parse_primary(ParseCtx *ctx) {
+    if (ctx->err_flagged) return NULL;
+
+    if (ctx->cur.kind == TK_INT) {
+        KyNode *n = kyir_build_const(ctx->b, ctx->cur.ival);
+        next_tok(ctx);
+        return n;
+    }
+    if (ctx->cur.kind == TK_IDENT) {
+        int idx = find_local(ctx, ctx->cur.sval);
+        if (idx < 0) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col,
+                    "undefined variable: %s", ctx->cur.sval);
+            return NULL;
+        }
+        int32_t offset = ctx->locals[idx].offset;
+        next_tok(ctx);
+        return kyir_build_load_local(ctx->b, offset);
+    }
+    if (ctx->cur.kind == TK_LPAREN) {
+        next_tok(ctx);
+        KyNode *n = parse_expr(ctx);
+        if (ctx->cur.kind != TK_RPAREN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ')'");
+            return NULL;
+        }
+        next_tok(ctx);
+        return n;
+    }
+    set_err(ctx, ctx->cur.line, ctx->cur.col,
+            "expected expression, got token kind %d", ctx->cur.kind);
+    return NULL;
+}
+
+static KyNode *parse_unary(ParseCtx *ctx) {
+    if (ctx->err_flagged) return NULL;
+
+    if (ctx->cur.kind == TK_MINUS) {
+        next_tok(ctx);
+        KyNode *a = parse_unary(ctx);
+        if (!a) return NULL;
+        return kyir_build_neg(ctx->b, a);
+    }
+    if (ctx->cur.kind == TK_TILDE) {
+        next_tok(ctx);
+        KyNode *a = parse_unary(ctx);
+        if (!a) return NULL;
+        return kyir_build_not(ctx->b, a);
+    }
+    return parse_primary(ctx);
+}
+
+static KyNode *parse_mul(ParseCtx *ctx) {
+    KyNode *lhs = parse_unary(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_STAR || ctx->cur.kind == TK_SLASH ||
+           ctx->cur.kind == TK_PERCENT) {
+        TokKind op = ctx->cur.kind;
+        next_tok(ctx);
+        KyNode *rhs = parse_unary(ctx);
+        if (!rhs) return NULL;
+        switch (op) {
+            case TK_STAR:    lhs = kyir_build_mul(ctx->b, lhs, rhs); break;
+            case TK_SLASH:   lhs = kyir_build_div(ctx->b, lhs, rhs); break;
+            case TK_PERCENT: lhs = kyir_build_mod(ctx->b, lhs, rhs); break;
+            default: break;
+        }
+    }
+    return lhs;
+}
+
+static KyNode *parse_add(ParseCtx *ctx) {
+    KyNode *lhs = parse_mul(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_PLUS || ctx->cur.kind == TK_MINUS) {
+        TokKind op = ctx->cur.kind;
+        next_tok(ctx);
+        KyNode *rhs = parse_mul(ctx);
+        if (!rhs) return NULL;
+        lhs = (op == TK_PLUS)
+              ? kyir_build_add(ctx->b, lhs, rhs)
+              : kyir_build_sub(ctx->b, lhs, rhs);
+    }
+    return lhs;
+}
+
+static KyNode *parse_shift(ParseCtx *ctx) {
+    KyNode *lhs = parse_add(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_SHL || ctx->cur.kind == TK_SHR) {
+        TokKind op = ctx->cur.kind;
+        next_tok(ctx);
+        KyNode *rhs = parse_add(ctx);
+        if (!rhs) return NULL;
+        lhs = (op == TK_SHL)
+              ? kyir_build_shl(ctx->b, lhs, rhs)
+              : kyir_build_shr(ctx->b, lhs, rhs);
+    }
+    return lhs;
+}
+
+static KyNode *parse_and(ParseCtx *ctx) {
+    KyNode *lhs = parse_shift(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_AMP) {
+        next_tok(ctx);
+        KyNode *rhs = parse_shift(ctx);
+        if (!rhs) return NULL;
+        lhs = kyir_build_and(ctx->b, lhs, rhs);
+    }
+    return lhs;
+}
+
+static KyNode *parse_xor(ParseCtx *ctx) {
+    KyNode *lhs = parse_and(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_CARET) {
+        next_tok(ctx);
+        KyNode *rhs = parse_and(ctx);
+        if (!rhs) return NULL;
+        lhs = kyir_build_xor(ctx->b, lhs, rhs);
+    }
+    return lhs;
+}
+
+static KyNode *parse_or(ParseCtx *ctx) {
+    KyNode *lhs = parse_xor(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_PIPE) {
+        next_tok(ctx);
+        KyNode *rhs = parse_xor(ctx);
+        if (!rhs) return NULL;
+        lhs = kyir_build_or(ctx->b, lhs, rhs);
+    }
+    return lhs;
+}
+
+/* Comparison: lowest precedence above assignment. Non-associative:
+ * "a < b < c" parses as "(a < b) < c" — which the IR handles
+ * naturally (a bool-as-int vs c). Acceptable for this language. */
+static KyNode *parse_expr(ParseCtx *ctx) {
+    KyNode *lhs = parse_or(ctx);
+    if (!lhs) return NULL;
+    while (ctx->cur.kind == TK_EQ || ctx->cur.kind == TK_NE ||
+           ctx->cur.kind == TK_LT || ctx->cur.kind == TK_LE ||
+           ctx->cur.kind == TK_GT || ctx->cur.kind == TK_GE) {
+        TokKind op = ctx->cur.kind;
+        next_tok(ctx);
+        KyNode *rhs = parse_or(ctx);
+        if (!rhs) return NULL;
+        switch (op) {
+            case TK_EQ: lhs = kyir_build_cmp_eq(ctx->b, lhs, rhs); break;
+            case TK_NE: lhs = kyir_build_cmp_ne(ctx->b, lhs, rhs); break;
+            case TK_LT: lhs = kyir_build_cmp_lt(ctx->b, lhs, rhs); break;
+            case TK_LE: lhs = kyir_build_cmp_le(ctx->b, lhs, rhs); break;
+            case TK_GT: lhs = kyir_build_cmp_gt(ctx->b, lhs, rhs); break;
+            case TK_GE: lhs = kyir_build_cmp_ge(ctx->b, lhs, rhs); break;
+            default: break;
+        }
+    }
+    return lhs;
+}
+
+/* ============================================================
+ * Parser — statements
+ * ============================================================ */
+
+static int find_local(ParseCtx *ctx, const char *name) {
+    for (int i = 0; i < ctx->num_locals; i++) {
+        if (strcmp(ctx->locals[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int32_t alloc_local(ParseCtx *ctx, const char *name) {
+    if (find_local(ctx, name) != -1) {
+        set_err(ctx, ctx->cur.line, ctx->cur.col, "redeclaration of '%s'", name);
+        return 0;
+    }
+    if (ctx->num_locals >= 64) {
+        set_err(ctx, ctx->cur.line, ctx->cur.col, "too many locals");
+        return 0;
+    }
+    strncpy(ctx->locals[ctx->num_locals].name, name, 63);
+    ctx->locals[ctx->num_locals].name[63] = 0;
+    ctx->locals[ctx->num_locals].offset = ctx->next_local_offset;
+    ctx->next_local_offset -= 8;
+    ctx->num_locals++;
+    return ctx->locals[ctx->num_locals - 1].offset;
+}
+
+static void parse_stmt(ParseCtx *ctx);
+
+/* True if the current block has already been closed by a RETURN.
+ * Used to stop parsing dead statements in a block. */
+static int is_block_terminated(ParseCtx *ctx) {
+    if (!ctx || !ctx->b) return 0;
+    KyBlock *b = ctx->b->current_block;
+    if (!b || !b->terminator) return 0;
+    return b->terminator->opcode == IR_RETURN;
+}
+
+static void parse_block(ParseCtx *ctx) {
+    /* cur is already past '{' */
+    while (!ctx->err_flagged &&
+           ctx->cur.kind != TK_RBRACE &&
+           ctx->cur.kind != TK_EOF) {
+        /* Skip statements after a return — they're unreachable. */
+        if (is_block_terminated(ctx)) {
+            /* Consume the rest of the block without emitting IR. */
+            if (ctx->cur.kind == TK_RBRACE) break;
+            next_tok(ctx);
+            continue;
+        }
+        parse_stmt(ctx);
+    }
+    if (ctx->cur.kind != TK_RBRACE) {
+        set_err(ctx, ctx->cur.line, ctx->cur.col, "expected '}'");
+        return;
+    }
+    next_tok(ctx);
+}
+
+static void parse_stmt(ParseCtx *ctx) {
+    if (ctx->err_flagged) return;
+
+    /* if ( cond ) stmt [ else stmt ] */
+    if (ctx->cur.kind == TK_IF) {
+        next_tok(ctx);
+        if (ctx->cur.kind != TK_LPAREN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected '(' after 'if'");
+            return;
+        }
+        next_tok(ctx);
+        KyNode *cond = parse_expr(ctx);
+        if (!cond) return;
+        if (ctx->cur.kind != TK_RPAREN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ')' after if condition");
+            return;
+        }
+        next_tok(ctx);
+
+        /* Build then/else labels. */
+        KyNode *then_lbl = kyir_node_create(ctx->graph, IR_LABEL);
+        KyNode *else_lbl = kyir_node_create(ctx->graph, IR_LABEL);
+        kyir_build_if(ctx->b, cond, then_lbl, else_lbl);
+
+        /* Then branch: current block is the then block. */
+        KyBlock *then_blk = ctx->b->current_block;
+        kyir_block_add_node(then_blk, then_lbl);
+        parse_stmt(ctx);
+
+        /* After then body, we need a join label UNLESS the then body
+         * already terminates with RETURN (no fall-through). */
+        KyNode *join_lbl = kyir_node_create(ctx->graph, IR_LABEL);
+        /* Save current block before any jump. */
+        KyBlock *then_end = ctx->b->current_block;
+        int then_terminated = (then_end->terminator != NULL &&
+                               then_end->terminator->opcode == IR_RETURN);
+
+        if (!then_terminated) {
+            /* Emit a jump to join. Use _no_open because we'll enter
+             * the else block next. */
+            kyir_build_jump_no_open(ctx->b, join_lbl);
+        }
+
+        /* Else branch. */
+        KyBlock *else_blk = kyir_builder_enter_block(ctx->b, else_lbl);
+        kyir_block_add_node(else_blk, else_lbl);
+
+        if (ctx->cur.kind == TK_ELSE) {
+            next_tok(ctx);
+            parse_stmt(ctx);
+        }
+        /* else: empty else block — falls through to whatever comes next */
+
+        KyBlock *else_end = ctx->b->current_block;
+        int else_terminated = (else_end->terminator != NULL &&
+                               else_end->terminator->opcode == IR_RETURN);
+
+        if (!else_terminated) {
+            kyir_build_jump_no_open(ctx->b, join_lbl);
+        }
+
+        /* Join block. Only enter it if at least one arm falls through. */
+        if (!then_terminated || !else_terminated) {
+            KyBlock *join_blk = kyir_builder_enter_block(ctx->b, join_lbl);
+            kyir_block_add_node(join_blk, join_lbl);
+        }
+        return;
+    }
+
+    /* { stmts } */
+    if (ctx->cur.kind == TK_LBRACE) {
+        next_tok(ctx);
+        parse_block(ctx);
+        return;
+    }
+
+    /* return expr ; */
+    if (ctx->cur.kind == TK_RETURN) {
+        next_tok(ctx);
+        KyNode *v = parse_expr(ctx);
+        if (!v) return;
+        if (ctx->cur.kind != TK_SEMI) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ';' after return");
+            return;
+        }
+        next_tok(ctx);
+        kyir_build_return(ctx->b, v);
+        /* Block is now closed; parse_stmt may be called again. */
+        return;
+    }
+
+    /* write(fd, "string", len) ; — emitted as IR_SYSCALL nr=1 (SYS_write).
+     * We support only a numeric integer in the middle (pointer cast),
+     * so this is really "write raw bytes at an address". Real string
+     * literals come later when we have a data section. */
+    if (ctx->cur.kind == TK_WRITE) {
+        next_tok(ctx);
+        if (ctx->cur.kind != TK_LPAREN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected '(' after 'write'");
+            return;
+        }
+        next_tok(ctx);
+
+        KyNode *fd = parse_expr(ctx);
+        if (!fd) return;
+        if (ctx->cur.kind != TK_COMMA) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ',' in write(...)");
+            return;
+        }
+        next_tok(ctx);
+
+        /* String literal in the buffer slot: intern it and emit a
+         * string-ptr const node. The ELF writer resolves the address. */
+        KyNode *buf;
+        if (ctx->cur.kind == TK_STRING) {
+            const char *s = ctx->cur.sval ? ctx->cur.sval : "";
+            uint32_t slen = (uint32_t)ctx->cur.slen;
+            uint32_t idx = kyir_intern_string(ctx->graph, s, slen);
+            if (idx == 0xFFFFFFFFu) {
+                set_err(ctx, ctx->cur.line, ctx->cur.col,
+                        "string pool exhausted");
+                return;
+            }
+            buf = kyir_const_string_ptr(ctx->graph, idx);
+            if (!buf) return;
+            if (ctx->b->current_block)
+                kyir_block_add_node(ctx->b->current_block, buf);
+            next_tok(ctx);
+        } else {
+            buf = parse_expr(ctx);
+            if (!buf) return;
+        }
+
+        if (ctx->cur.kind != TK_COMMA) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ',' in write(...)");
+            return;
+        }
+        next_tok(ctx);
+        KyNode *len = parse_expr(ctx);
+        if (!len) return;
+        if (ctx->cur.kind != TK_RPAREN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ')' in write(...)");
+            return;
+        }
+        next_tok(ctx);
+        if (ctx->cur.kind != TK_SEMI) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ';' after write(...)");
+            return;
+        }
+        next_tok(ctx);
+
+        KyNode *nr = kyir_build_const(ctx->b, 1);   /* SYS_write */
+        kyir_build_syscall(ctx->b, nr, fd, buf, len, NULL, NULL, NULL);
+        return;
+    }
+
+    /* Local declaration: int x = expr; */
+    if (ctx->cur.kind == TK_KW_INT) {
+        next_tok(ctx);
+        if (ctx->cur.kind != TK_IDENT) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected identifier after 'int'");
+            return;
+        }
+        char name[64];
+        strncpy(name, ctx->cur.sval, 63); name[63] = 0;
+        next_tok(ctx);
+        if (ctx->cur.kind != TK_ASSIGN) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected '=' in local declaration");
+            return;
+        }
+        next_tok(ctx);
+        KyNode *val = parse_expr(ctx);
+        if (!val) return;
+        if (ctx->cur.kind != TK_SEMI) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ';' after local declaration");
+            return;
+        }
+        next_tok(ctx);
+        int32_t offset = alloc_local(ctx, name);
+        if (ctx->err_flagged) return;
+        kyir_build_store_local(ctx->b, offset, val);
+        return;
+    }
+
+    /* Assignment: x = expr; */
+    if (ctx->cur.kind == TK_IDENT) {
+        Token *pk = peek_tok(ctx);
+        if (pk->kind == TK_ASSIGN) {
+            char name[64];
+            strncpy(name, ctx->cur.sval, 63); name[63] = 0;
+            next_tok(ctx);
+            next_tok(ctx);
+            KyNode *val = parse_expr(ctx);
+            if (!val) return;
+            if (ctx->cur.kind != TK_SEMI) {
+                set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ';' after assignment");
+                return;
+            }
+            next_tok(ctx);
+            int idx = find_local(ctx, name);
+            if (idx < 0) {
+                set_err(ctx, ctx->cur.line, ctx->cur.col, "undefined variable: %s", name);
+                return;
+            }
+            kyir_build_store_local(ctx->b, ctx->locals[idx].offset, val);
+            return;
+        }
+    }
+
+    /* Expression statement: parse and discard the value. */
+    {
+        KyNode *e = parse_expr(ctx);
+        if (!e) return;
+        if (ctx->cur.kind != TK_SEMI) {
+            set_err(ctx, ctx->cur.line, ctx->cur.col, "expected ';' after expression");
+            return;
+        }
+        next_tok(ctx);
+        /* Discard value. DCE will clean up if unused. */
+    }
+}
+
+/* ============================================================
+ * Top-level entry
+ * ============================================================ */
+
+KyGraph *kyjit_parse_source(const char *src,
+                            const char *filename,
+                            char *errbuf,
+                            size_t errlen) {
+    if (!src) return NULL;
+
+    ParseCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src = src;
+    ctx.filename = filename ? filename : "<source>";
+    ctx.line = 1;
+    ctx.col = 1;
+    ctx.errbuf = errbuf;
+    ctx.errlen = errlen;
+    if (errbuf && errlen) errbuf[0] = '\0';
+    ctx.num_locals = 0;
+    ctx.next_local_offset = -8;
+
+    ctx.graph = kyir_graph_create();
+    if (!ctx.graph) return NULL;
+
+    ctx.b = kyir_builder_create(ctx.graph);
+    if (!ctx.b) { kyir_graph_destroy(ctx.graph); return NULL; }
+
+    /* Entry block. */
+    ctx.entry_block = kyir_builder_new_block(ctx.b);
+    kyir_builder_set_block(ctx.b, ctx.entry_block);
+
+    /* Prime the lexer. */
+    ctx.cur.kind = TK_EOF;
+    next_tok(&ctx);
+
+    while (!ctx.err_flagged && ctx.cur.kind != TK_EOF) {
+        /* Once the top-level block has a return, further statements
+         * are unreachable. Consume tokens without emitting IR. */
+        if (is_block_terminated(&ctx)) {
+            next_tok(&ctx);
+            continue;
+        }
+        parse_stmt(&ctx);
+    }
+
+    if (ctx.cur.sval) free(ctx.cur.sval);
+    if (ctx.peeked.sval) free(ctx.peeked.sval);
+
+    if (ctx.err_flagged) {
+        kyir_builder_destroy(ctx.b);
+        kyir_graph_destroy(ctx.graph);
+        return NULL;
+    }
+
+    kyir_builder_destroy(ctx.b);
+    return ctx.graph;
+}

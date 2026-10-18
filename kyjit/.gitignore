@@ -1,0 +1,51 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.d
+*.gch
+
+# Backups
+*.bak
+*.bak[0-9]
+*.before_*
+*.2026*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Compiled binaries
+kyjit
+libkyjit*.so
+bench/bench_ic
+bench/bench_ic_all
+bench/bench_ic_server
+bench/bench_native
+bench/e2e/
+
+# Logs / temp
+*.log
+/tmp/
+
+# UDDP build artifacts
+target/
+**/target/
+
+# Backups and junk
+src.backup.*
+**/src.backup.*
+*.bak.*
+*.backup
+*.pre-m2a
+*.pre-m4
+*.m12-botched
+cert.json
+loop.json
+None,
+return
+.aider*

@@ -1,0 +1,106 @@
+#include "kyjit_ir.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <stdlib.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+typedef int64_t (*Fn0)(void);
+
+__attribute__((noinline))
+static int64_t ext_add(int64_t a, int64_t b) { return a + b; }
+
+__attribute__((noinline))
+static int64_t ext_mul(int64_t a, int64_t b) { return a * b; }
+
+/* Build a complete function: return ext_fn(a, b); */
+static int64_t run_test(void *ext_fn, int64_t a, int64_t b, const char *name) {
+    printf("    running %s(%lld, %lld)\n", name, (long long)a, (long long)b);
+
+    KyGraph *g = kyir_graph_create();
+    KyDomTree *dt = kyir_domtree_build(g);
+    KySchedule *s = kyir_schedule_build(g, dt);
+    KyX64Backend *bk = kyx64_backend_create(g, s, dt);
+
+    KyVReg *arg0 = new_vreg(bk, 0);
+    KyVReg *arg1 = new_vreg(bk, 1);
+    KyVReg *result = new_vreg(bk, 2);
+
+    KyX64Ins *ins = add_insn(bk, X64_MOV_REG_IMM);
+    ins->dst = arg0;
+    ins->imm = a;
+
+    ins = add_insn(bk, X64_MOV_REG_IMM);
+    ins->dst = arg1;
+    ins->imm = b;
+
+    KyVReg *args[2] = { arg0, arg1 };
+    kyx64_emit_call_direct(bk, ext_fn, args, 2, result);
+
+    KyX64Ins *mov_ret = add_insn(bk, X64_MOV_REG_REG);
+    mov_ret->imm = (X64_RAX << 8) | 0;
+    mov_ret->src1 = result;
+    add_insn(bk, X64_RET);
+
+    kyregalloc_run(bk);
+
+    void *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return -1;
+
+    size_t code_len = 0;
+    int rc = kyx64_emit_with_calls(bk, (uint8_t *)code, 4096, &code_len);
+    printf("    emit rc=%d len=%zu\n", rc, code_len);
+
+    int64_t result_val = -1;
+    if (rc == 0) {
+        Fn0 fn = (Fn0)code;
+        result_val = fn();
+        printf("    result = %lld\n", (long long)result_val);
+    }
+
+    munmap(code, 4096);
+    kyx64_backend_destroy(bk);
+    kyir_schedule_destroy(s);
+    kyir_domtree_destroy(dt);
+    kyir_graph_destroy(g);
+
+    return result_val;
+}
+
+int main(void) {
+    printf("KYJIT Function Call Test v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n\n");
+
+    printf("[Test] add(5, 7) = 12\n");
+    int64_t r = run_test((void *)ext_add, 5, 7, "ext_add");
+    TEST("add(5, 7) = 12", r == 12);
+
+    printf("\n[Test] mul(6, 7) = 42\n");
+    r = run_test((void *)ext_mul, 6, 7, "ext_mul");
+    TEST("mul(6, 7) = 42", r == 42);
+
+    printf("\n[Test] add(100, 200) = 300\n");
+    r = run_test((void *)ext_add, 100, 200, "ext_add");
+    TEST("add(100, 200) = 300", r == 300);
+
+    printf("\n[Test] mul(11, 11) = 121\n");
+    r = run_test((void *)ext_mul, 11, 11, "ext_mul");
+    TEST("mul(11, 11) = 121", r == 121);
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+
+    return (tests_run == tests_passed) ? 0 : 1;
+}

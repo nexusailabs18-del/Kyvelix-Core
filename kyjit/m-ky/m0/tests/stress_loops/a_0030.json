@@ -1,0 +1,48 @@
+{
+  "depth": 1,
+  "ivs": [
+    {
+      "name": "i",
+      "lower": 0,
+      "upper": 64,
+      "step": 1
+    }
+  ],
+  "body": [
+    {
+      "kind": "write",
+      "base": "A",
+      "index": [
+        -2
+      ],
+      "elem_size": 8,
+      "offset": {
+        "Const": 0
+      },
+      "expr": null,
+      "indirect": null,
+      "guard": null,
+      "range": null,
+      "index_kind": "Affine"
+    },
+    {
+      "kind": "read",
+      "base": "A",
+      "index": [
+        0
+      ],
+      "elem_size": 8,
+      "offset": {
+        "Const": -2
+      },
+      "expr": null,
+      "indirect": null,
+      "guard": null,
+      "range": null,
+      "index_kind": "Affine"
+    }
+  ],
+  "recursion": null,
+  "chase": null,
+  "assertions": []
+}

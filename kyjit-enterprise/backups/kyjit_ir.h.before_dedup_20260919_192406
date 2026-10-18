@@ -1,0 +1,1046 @@
+#ifndef KYJIT_IR_H
+#define KYJIT_IR_H
+
+/*
+ * KYJIT Sea of Nodes Compiler IR — v1.0.0
+ *
+ * Tri-edge node-based IR:
+ *   - Value edges: data dependencies
+ *   - Control edges: execution order
+ *   - Effect edges: side effect ordering
+ *
+ * Foundation for optimization, scheduling, codegen.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define KYIR_VERSION_MAJOR 1
+#define KYIR_VERSION_MINOR 0
+#define KYIR_VERSION_STRING "1.0.0"
+
+/* ============================================================
+ * Node opcodes
+ * ============================================================ */
+
+typedef enum {
+    /* Control flow */
+    IR_START         = 0,
+    IR_END           = 1,
+    IR_IF            = 2,
+    IR_LOOP          = 3,
+    IR_MERGE         = 4,
+    IR_PHI           = 5,
+    IR_RETURN        = 6,
+    IR_JUMP          = 7,
+    IR_THROW         = 8,
+
+    /* Integer arithmetic */
+    IR_ADD_I32       = 10,
+    IR_ADD_I64       = 11,
+    IR_SUB_I32       = 12,
+    IR_SUB_I64       = 13,
+    IR_MUL_I32       = 14,
+    IR_MUL_I64       = 15,
+    IR_DIV_I32       = 16,
+    IR_DIV_I64       = 17,
+    IR_MOD_I32       = 18,
+    IR_MOD_I64       = 19,
+    IR_NEG_I32       = 20,
+    IR_NEG_I64       = 21,
+    IR_SHL           = 22,
+    IR_SHR           = 23,
+    IR_AND           = 24,
+    IR_OR            = 25,
+    IR_XOR           = 26,
+    IR_SAR           = 27,   /* arithmetic shift right (sign-preserving) */
+    IR_NOT           = 28,   /* bitwise complement: ~x */
+    IR_SAR           = 27,   /* arithmetic shift right (sign-preserving) */
+    IR_NOT           = 28,   /* bitwise complement: ~x */
+    IR_SAR           = 27,   /* arithmetic shift right (sign-preserving) */
+    IR_NOT           = 28,   /* bitwise complement: ~x */
+
+    /* Float arithmetic */
+    IR_ADD_F32       = 30,
+    IR_ADD_F64       = 31,
+    IR_SUB_F32       = 32,
+    IR_SUB_F64       = 33,
+    IR_MUL_F32       = 34,
+    IR_MUL_F64       = 35,
+    IR_DIV_F32       = 36,
+    IR_DIV_F64       = 37,
+
+    /* Comparison */
+    IR_CMP_EQ        = 40,
+    IR_CMP_NE        = 41,
+    IR_CMP_LT        = 42,
+    IR_CMP_LE        = 43,
+    IR_CMP_GT        = 44,
+    IR_CMP_GE        = 45,
+
+    /* Memory */
+    IR_LOAD          = 50,
+    IR_STORE         = 51,
+    IR_LOAD_FIELD    = 52,
+    IR_STORE_FIELD   = 53,
+    IR_LOAD_ELEMENT  = 54,
+    IR_STORE_ELEMENT = 55,
+
+    /* Type conversion */
+    IR_TRUNC         = 60,
+    IR_SEXT          = 61,
+    IR_ZEXT          = 62,
+    IR_FPTOSI        = 63,
+    IR_SITOFP        = 64,
+    IR_BITCAST       = 65,
+
+    /* Objects */
+    IR_NEW_OBJECT    = 70,
+    IR_NEW_ARRAY     = 71,
+    IR_NEW_CLOSURE   = 72,
+    IR_GET_FIELD     = 73,
+    IR_SET_FIELD     = 74,
+
+    /* Calls */
+    IR_CALL          = 80,
+    IR_CALL_DIRECT   = 81,
+    IR_CALL_INDIRECT = 82,
+    IR_CALL_INTRINSIC= 83,
+    IR_CALL_RUNTIME  = 84,
+
+    /* Guards (for deopt) */
+    IR_CHECK_MAP     = 90,
+    IR_CHECK_TYPE    = 91,
+    IR_CHECK_BOUNDS  = 92,
+    IR_CHECK_NULL    = 93,
+    IR_DEOPT         = 94,
+
+    /* Constants */
+    IR_CONST_I32     = 100,
+    IR_CONST_I64     = 101,
+    IR_CONST_F32     = 102,
+    IR_CONST_F64     = 103,
+    IR_CONST_NULL    = 104,
+    IR_CONST_UNDEF   = 105,
+    IR_CONST_TRUE    = 106,
+    IR_CONST_FALSE   = 107,
+
+    /* Meta */
+    IR_PARAMETER     = 110,
+    IR_ARGUMENT      = 111,
+    IR_EFFECT        = 112,
+    IR_MEMORY        = 113,
+    IR_NOP           = 114,
+
+    IR_OPCODE_MAX    = 128
+} KyIROpcode;
+
+/* ============================================================
+ * Node flags
+ * ============================================================ */
+
+#define KYIR_FLAG_CONSTANT       (1u << 0)
+#define KYIR_FLAG_HAS_SIDE_EFFECT (1u << 1)
+#define KYIR_FLAG_CONTROL        (1u << 2)
+#define KYIR_FLAG_DEAD           (1u << 3)
+#define KYIR_FLAG_VISITED        (1u << 4)
+#define KYIR_FLAG_PINNED         (1u << 5)
+#define KYIR_FLAG_LOOP_INVARIANT (1u << 6)
+#define KYIR_FLAG_ELIMINATED     (1u << 7)
+
+/* ============================================================
+ * Type lattice
+ * ============================================================ */
+
+typedef enum {
+    KYIR_TYPE_UNKNOWN   = 0,
+    KYIR_TYPE_INT32     = 1,
+    KYIR_TYPE_INT64     = 2,
+    KYIR_TYPE_FLOAT32   = 3,
+    KYIR_TYPE_FLOAT64   = 4,
+    KYIR_TYPE_PTR       = 5,
+    KYIR_TYPE_OBJECT    = 6,
+    KYIR_TYPE_ARRAY     = 7,
+    KYIR_TYPE_STRING    = 8,
+    KYIR_TYPE_FUNCTION  = 9,
+    KYIR_TYPE_NULL      = 10,
+    KYIR_TYPE_UNDEFINED = 11,
+    KYIR_TYPE_BOOLEAN   = 12,
+    KYIR_TYPE_ANY       = 13
+} KyIRType;
+
+/* ============================================================
+ * Forward declarations
+ * ============================================================ */
+
+typedef struct KyNode KyNode;
+typedef struct KyBlock KyBlock;
+typedef struct KyGraph KyGraph;
+
+/* ============================================================
+ * Node — the fundamental unit
+ * ============================================================ */
+
+struct KyNode {
+    /* Identity */
+    uint32_t  id;
+    uint16_t  opcode;
+    uint16_t  flags;
+    KyIRType  type;
+
+    /* Tri-edge inputs */
+    KyNode  **value_inputs;
+    KyNode  **control_inputs;
+    KyNode  **effect_inputs;
+
+    uint16_t  num_values;
+    uint16_t  num_controls;
+    uint16_t  num_effects;
+    uint16_t  _pad;
+
+    /* Uses (reverse edges) */
+    KyNode  **uses;
+    uint16_t  num_uses;
+    uint16_t  use_capacity;
+
+    /* Constant payload */
+    union {
+        int32_t  i32;
+        int64_t  i64;
+        float    f32;
+        double   f64;
+        void    *ptr;
+    } constant;
+
+    /* Scheduling (filled in later) */
+    KyBlock  *block;
+    uint32_t  schedule_idx;
+
+    /* Codegen (filled in later) */
+    int32_t   reg;
+    int32_t   stack_slot;
+};
+
+/* ============================================================
+ * Block — control flow container
+ * ============================================================ */
+
+struct KyBlock {
+    uint32_t  id;
+
+    KyBlock **successors;
+    KyBlock **predecessors;
+    uint16_t  num_successors;
+    uint16_t  num_pred_capacity;
+    uint16_t  num_predecessors;
+    uint16_t  num_succ_capacity;
+
+    KyNode  **nodes;
+    uint32_t  num_nodes;
+    uint32_t  node_capacity;
+
+    KyBlock  *idom;
+    uint32_t  dom_depth;
+};
+
+/* ============================================================
+ * Graph — the whole program
+ * ============================================================ */
+
+struct KyGraph {
+    KyNode  **nodes;
+    uint32_t  node_count;
+    uint32_t  node_capacity;
+
+    KyBlock **blocks;
+    uint32_t  block_count;
+    uint32_t  block_capacity;
+
+    KyNode   *start;
+    KyNode   *end;
+};
+
+/* ============================================================
+ * API — Graph
+ * ============================================================ */
+
+KyGraph *kyir_graph_create(void);
+void     kyir_graph_destroy(KyGraph *g);
+
+/* ============================================================
+ * API — Nodes
+ * ============================================================ */
+
+KyNode *kyir_node_create(KyGraph *g, KyIROpcode opcode);
+void    kyir_node_add_value_input(KyNode *n, KyNode *input);
+void    kyir_node_add_control_input(KyNode *n, KyNode *input);
+void    kyir_node_add_effect_input(KyNode *n, KyNode *input);
+void    kyir_node_add_use(KyNode *n, KyNode *use);
+
+/* Convenience constructors */
+KyNode *kyir_const_i64(KyGraph *g, int64_t value);
+KyNode *kyir_add(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_sub(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_mul(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_shl(KyGraph *g, KyNode *a, KyNode *shift);
+KyNode *kyir_shr(KyGraph *g, KyNode *a, KyNode *shift);
+KyNode *kyir_sar(KyGraph *g, KyNode *a, KyNode *shift);
+KyNode *kyir_and(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_or (KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_xor(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_neg(KyGraph *g, KyNode *a);
+KyNode *kyir_not(KyGraph *g, KyNode *a);
+
+/* Debug */
+void kyir_node_print(const KyNode *n);
+void kyir_graph_print(const KyGraph *g);
+
+/* Utility */
+uint32_t kyir_node_use_count(const KyNode *n);
+
+/* ============================================================
+ * Layer 2: Blocks and Control Flow
+ * ============================================================ */
+
+KyBlock *kyir_block_create(KyGraph *g);
+void     kyir_block_add_node(KyBlock *b, KyNode *n);
+void     kyir_block_add_successor(KyBlock *b, KyBlock *succ);
+void     kyir_block_add_predecessor(KyBlock *b, KyBlock *pred);
+void     kyir_block_set_terminator(KyBlock *b, KyNode *n);
+void     kyir_block_print(const KyBlock *b);
+
+/* ============================================================
+ * Layer 3: Dominator Tree
+ * ============================================================ */
+
+typedef struct KyDomTree {
+    KyBlock **idom;
+    uint32_t *dom_depth;
+    uint32_t *postorder;
+    uint32_t *postorder_num;
+    uint32_t  num_blocks;
+} KyDomTree;
+
+KyDomTree *kyir_domtree_build(KyGraph *g);
+void       kyir_domtree_destroy(KyDomTree *dt);
+int        kyir_domtree_dominates(KyDomTree *dt, KyBlock *a, KyBlock *b);
+KyBlock   *kyir_domtree_lca(KyDomTree *dt, KyBlock *a, KyBlock *b);
+
+/* ============================================================
+ * Layer 4: SSA Construction
+ * ============================================================ */
+
+int  kyir_ssa_construct(KyGraph *g);   /* Returns 0 on success */
+int  kyir_ssa_insert_phis(KyGraph *g);
+
+/* ============================================================
+ * Layer 5: AST/Bytecode → IR Builder
+ * ============================================================ */
+
+typedef struct KyIRBuilder KyIRBuilder;
+
+struct KyIRBuilder {
+    KyGraph *graph;
+    KyBlock *current_block;
+    KyNode  *current_control;
+    KyNode  *current_memory;
+
+    /* Variable → node map */
+    KyNode **var_nodes;
+    uint32_t num_vars;
+    uint32_t var_capacity;
+
+    /* Loop stack */
+    KyBlock **loop_stack;
+    uint32_t  loop_depth;
+};
+
+KyIRBuilder *kyir_builder_create(KyGraph *g);
+void         kyir_builder_destroy(KyIRBuilder *b);
+void         kyir_builder_set_block(KyIRBuilder *b, KyBlock *block);
+KyNode      *kyir_builder_get_var(KyIRBuilder *b, uint32_t var_id);
+void         kyir_builder_set_var(KyIRBuilder *b, uint32_t var_id, KyNode *value);
+
+/* High-level IR builders */
+KyNode *kyir_build_const(KyIRBuilder *b, int64_t value);
+KyNode *kyir_build_add(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_sub(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_mul(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_return(KyIRBuilder *b, KyNode *value);
+KyNode *kyir_build_load_field(KyIRBuilder *b, KyNode *obj, int32_t offset);
+KyNode *kyir_build_store_field(KyIRBuilder *b, KyNode *obj, int32_t offset,
+                               KyNode *value);
+KyNode *kyir_build_shl(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_shr(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_sar(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_and(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_or (KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_xor(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_neg(KyIRBuilder *b, KyNode *a);
+KyNode *kyir_build_not(KyIRBuilder *b, KyNode *a);
+
+/* Bitwise and shift operations */
+KyNode *kyir_build_shl(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_shr(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_sar(KyIRBuilder *b, KyNode *a, KyNode *shift);
+KyNode *kyir_build_and(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_or (KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_xor(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_neg(KyIRBuilder *b, KyNode *a);
+KyNode *kyir_build_not(KyIRBuilder *b, KyNode *a);
+KyNode *kyir_build_load_field(KyIRBuilder *b, KyNode *obj, int32_t offset);
+KyNode *kyir_build_store_field(KyIRBuilder *b, KyNode *obj, int32_t offset,
+                               KyNode *value);
+
+/* ============================================================
+ * Layer 6: Optimizations
+ * ============================================================ */
+
+/* Constant folding: fold ADD/SUB/MUL of constants */
+int kyir_opt_constfold(KyGraph *g);
+
+/* Algebraic simplify: x+0=x, x*1=x, x*0=0, x-x=0 */
+int kyir_opt_algebraic(KyGraph *g);
+
+/* Dead code elimination */
+int kyir_opt_dce(KyGraph *g);
+
+/* Global value numbering (basic) */
+int kyir_opt_gvn(KyGraph *g);
+
+/* Run all optimizations until fixed point */
+int kyir_optimize(KyGraph *g);
+
+/* ============================================================
+ * Layer 7: Graph Verifier
+ * ============================================================ */
+
+typedef struct KyVerifyResult {
+    int ok;
+    uint32_t errors;
+    char messages[16][128];
+} KyVerifyResult;
+
+KyVerifyResult kyir_graph_verify(KyGraph *g);
+
+/* ============================================================
+ * Utility
+ * ============================================================ */
+
+uint32_t kyir_node_use_count(const KyNode *n);
+void     kyir_node_remove_use(KyNode *n, KyNode *use);
+void     kyir_node_replace_uses(KyGraph *g, KyNode *old_node, KyNode *new_node);
+int      kyir_node_is_constant(const KyNode *n);
+int64_t  kyir_node_const_i64(const KyNode *n);
+
+/* ============================================================
+ * Layer 8: SSA Construction
+ *
+ * Braun et al. algorithm:
+ *   1. Compute dominance frontiers
+ *   2. Insert phi nodes at dominance frontiers
+ *   3. Rename variables via dominator tree DFS
+ * ============================================================ */
+
+typedef struct KyDominanceFrontier {
+    KyBlock **frontier;
+    uint32_t  num_blocks;
+    uint32_t  capacity;
+} KyDominanceFrontier;
+
+typedef struct KySSAContext {
+    KyGraph    *graph;
+    KyDomTree  *domtree;
+    KyBlock   **blocks;       /* RPO order */
+
+    /* Dominance frontiers per block */
+    KyDominanceFrontier *df;
+
+    /* Current variable definitions (stack of versions) */
+    struct {
+        KyNode **defs;        /* stack of definitions */
+        uint32_t depth;
+        uint32_t capacity;
+    } *var_defs;
+    uint32_t num_vars;
+
+    /* Phi nodes inserted */
+    KyNode **phis;
+    uint32_t num_phis;
+    uint32_t phi_capacity;
+} KySSAContext;
+
+/* Compute dominance frontiers */
+KyDominanceFrontier *kyir_domfrontier_build(KyGraph *g, KyDomTree *dt);
+void kyir_domfrontier_destroy(KyDominanceFrontier *df);
+
+/* SSA construction */
+KySSAContext *kyir_ssa_create(KyGraph *g, KyDomTree *dt);
+void          kyir_ssa_destroy(KySSAContext *ssa);
+
+/* Main SSA construction entry point */
+int kyir_ssa_construct_full(KyGraph *g);
+
+/* Phi node creation */
+KyNode *kyir_phi_create(KyGraph *g, uint32_t num_inputs);
+
+/* SSA print */
+void kyir_ssa_print(KySSAContext *ssa);
+
+/* ============================================================
+ * Layer 9: Loop Analysis
+ * ============================================================ */
+
+typedef struct KyLoop {
+    KyBlock *header;
+    KyBlock *latch;
+    KyBlock **body;
+    uint32_t  num_body;
+    uint32_t  body_capacity;
+
+    KyBlock *preheader;
+
+    KyBlock **exits;
+    uint32_t  num_exits;
+    uint32_t  exit_capacity;
+
+    struct KyLoop *parent;
+    struct KyLoop **children;
+    uint32_t  num_children;
+    uint32_t  child_capacity;
+
+    uint32_t  depth;
+    uint8_t   is_innermost;
+    uint8_t   is_reducible;
+    uint8_t   has_calls;
+    uint8_t   _pad;
+} KyLoop;
+
+typedef struct KyLoopInfo {
+    KyLoop **loops;
+    uint32_t num_loops;
+    uint32_t capacity;
+    KyLoop **block_loop;    /* innermost loop containing each block */
+} KyLoopInfo;
+
+/* Build loop info from graph + dominator tree */
+KyLoopInfo *kyir_loopinfo_build(KyGraph *g, KyDomTree *dt);
+void        kyir_loopinfo_destroy(KyLoopInfo *li);
+
+/* Query: is a block in a loop? */
+KyLoop *kyir_loop_of_block(KyLoopInfo *li, KyBlock *b);
+
+/* Query: does block A contain block B? */
+int kyir_loop_contains(KyLoop *loop, KyBlock *b);
+
+/* Print */
+void kyir_loopinfo_print(KyLoopInfo *li);
+
+/* ============================================================
+ * LICM — Loop Invariant Code Motion
+ * ============================================================ */
+
+typedef struct KyLICMResult {
+    uint32_t nodes_hoisted;
+    uint32_t loops_processed;
+} KyLICMResult;
+
+KyLICMResult kyir_licm(KyGraph *g, KyLoopInfo *li, KyDomTree *dt);
+
+/* ============================================================
+ * Loop unrolling
+ * ============================================================ */
+
+typedef struct KyUnrollResult {
+    uint32_t loops_unrolled;
+    uint32_t nodes_duplicated;
+} KyUnrollResult;
+
+KyUnrollResult kyir_loop_unroll(KyGraph *g, KyLoopInfo *li, KyDomTree *dt,
+                                uint32_t factor);
+
+/* ============================================================
+ * Layer 10: Type Inference
+ *
+ * Lattice-based type inference:
+ *   - Bottom up: assign types from opcodes and inputs
+ *   - Fixed-point: iterate until no changes
+ *   - Range analysis: track integer ranges
+ * ============================================================ */
+
+typedef struct KyTypeLattice {
+    KyIRType base;
+    int64_t  min;
+    int64_t  max;
+    int      is_const;
+    int64_t  const_val;
+    int      is_exact;
+} KyTypeLattice;
+
+/* Per-node type info (attached to nodes during inference) */
+typedef struct KyNodeTypeInfo {
+    KyTypeLattice type;
+    int           inference_depth;   /* to detect cycles */
+} KyNodeTypeInfo;
+
+typedef struct KyTypeInference {
+    KyGraph        *graph;
+    KyNodeTypeInfo *info;            /* one per node */
+    uint32_t        num_iterations;
+    uint32_t        num_changes;
+} KyTypeInference;
+
+/* Build type inference for a graph */
+KyTypeInference *kyir_types_infer(KyGraph *g, KyDomTree *dt);
+void             kyir_types_destroy(KyTypeInference *ti);
+
+/* Query: get type of node */
+KyTypeLattice kyir_types_get(KyTypeInference *ti, KyNode *n);
+
+/* Query: is this node a known constant? */
+int kyir_types_is_const(KyTypeInference *ti, KyNode *n, int64_t *out);
+
+/* Query: is this node's type int32? int64? */
+int kyir_types_is_int(KyTypeInference *ti, KyNode *n);
+int kyir_types_is_float(KyTypeInference *ti, KyNode *n);
+
+/* Print */
+void kyir_types_print(KyTypeInference *ti);
+const char *kyir_type_name(KyIRType t);
+
+/* ============================================================
+ * Type-based optimizations
+ * ============================================================ */
+
+/* Constant propagation using type info */
+int kyir_opt_sccp(KyGraph *g, KyTypeInference *ti);
+
+/* Bounds check elimination using range analysis */
+int kyir_opt_bounds_check(KyGraph *g, KyTypeInference *ti);
+
+/* ============================================================
+ * Layer 11: Escape Analysis + SROA
+ * ============================================================ */
+
+typedef enum {
+    KYIR_ESCAPE_NO_ESCAPE = 0,   /* local only — can SROA */
+    KYIR_ESCAPE_ARG_ESCAPE,      /* passed to known function */
+    KYIR_ESCAPE_RETURN_ESCAPE,   /* returned */
+    KYIR_ESCAPE_HEAP_ESCAPE,     /* stored to heap */
+    KYIR_ESCAPE_UNKNOWN          /* passed to unknown code */
+} KyEscapeState;
+
+typedef struct KyConnectionEdge {
+    KyNode *from;
+    KyNode *to;
+    uint16_t kind;      /* points-to, deferred, alias */
+    uint16_t _pad;
+    struct KyConnectionEdge *next;
+} KyConnectionEdge;
+
+typedef struct KyConnectionGraph {
+    KyNode **allocations;
+    uint32_t num_allocations;
+    uint32_t alloc_capacity;
+
+    KyConnectionEdge **edges;   /* indexed by node id */
+    uint32_t edge_capacity;
+
+    KyEscapeState *states;      /* escape state per node */
+    uint32_t num_nodes;
+
+    /* Worklist for fixed-point */
+    KyNode **worklist;
+    uint32_t worklist_top;
+    uint32_t worklist_capacity;
+} KyConnectionGraph;
+
+/* Escape analysis */
+KyConnectionGraph *kyir_escape_build(KyGraph *g);
+void               kyir_escape_destroy(KyConnectionGraph *cg);
+void               kyir_escape_analyze(KyConnectionGraph *cg, KyGraph *g);
+KyEscapeState      kyir_escape_get(KyConnectionGraph *cg, KyNode *n);
+void               kyir_escape_print(KyConnectionGraph *cg, KyGraph *g);
+
+/* SROA — Scalar Replacement of Aggregates */
+typedef struct KySROAResult {
+    uint32_t allocations_eliminated;
+    uint32_t loads_replaced;
+    uint32_t stores_replaced;
+} KySROAResult;
+
+KySROAResult kyir_sroa(KyGraph *g, KyConnectionGraph *cg);
+
+/* ============================================================
+ * Layer 12: Scheduling (Click's Global Code Motion)
+ *
+ * Two-phase algorithm:
+ *   1. Schedule late: assign each node to the highest valid block
+ *   2. Schedule early: hoist nodes to reduce register pressure
+ * ============================================================ */
+
+typedef struct KySchedule {
+    KyGraph    *graph;
+    KyDomTree  *domtree;
+
+    KyBlock  **node_block;      /* block assigned per node */
+    uint32_t  *node_index;      /* position within block */
+    uint32_t  *node_priority;   /* scheduling priority */
+
+    uint32_t   num_scheduled;
+    uint32_t   num_hoisted;
+    uint32_t   num_unscheduled;
+} KySchedule;
+
+/* Build schedule from graph */
+KySchedule *kyir_schedule_build(KyGraph *g, KyDomTree *dt);
+void        kyir_schedule_destroy(KySchedule *s);
+
+/* Apply schedule to graph (assigns .block and .schedule_idx to nodes) */
+int kyir_schedule_apply(KyGraph *g, KySchedule *s);
+
+/* Print */
+void kyir_schedule_print(KySchedule *s);
+
+/* ============================================================
+ * Layer 13: x86-64 Backend
+ *
+ * Pipeline:
+ *   1. Linearize IR into instruction list
+ *   2. Instruction selection (BURS-style)
+ *   3. Register allocation (linear scan)
+ *   4. Code emission (x86-64 bytes)
+ * ============================================================ */
+
+/* Physical x86-64 registers */
+typedef enum {
+    X64_RAX = 0, X64_RBX, X64_RCX, X64_RDX,
+    X64_RSI, X64_RDI, X64_RBP, X64_RSP,
+    X64_R8, X64_R9, X64_R10, X64_R11,
+    X64_R12, X64_R13, X64_R14, X64_R15,
+    X64_REG_COUNT,
+    X64_REG_NONE = 0xFF
+} KyX64Reg;
+
+/*
+ * x86-64 encoding order:
+ *   RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7,
+ *   R8=8, R9=9, R10=10, R11=11, R12=12, R13=13, R14=14, R15=15
+ *
+ * Our enum order is different (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8..R15).
+ * Use ky_x64_enc[] to convert.
+ */
+static const uint8_t ky_x64_enc[16] = {
+    0,   /* X64_RAX = 0  → enc 0  (rax) */
+    3,   /* X64_RBX = 1  → enc 3  (rbx) */
+    1,   /* X64_RCX = 2  → enc 1  (rcx) */
+    2,   /* X64_RDX = 3  → enc 2  (rdx) */
+    6,   /* X64_RSI = 4  → enc 6  (rsi) */
+    7,   /* X64_RDI = 5  → enc 7  (rdi) */
+    5,   /* X64_RBP = 6  → enc 5  (rbp) */
+    4,   /* X64_RSP = 7  → enc 4  (rsp) */
+    8,   /* X64_R8  = 8  → enc 8 */
+    9,   /* X64_R9  = 9  → enc 9 */
+    10,  /* X64_R10 = 10 → enc 10 */
+    11,  /* X64_R11 = 11 → enc 11 */
+    12,  /* X64_R12 = 12 → enc 12 */
+    13,  /* X64_R13 = 13 → enc 13 */
+    14,  /* X64_R14 = 14 → enc 14 */
+    15   /* X64_R15 = 15 → enc 15 */
+};
+
+/* Machine opcodes (subset) */
+typedef enum {
+    X64_MOV_REG_REG = 0,
+    X64_MOV_REG_IMM,
+    X64_ADD_REG_REG,
+    X64_ADD_REG_IMM,
+    X64_SUB_REG_REG,
+    X64_SUB_REG_IMM,
+    X64_MUL_REG_REG,
+    X64_IMUL_REG_REG_IMM,
+    X64_AND_REG_REG,
+    X64_OR_REG_REG,
+    X64_XOR_REG_REG,
+    X64_SHL_REG_IMM,
+    X64_SHR_REG_IMM,
+    X64_SAR_REG_IMM,    /* sar r/m64, imm8  (C1 /7) */
+    X64_NEG,            /* neg r/m64        (F7 /3) */
+    X64_NOT,            /* not r/m64        (F7 /2) */
+    X64_CMP_REG_REG,
+    X64_CMP_REG_IMM,
+    X64_JMP,
+    X64_JZ,
+    X64_JNZ,
+    X64_JE,
+    X64_JNE,
+    X64_JL,
+    X64_JLE,
+    X64_JG,
+    X64_JGE,
+    X64_CALL,
+    X64_RET,
+    X64_PUSH,
+    X64_POP,
+    X64_MOV_REG_MEM,
+    X64_MOV_MEM_REG,
+    X64_LEA,
+    X64_NOP,
+    X64_LABEL,
+    X64_OP_COUNT
+} KyX64Op;
+
+/* Virtual register */
+typedef enum {
+    VREG_VIRTUAL = 0,
+    VREG_PHYSICAL
+} KyVRegKind;
+
+typedef struct KyVReg {
+    uint32_t    id;
+    KyVRegKind  kind;
+    KyX64Reg    phys;      /* if physical */
+    uint32_t    interval_start;
+    uint32_t    interval_end;
+    int         spilled;
+    int32_t     spill_slot;
+} KyVReg;
+
+/* Machine instruction */
+typedef struct KyX64Label {
+    uint32_t  id;
+    uint32_t  byte_offset;
+    uint32_t  num_patches;
+    uint32_t *patch_offsets;
+    uint32_t  patch_capacity;
+} KyX64Label;
+
+typedef struct KyX64Ins {
+    KyX64Op   op;
+    KyVReg   *dst;
+    KyVReg   *src1;
+    KyVReg   *src2;
+    int64_t   imm;
+    int32_t   mem_offset;      /* for load/store */
+    KyX64Reg  mem_base;        /* for load/store */
+    uint32_t  label_id;        /* for jumps/labels */
+    uint32_t  orig_node;       /* original IR node id */
+    uint32_t  fixup_offset;      /* byte offset for patch */
+    uint32_t  fixup_label;       /* target label id */
+    uint8_t   is_conditional;    /* conditional jump */
+    uint8_t   is_terminator;     /* terminator (jump/ret) */
+    uint8_t   _pad[6];
+} KyX64Ins;
+
+/* Backend context */
+/* ============================================================
+ * Function frame — callee-saved registers to push/pop.
+ * Must be declared before KyX64Backend (which embeds one).
+ * ============================================================ */
+typedef struct KyFuncFrame {
+    /* Callee-saved registers actually used (need to be saved) */
+    KyX64Reg  callee_saved[6];      /* rbx, rbp, r12, r13, r14, r15 */
+    uint32_t  num_callee_saved;
+
+    /* Stack frame size (local variables, spills) */
+    uint32_t  frame_size;
+
+    /* Alignment tracking */
+    uint32_t  stack_depth;
+
+    /* Prologue/epilogue labels */
+    uint32_t  prologue_done;
+} KyFuncFrame;
+
+typedef struct KyX64Backend {
+    KyGraph     *graph;
+    KySchedule  *schedule;
+    KyDomTree   *domtree;
+
+    KyVReg    **vregs;
+    uint32_t    num_vregs;
+    uint32_t    vreg_capacity;
+
+    KyX64Ins  **insns;
+    uint32_t    num_insns;
+    uint32_t    insn_capacity;
+
+    uint32_t    num_labels;
+    uint32_t    next_label;
+    KyX64Label **labels;
+    uint32_t    label_capacity;
+
+    /* Register allocation state */
+    KyX64Reg    reg_alloc[X64_REG_COUNT];    /* which vreg uses each phys */
+    KyX64Reg   *vreg_phys;                   /* phys reg per vreg */
+
+    /* Function frame (callee-saved regs to push/pop) */
+    KyFuncFrame frame;
+
+    /* Stats */
+    uint32_t    num_spills;
+    uint32_t    num_moves_eliminated;
+} KyX64Backend;
+
+/* Backend API */
+KyX64Backend *kyx64_backend_create(KyGraph *g, KySchedule *s, KyDomTree *dt);
+void          kyx64_backend_destroy(KyX64Backend *b);
+
+/* Pipeline stages */
+int kyx64_linearize(KyX64Backend *b);
+int kyx64_select(KyX64Backend *b);
+int kyx64_allocate(KyX64Backend *b);
+int kyx64_emit(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len);
+
+/* Convenience: full compile */
+int kyx64_compile(KyGraph *g, uint8_t *code, size_t code_size, size_t *code_len);
+
+/* Print */
+void kyx64_dump(KyX64Backend *b);
+
+const char *kyx64_op_name(KyX64Op op);
+const char *kyx64_reg_name(KyX64Reg r);
+
+/* Extended backend API */
+KyX64Label *kyx64_new_label(KyX64Backend *b);
+void        kyx64_emit_label(KyX64Backend *b, KyX64Label *label);
+void        kyx64_emit_jump(KyX64Backend *b, KyX64Op op, KyX64Label *target);
+void        kyx64_emit_branch_zero(KyX64Backend *b, KyVReg *cond, KyX64Label *target);
+void        kyx64_emit_load(KyX64Backend *b, KyVReg *dst, KyVReg *base, int32_t offset);
+void        kyx64_emit_store(KyX64Backend *b, KyVReg *base, int32_t offset, KyVReg *value);
+void        kyx64_emit_call(KyX64Backend *b, void *target, KyVReg *result);
+void        kyx64_patch_labels(KyX64Backend *b, uint8_t *code, size_t code_size);
+
+/* Internal helpers exposed for testing */
+KyVReg    *new_vreg(KyX64Backend *b, uint32_t node_id);
+KyX64Ins  *add_insn(KyX64Backend *b, KyX64Op op);
+int        emit_bytes(uint8_t *code, size_t code_size, size_t *off,
+                      const uint8_t *bytes, size_t len);
+int        encode_mov_imm64(uint8_t *code, size_t code_size, size_t *off,
+                            KyX64Reg dst, int64_t imm);
+int        encode_mov_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src);
+int        encode_add_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src);
+int        encode_sub_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                              KyX64Reg dst, KyX64Reg src);
+int        encode_imul_reg_reg(uint8_t *code, size_t code_size, size_t *off,
+                               KyX64Reg dst, KyX64Reg src);
+
+int kyx64_emit_extended(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len);
+
+/* ============================================================
+ * Layer 14: Chaitin-Briggs Register Allocation
+ * ============================================================ */
+
+typedef struct KyRegNode {
+    uint32_t  vreg_id;
+    uint32_t  degree;
+    uint32_t  color;              /* physical register or KYREG_UNASSIGNED */
+    uint32_t  live_start;
+    uint32_t  live_end;
+    int       spilled;
+    int       removed;
+
+    uint32_t *neighbors;
+    uint32_t  num_neighbors;
+    uint32_t  neighbor_capacity;
+} KyRegNode;
+
+#define KYREG_UNASSIGNED 0xFFFFFFFFu
+
+typedef struct KyRegAlloc {
+    KyX64Backend *backend;
+    uint32_t      num_nodes;
+    KyRegNode   **nodes;
+
+    KyX64Reg      num_regs;
+    KyX64Reg      regs[X64_REG_COUNT];
+
+    uint32_t     *stack;
+    uint32_t      stack_top;
+    uint32_t      stack_capacity;
+
+    uint32_t      num_spills;
+    uint32_t     *spilled;
+    uint32_t      spill_capacity;
+
+    uint32_t      num_moves_eliminated;
+} KyRegAlloc;
+
+KyRegAlloc *kyregalloc_create(KyX64Backend *b);
+void        kyregalloc_destroy(KyRegAlloc *ra);
+
+/* Main entry point */
+int kyregalloc_run(KyX64Backend *b);
+
+/* Debug */
+void kyregalloc_print(KyRegAlloc *ra);
+
+/* ============================================================
+ * Layer 15: Function Calls (SysV x86-64 ABI)
+ * ============================================================ */
+
+#define KYFUNC_MAX_ARGS 6
+
+/* Argument registers in order */
+#define KYFUNC_ARG0 X64_RDI
+#define KYFUNC_ARG1 X64_RSI
+#define KYFUNC_ARG2 X64_RDX
+#define KYFUNC_ARG3 X64_RCX
+#define KYFUNC_ARG4 X64_R8
+#define KYFUNC_ARG5 X64_R9
+#define KYFUNC_RET   X64_RAX
+
+
+
+/* Function metadata */
+typedef struct KyFunction {
+    uint32_t    id;
+    const char *name;
+    void       *entry;          /* entry point (for calls) */
+    KyFuncFrame frame;
+
+    /* Type info */
+    uint32_t    num_args;
+    uint32_t    num_locals;
+} KyFunction;
+
+/* Function call emission */
+KyX64Ins *kyx64_emit_prologue(KyX64Backend *b, KyFuncFrame *frame);
+KyX64Ins *kyx64_emit_epilogue(KyX64Backend *b, KyFuncFrame *frame);
+KyX64Ins *kyx64_emit_call_direct(KyX64Backend *b, void *target,
+                                  KyVReg **args, uint32_t num_args,
+                                  KyVReg *result);
+KyX64Ins *kyx64_emit_call_reg(KyX64Backend *b, KyVReg *target_reg,
+                               KyVReg **args, uint32_t num_args,
+                               KyVReg *result);
+KyX64Ins *kyx64_emit_push(KyX64Backend *b, KyVReg *reg);
+KyX64Ins *kyx64_emit_pop(KyX64Backend *b, KyVReg *reg);
+
+/* Mark callee-saved registers as used */
+void kyx64_frame_add_callee_saved(KyFuncFrame *frame, KyX64Reg reg);
+
+
+/* Function call declarations */
+#define KYFUNC_MAX_ARGS 6
+#define KYFUNC_ARG0 X64_RDI
+#define KYFUNC_ARG1 X64_RSI
+#define KYFUNC_ARG2 X64_RDX
+#define KYFUNC_ARG3 X64_RCX
+#define KYFUNC_ARG4 X64_R8
+#define KYFUNC_ARG5 X64_R9
+#define KYFUNC_RET   X64_RAX
+
+
+
+KyX64Ins *kyx64_emit_prologue(KyX64Backend *b, KyFuncFrame *frame);
+KyX64Ins *kyx64_emit_epilogue(KyX64Backend *b, KyFuncFrame *frame);
+KyX64Ins *kyx64_emit_call_direct(KyX64Backend *b, void *target, KyVReg **args, uint32_t num_args, KyVReg *result);
+KyX64Ins *kyx64_emit_call_reg(KyX64Backend *b, KyVReg *target_reg, KyVReg **args, uint32_t num_args, KyVReg *result);
+KyX64Ins *kyx64_emit_push(KyX64Backend *b, KyVReg *reg);
+KyX64Ins *kyx64_emit_pop(KyX64Backend *b, KyVReg *reg);
+void      kyx64_frame_add_callee_saved(KyFuncFrame *frame, KyX64Reg reg);
+int       kyx64_emit_with_calls(KyX64Backend *b, uint8_t *code, size_t code_size, size_t *code_len);
+
+#endif /* KYJIT_IR_H */

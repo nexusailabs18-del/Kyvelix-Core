@@ -1,0 +1,200 @@
+/*
+ * test_frontend.c — parse .ky source, compile, execute, check.
+ */
+#include "kyjit_ir.h"
+#include <stdlib.h>
+#include "kyjit_frontend.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <unistd.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+/* Compile source, execute, return the JIT'd function's result.
+ * Returns 0 on any compile error. */
+static int64_t run_source(const char *src) {
+    char errbuf[512];
+    KyGraph *g = kyjit_parse_source(src, "<test>", errbuf, sizeof(errbuf));
+    if (!g) {
+        printf("    parse error: %s\n", errbuf);
+        return 0;
+    }
+    void *code = mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) { kyir_graph_destroy(g); return 0; }
+    size_t len = 0;
+    if (kyx64_compile(g, (uint8_t *)code, 4096, &len) != 0) {
+        munmap(code, 4096); kyir_graph_destroy(g); return 0;
+    }
+    typedef int64_t (*Fn)(void);
+    Fn f = (Fn)code;
+    int64_t r = f();
+    munmap(code, 4096);
+    kyir_graph_destroy(g);
+    return r;
+}
+
+int main(void) {
+    printf("KYJIT Frontend Test v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n");
+
+    printf("\n[literals]\n");
+    TEST("return 42",      run_source("return 42;") == 42);
+    TEST("return 0",       run_source("return 0;") == 0);
+    TEST("return 0xFF",    run_source("return 0xFF;") == 255);
+
+    printf("\n[arithmetic]\n");
+    TEST("5 + 7",          run_source("return 5 + 7;") == 12);
+    TEST("5 - 7",          run_source("return 5 - 7;") == -2);
+    TEST("5 * 7",          run_source("return 5 * 7;") == 35);
+    TEST("100 / 7",        run_source("return 100 / 7;") == 14);
+    TEST("100 % 7",        run_source("return 100 % 7;") == 2);
+    TEST("precedence",     run_source("return 5 + 7 * 3;") == 26);
+    TEST("parens",         run_source("return (5 + 7) * 3;") == 36);
+    TEST("nested parens",  run_source("return ((2 + 3) * (4 + 5));") == 45);
+
+    printf("\n[bitwise]\n");
+    TEST("0xAB & 0xFF",         run_source("return 0xAB & 0xFF;") == 0xAB);
+    TEST("0xF0 | 0x0F",         run_source("return 0xF0 | 0x0F;") == 0xFF);
+    TEST("0xFF ^ 0x0F",         run_source("return 0xFF ^ 0x0F;") == 0xF0);
+    TEST("1 << 4",              run_source("return 1 << 4;") == 16);
+    TEST("256 >> 4",            run_source("return 256 >> 4;") == 16);
+    TEST("~0",                  run_source("return ~0;") == -1);
+    TEST("0xCD << 8 | 0xAB",    run_source("return (0xCD << 8) | 0xAB;") == 0xCDAB);
+
+    printf("\n[unary]\n");
+    TEST("-42",            run_source("return -42;") == -42);
+    TEST("-(-100)",        run_source("return -(-100);") == 100);
+
+    printf("\n[comparisons]\n");
+    TEST("5 < 7",          run_source("return 5 < 7;") == 1);
+    TEST("7 < 5",          run_source("return 7 < 5;") == 0);
+    TEST("5 == 5",         run_source("return 5 == 5;") == 1);
+    TEST("5 != 5",         run_source("return 5 != 5;") == 0);
+    TEST("10 > 20",        run_source("return 10 > 20;") == 0);
+    TEST("5 <= 5",         run_source("return 5 <= 5;") == 1);
+    TEST("5 >= 6",         run_source("return 5 >= 6;") == 0);
+
+    printf("\n[if / else]\n");
+    TEST("if(1) 42 else 99",   run_source("if (1) return 42; else return 99;") == 42);
+    TEST("if(0) 42 else 99",   run_source("if (0) return 42; else return 99;") == 99);
+    TEST("if(5<7) 1",          run_source("if (5 < 7) return 1; else return 2;") == 1);
+    TEST("nested if",          run_source("if (1) { if (1) return 111; else return 110; } else return 0;") == 111);
+    TEST("else-if chain",
+         run_source("if (0) return 1; else if (0) return 2; else return 3;") == 3);
+    TEST("else-if chain first",
+         run_source("if (1) return 1; else if (0) return 2; else return 3;") == 1);
+
+    printf("\n[statements / blocks]\n");
+    TEST("two returns unreachable",
+         run_source("return 10; return 20;") == 10);
+    TEST("block form",
+         run_source("{ return 7; }") == 7);
+
+    printf("\n[string literals in write()]\n");
+    {
+        /* This test needs the full pipeline through the ELF writer.
+         * We compile to a temp file, run it, and capture stdout. */
+        const char *src_text = "write(1, \"hello\\n\", 6); return 0;";
+        char errbuf[512];
+        KyGraph *g = kyjit_parse_source(src_text, "<test>", errbuf, sizeof(errbuf));
+        TEST("parse write(1, \"hello\\n\", 6)", g != NULL);
+        if (g) {
+            TEST("string pool has one entry", g->string_count == 1);
+            if (g->string_count > 0) {
+                TEST("string is hello\\n", 
+                     g->strings[0].length == 6 &&
+                     memcmp(g->strings[0].bytes, "hello\n", 6) == 0);
+            }
+            /* Full pipeline to a binary. */
+            const char *out = "/tmp/kyjit_hello_from_src";
+            int rc = kyx64_compile_to_elf(g, out, 0755);
+            TEST("compile_to_elf returns 0", rc == 0);
+            if (rc == 0) {
+                char cmd[512];
+                snprintf(cmd, sizeof(cmd), "%s > /tmp/kyjit_hello_out.txt", out);
+                int sys_rc = system(cmd);
+                TEST("executed hello binary", sys_rc == 0);
+                FILE *f = fopen("/tmp/kyjit_hello_out.txt", "rb");
+                if (f) {
+                    char buf[32] = {0};
+                    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+                    fclose(f);
+                    TEST("captured output is 'hello\\n'",
+                         got == 6 && memcmp(buf, "hello\n", 6) == 0);
+                } else {
+                    TEST("output file readable", 0);
+                }
+                unlink(out);
+            }
+            kyir_graph_destroy(g);
+        }
+    }
+
+    printf("\n[locals]\n");
+    TEST("int x = 5; return x;",
+         run_source("int x = 5; return x;") == 5);
+    TEST("int x = 5; return x + 1;",
+         run_source("int x = 5; return x + 1;") == 6);
+    TEST("int x = 10; int y = 20; return x + y;",
+         run_source("int x = 10; int y = 20; return x + y;") == 30);
+    TEST("int x = 42; x = x + 1; return x;",
+         run_source("int x = 42; x = x + 1; return x;") == 43);
+    TEST("int x = 5; if (x < 10) { x = 100; } return x;",
+         run_source("int x = 5; if (x < 10) { x = 100; } return x;") == 100);
+    TEST("int x = 1; int y = x + 1; int z = y + 1; return z;",
+         run_source("int x = 1; int y = x + 1; int z = y + 1; return z;") == 3);
+    {
+        char errbuf[512];
+        KyGraph *g = kyjit_parse_source("int x = 1; int x = 2;", "<t>", errbuf, sizeof(errbuf));
+        TEST("redeclaration is parse error", g == NULL);
+        if (g) kyir_graph_destroy(g);
+    }
+    {
+        char errbuf[512];
+        KyGraph *g = kyjit_parse_source("return y;", "<t>", errbuf, sizeof(errbuf));
+        TEST("undefined variable is parse error", g == NULL);
+        if (g) kyir_graph_destroy(g);
+    }
+
+    printf("\n[frontend spill]\n");
+    TEST("frontend spill (i+j = 37)",
+         run_source("int a=1; int b=2; int c=a+b; int d=a+c; int e=b+c; int f=c+d; int g=d+e; int h=e+f; int i=f+g; int j=g+h; return i+j;") == 37);
+
+    printf("\n[arrays]\n");
+    TEST("[1,2,3][0] == 1",        run_source("return [1, 2, 3][0];") == 1);
+    TEST("[1,2,3][2] == 3",        run_source("return [1, 2, 3][2];") == 3);
+    TEST("arr=[10,20,30]; arr[1]",  run_source("arr = [10, 20, 30]; return arr[1];") == 20);
+    TEST("arr[0]=100; return",      run_source("arr = [1, 2, 3]; arr[0] = 100; return arr[0];") == 100);
+    TEST("[1,2,3].length == 3",    run_source("return [1, 2, 3].length;") == 3);
+    TEST("arr.length == 3",        run_source("arr = [1, 2, 3]; return arr.length;") == 3);
+
+    printf("\n[objects]\n");
+    TEST("{a:42}.a == 42",         run_source("return {a: 42}.a;") == 42);
+    TEST("{a:1,b:2}.b == 2",       run_source("return {a: 1, b: 2}.b;") == 2);
+    TEST("obj={a:42}; obj.a",      run_source("obj = {a: 42}; return obj.a;") == 42);
+    TEST("obj={x:10}; obj.x=20",   run_source("obj = {x: 10}; obj.x = 20; return obj.x;") == 20);
+    TEST("obj={a:1,b:2}; obj.b",   run_source("obj = {a: 1, b: 2}; return obj.b;") == 2);
+
+    printf("\n[arrays + objects end-to-end]\n");
+    TEST("arr+obj = 202",
+         run_source("arr = [10, 20, 30]; obj = {name: 42, value: 100}; "
+                    "return arr[0] + arr[1] + arr[2] + obj.name + obj.value;") == 202);
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+    return (tests_run == tests_passed) ? 0 : 1;
+}

@@ -1,0 +1,1 @@
+{"depth":5,"ivs":[{"name":"a","lower":0,"upper":10,"step":1},{"name":"b","lower":0,"upper":10,"step":1},{"name":"c","lower":0,"upper":10,"step":1},{"name":"d","lower":0,"upper":10,"step":1},{"name":"e","lower":0,"upper":10,"step":1}],"body":[{"kind":"write","base":"A","index":[1,1,1,1,1],"elem_size":8,"offset":0}]}

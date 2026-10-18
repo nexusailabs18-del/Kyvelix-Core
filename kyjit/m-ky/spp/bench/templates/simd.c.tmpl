@@ -1,0 +1,14 @@
+// SIMD kernel template
+// {{BODY}}
+
+// SIMD parameters
+#define SIMD_WIDTH {{SIMD_WIDTH}}
+
+{{#if OPENMP}}
+#include <omp.h>
+#endif
+
+void kernel_{{KERNEL_NAME}}_simd_{{SIMD_WIDTH}}({{ARGS}}) {
+    // SIMD implementation with width {{SIMD_WIDTH}}
+    {{SIMD_BODY}}
+}

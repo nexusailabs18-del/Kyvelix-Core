@@ -1,0 +1,452 @@
+#ifndef KYJIT_IR_H
+#define KYJIT_IR_H
+
+/*
+ * KYJIT Sea of Nodes Compiler IR — v1.0.0
+ *
+ * Tri-edge node-based IR:
+ *   - Value edges: data dependencies
+ *   - Control edges: execution order
+ *   - Effect edges: side effect ordering
+ *
+ * Foundation for optimization, scheduling, codegen.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define KYIR_VERSION_MAJOR 1
+#define KYIR_VERSION_MINOR 0
+#define KYIR_VERSION_STRING "1.0.0"
+
+/* ============================================================
+ * Node opcodes
+ * ============================================================ */
+
+typedef enum {
+    /* Control flow */
+    IR_START         = 0,
+    IR_END           = 1,
+    IR_IF            = 2,
+    IR_LOOP          = 3,
+    IR_MERGE         = 4,
+    IR_PHI           = 5,
+    IR_RETURN        = 6,
+    IR_JUMP          = 7,
+    IR_THROW         = 8,
+
+    /* Integer arithmetic */
+    IR_ADD_I32       = 10,
+    IR_ADD_I64       = 11,
+    IR_SUB_I32       = 12,
+    IR_SUB_I64       = 13,
+    IR_MUL_I32       = 14,
+    IR_MUL_I64       = 15,
+    IR_DIV_I32       = 16,
+    IR_DIV_I64       = 17,
+    IR_MOD_I32       = 18,
+    IR_MOD_I64       = 19,
+    IR_NEG_I32       = 20,
+    IR_NEG_I64       = 21,
+    IR_SHL           = 22,
+    IR_SHR           = 23,
+    IR_AND           = 24,
+    IR_OR            = 25,
+    IR_XOR           = 26,
+
+    /* Float arithmetic */
+    IR_ADD_F32       = 30,
+    IR_ADD_F64       = 31,
+    IR_SUB_F32       = 32,
+    IR_SUB_F64       = 33,
+    IR_MUL_F32       = 34,
+    IR_MUL_F64       = 35,
+    IR_DIV_F32       = 36,
+    IR_DIV_F64       = 37,
+
+    /* Comparison */
+    IR_CMP_EQ        = 40,
+    IR_CMP_NE        = 41,
+    IR_CMP_LT        = 42,
+    IR_CMP_LE        = 43,
+    IR_CMP_GT        = 44,
+    IR_CMP_GE        = 45,
+
+    /* Memory */
+    IR_LOAD          = 50,
+    IR_STORE         = 51,
+    IR_LOAD_FIELD    = 52,
+    IR_STORE_FIELD   = 53,
+    IR_LOAD_ELEMENT  = 54,
+    IR_STORE_ELEMENT = 55,
+
+    /* Type conversion */
+    IR_TRUNC         = 60,
+    IR_SEXT          = 61,
+    IR_ZEXT          = 62,
+    IR_FPTOSI        = 63,
+    IR_SITOFP        = 64,
+    IR_BITCAST       = 65,
+
+    /* Objects */
+    IR_NEW_OBJECT    = 70,
+    IR_NEW_ARRAY     = 71,
+    IR_NEW_CLOSURE   = 72,
+    IR_GET_FIELD     = 73,
+    IR_SET_FIELD     = 74,
+
+    /* Calls */
+    IR_CALL          = 80,
+    IR_CALL_DIRECT   = 81,
+    IR_CALL_INDIRECT = 82,
+    IR_CALL_INTRINSIC= 83,
+    IR_CALL_RUNTIME  = 84,
+
+    /* Guards (for deopt) */
+    IR_CHECK_MAP     = 90,
+    IR_CHECK_TYPE    = 91,
+    IR_CHECK_BOUNDS  = 92,
+    IR_CHECK_NULL    = 93,
+    IR_DEOPT         = 94,
+
+    /* Constants */
+    IR_CONST_I32     = 100,
+    IR_CONST_I64     = 101,
+    IR_CONST_F32     = 102,
+    IR_CONST_F64     = 103,
+    IR_CONST_NULL    = 104,
+    IR_CONST_UNDEF   = 105,
+    IR_CONST_TRUE    = 106,
+    IR_CONST_FALSE   = 107,
+
+    /* Meta */
+    IR_PARAMETER     = 110,
+    IR_ARGUMENT      = 111,
+    IR_EFFECT        = 112,
+    IR_MEMORY        = 113,
+    IR_NOP           = 114,
+
+    IR_OPCODE_MAX    = 128
+} KyIROpcode;
+
+/* ============================================================
+ * Node flags
+ * ============================================================ */
+
+#define KYIR_FLAG_CONSTANT       (1u << 0)
+#define KYIR_FLAG_HAS_SIDE_EFFECT (1u << 1)
+#define KYIR_FLAG_CONTROL        (1u << 2)
+#define KYIR_FLAG_DEAD           (1u << 3)
+#define KYIR_FLAG_VISITED        (1u << 4)
+#define KYIR_FLAG_PINNED         (1u << 5)
+#define KYIR_FLAG_LOOP_INVARIANT (1u << 6)
+#define KYIR_FLAG_ELIMINATED     (1u << 7)
+
+/* ============================================================
+ * Type lattice
+ * ============================================================ */
+
+typedef enum {
+    KYIR_TYPE_UNKNOWN   = 0,
+    KYIR_TYPE_INT32     = 1,
+    KYIR_TYPE_INT64     = 2,
+    KYIR_TYPE_FLOAT32   = 3,
+    KYIR_TYPE_FLOAT64   = 4,
+    KYIR_TYPE_PTR       = 5,
+    KYIR_TYPE_OBJECT    = 6,
+    KYIR_TYPE_ARRAY     = 7,
+    KYIR_TYPE_STRING    = 8,
+    KYIR_TYPE_FUNCTION  = 9,
+    KYIR_TYPE_NULL      = 10,
+    KYIR_TYPE_UNDEFINED = 11,
+    KYIR_TYPE_BOOLEAN   = 12,
+    KYIR_TYPE_ANY       = 13
+} KyIRType;
+
+/* ============================================================
+ * Forward declarations
+ * ============================================================ */
+
+typedef struct KyNode KyNode;
+typedef struct KyBlock KyBlock;
+typedef struct KyGraph KyGraph;
+
+/* ============================================================
+ * Node — the fundamental unit
+ * ============================================================ */
+
+struct KyNode {
+    /* Identity */
+    uint32_t  id;
+    uint16_t  opcode;
+    uint16_t  flags;
+    KyIRType  type;
+
+    /* Tri-edge inputs */
+    KyNode  **value_inputs;
+    KyNode  **control_inputs;
+    KyNode  **effect_inputs;
+
+    uint16_t  num_values;
+    uint16_t  num_controls;
+    uint16_t  num_effects;
+    uint16_t  _pad;
+
+    /* Uses (reverse edges) */
+    KyNode  **uses;
+    uint16_t  num_uses;
+    uint16_t  use_capacity;
+
+    /* Constant payload */
+    union {
+        int32_t  i32;
+        int64_t  i64;
+        float    f32;
+        double   f64;
+        void    *ptr;
+    } constant;
+
+    /* Scheduling (filled in later) */
+    KyBlock  *block;
+    uint32_t  schedule_idx;
+
+    /* Codegen (filled in later) */
+    int32_t   reg;
+    int32_t   stack_slot;
+};
+
+/* ============================================================
+ * Block — control flow container
+ * ============================================================ */
+
+struct KyBlock {
+    uint32_t  id;
+
+    KyBlock **successors;
+    KyBlock **predecessors;
+    uint16_t  num_successors;
+    uint16_t  num_pred_capacity;
+    uint16_t  num_predecessors;
+    uint16_t  num_succ_capacity;
+
+    KyNode  **nodes;
+    uint32_t  num_nodes;
+    uint32_t  node_capacity;
+
+    KyBlock  *idom;
+    uint32_t  dom_depth;
+};
+
+/* ============================================================
+ * Graph — the whole program
+ * ============================================================ */
+
+struct KyGraph {
+    KyNode  **nodes;
+    uint32_t  node_count;
+    uint32_t  node_capacity;
+
+    KyBlock **blocks;
+    uint32_t  block_count;
+    uint32_t  block_capacity;
+
+    KyNode   *start;
+    KyNode   *end;
+};
+
+/* ============================================================
+ * API — Graph
+ * ============================================================ */
+
+KyGraph *kyir_graph_create(void);
+void     kyir_graph_destroy(KyGraph *g);
+
+/* ============================================================
+ * API — Nodes
+ * ============================================================ */
+
+KyNode *kyir_node_create(KyGraph *g, KyIROpcode opcode);
+void    kyir_node_add_value_input(KyNode *n, KyNode *input);
+void    kyir_node_add_control_input(KyNode *n, KyNode *input);
+void    kyir_node_add_effect_input(KyNode *n, KyNode *input);
+void    kyir_node_add_use(KyNode *n, KyNode *use);
+
+/* Convenience constructors */
+KyNode *kyir_const_i64(KyGraph *g, int64_t value);
+KyNode *kyir_add(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_sub(KyGraph *g, KyNode *a, KyNode *b);
+KyNode *kyir_mul(KyGraph *g, KyNode *a, KyNode *b);
+
+/* Debug */
+void kyir_node_print(const KyNode *n);
+void kyir_graph_print(const KyGraph *g);
+
+/* Utility */
+uint32_t kyir_node_use_count(const KyNode *n);
+
+/* ============================================================
+ * Layer 2: Blocks and Control Flow
+ * ============================================================ */
+
+KyBlock *kyir_block_create(KyGraph *g);
+void     kyir_block_add_node(KyBlock *b, KyNode *n);
+void     kyir_block_add_successor(KyBlock *b, KyBlock *succ);
+void     kyir_block_add_predecessor(KyBlock *b, KyBlock *pred);
+void     kyir_block_set_terminator(KyBlock *b, KyNode *n);
+void     kyir_block_print(const KyBlock *b);
+
+/* ============================================================
+ * Layer 3: Dominator Tree
+ * ============================================================ */
+
+typedef struct KyDomTree {
+    KyBlock **idom;
+    uint32_t *dom_depth;
+    uint32_t *postorder;
+    uint32_t *postorder_num;
+    uint32_t  num_blocks;
+} KyDomTree;
+
+KyDomTree *kyir_domtree_build(KyGraph *g);
+void       kyir_domtree_destroy(KyDomTree *dt);
+int        kyir_domtree_dominates(KyDomTree *dt, KyBlock *a, KyBlock *b);
+KyBlock   *kyir_domtree_lca(KyDomTree *dt, KyBlock *a, KyBlock *b);
+
+/* ============================================================
+ * Layer 4: SSA Construction
+ * ============================================================ */
+
+int  kyir_ssa_construct(KyGraph *g);   /* Returns 0 on success */
+int  kyir_ssa_insert_phis(KyGraph *g);
+
+/* ============================================================
+ * Layer 5: AST/Bytecode → IR Builder
+ * ============================================================ */
+
+typedef struct KyIRBuilder KyIRBuilder;
+
+struct KyIRBuilder {
+    KyGraph *graph;
+    KyBlock *current_block;
+    KyNode  *current_control;
+    KyNode  *current_memory;
+
+    /* Variable → node map */
+    KyNode **var_nodes;
+    uint32_t num_vars;
+    uint32_t var_capacity;
+
+    /* Loop stack */
+    KyBlock **loop_stack;
+    uint32_t  loop_depth;
+};
+
+KyIRBuilder *kyir_builder_create(KyGraph *g);
+void         kyir_builder_destroy(KyIRBuilder *b);
+void         kyir_builder_set_block(KyIRBuilder *b, KyBlock *block);
+KyNode      *kyir_builder_get_var(KyIRBuilder *b, uint32_t var_id);
+void         kyir_builder_set_var(KyIRBuilder *b, uint32_t var_id, KyNode *value);
+
+/* High-level IR builders */
+KyNode *kyir_build_const(KyIRBuilder *b, int64_t value);
+KyNode *kyir_build_add(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_sub(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_mul(KyIRBuilder *b, KyNode *a, KyNode *c);
+KyNode *kyir_build_return(KyIRBuilder *b, KyNode *value);
+
+/* ============================================================
+ * Layer 6: Optimizations
+ * ============================================================ */
+
+/* Constant folding: fold ADD/SUB/MUL of constants */
+int kyir_opt_constfold(KyGraph *g);
+
+/* Algebraic simplify: x+0=x, x*1=x, x*0=0, x-x=0 */
+int kyir_opt_algebraic(KyGraph *g);
+
+/* Dead code elimination */
+int kyir_opt_dce(KyGraph *g);
+
+/* Global value numbering (basic) */
+int kyir_opt_gvn(KyGraph *g);
+
+/* Run all optimizations until fixed point */
+int kyir_optimize(KyGraph *g);
+
+/* ============================================================
+ * Layer 7: Graph Verifier
+ * ============================================================ */
+
+typedef struct KyVerifyResult {
+    int ok;
+    uint32_t errors;
+    char messages[16][128];
+} KyVerifyResult;
+
+KyVerifyResult kyir_graph_verify(KyGraph *g);
+
+/* ============================================================
+ * Utility
+ * ============================================================ */
+
+uint32_t kyir_node_use_count(const KyNode *n);
+void     kyir_node_remove_use(KyNode *n, KyNode *use);
+void     kyir_node_replace_uses(KyGraph *g, KyNode *old_node, KyNode *new_node);
+int      kyir_node_is_constant(const KyNode *n);
+int64_t  kyir_node_const_i64(const KyNode *n);
+
+/* ============================================================
+ * Layer 8: SSA Construction
+ *
+ * Braun et al. algorithm:
+ *   1. Compute dominance frontiers
+ *   2. Insert phi nodes at dominance frontiers
+ *   3. Rename variables via dominator tree DFS
+ * ============================================================ */
+
+typedef struct KyDominanceFrontier {
+    KyBlock **frontier;
+    uint32_t  num_blocks;
+    uint32_t  capacity;
+} KyDominanceFrontier;
+
+typedef struct KySSAContext {
+    KyGraph    *graph;
+    KyDomTree  *domtree;
+    KyBlock   **blocks;       /* RPO order */
+
+    /* Dominance frontiers per block */
+    KyDominanceFrontier *df;
+
+    /* Current variable definitions (stack of versions) */
+    struct {
+        KyNode **defs;        /* stack of definitions */
+        uint32_t depth;
+        uint32_t capacity;
+    } *var_defs;
+    uint32_t num_vars;
+
+    /* Phi nodes inserted */
+    KyNode **phis;
+    uint32_t num_phis;
+    uint32_t phi_capacity;
+} KySSAContext;
+
+/* Compute dominance frontiers */
+KyDominanceFrontier *kyir_domfrontier_build(KyGraph *g, KyDomTree *dt);
+void kyir_domfrontier_destroy(KyDominanceFrontier *df);
+
+/* SSA construction */
+KySSAContext *kyir_ssa_create(KyGraph *g, KyDomTree *dt);
+void          kyir_ssa_destroy(KySSAContext *ssa);
+
+/* Main SSA construction entry point */
+int kyir_ssa_construct_full(KyGraph *g);
+
+/* Phi node creation */
+KyNode *kyir_phi_create(KyGraph *g, uint32_t num_inputs);
+
+/* SSA print */
+void kyir_ssa_print(KySSAContext *ssa);
+
+#endif /* KYJIT_IR_H */

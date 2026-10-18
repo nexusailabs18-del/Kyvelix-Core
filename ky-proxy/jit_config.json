@@ -1,0 +1,17 @@
+{
+  "jit_engine_path": "/home/kumarr/kyjit-engine",
+  "enabled": false,
+  "models": {
+    "tinyllama": "models/text/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    "phi2": "models/text/phi-2.Q4_K_M.gguf",
+    "mistral": "models/text/mistral-7b-v0.1.Q4_K_M.gguf"
+  },
+  "on_demand": {
+    "enabled": true,
+    "cache_size": 1000
+  },
+  "jit": {
+    "speed": "1000 tokens/sec",
+    "integration_point": "src/ai/jit_integration.rs"
+  }
+}

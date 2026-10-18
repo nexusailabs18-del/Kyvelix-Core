@@ -1,0 +1,14 @@
+// Tiled kernel template
+// {{BODY}}
+
+// Tiling parameters
+#define TILE_SIZE {{TILE_SIZE}}
+
+{{#if OPENMP}}
+#include <omp.h>
+#endif
+
+void kernel_{{KERNEL_NAME}}_tiled_{{TILE_SIZE}}({{ARGS}}) {
+    // Tiled implementation with tile size {{TILE_SIZE}}
+    {{TILED_BODY}}
+}

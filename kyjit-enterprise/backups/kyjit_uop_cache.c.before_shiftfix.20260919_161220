@@ -1,0 +1,418 @@
+#define _GNU_SOURCE
+#include "kyjit_uop_cache.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <stdio.h>
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+
+/* ============================================================
+ * Helpers
+ * ============================================================ */
+
+static inline uint32_t kyuop_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* Return low 32 bits of ns — good enough for LRU */
+    return (uint32_t)(ts.tv_nsec ^ (ts.tv_sec * 1000000000ULL));
+}
+
+/* ============================================================
+ * Forward declarations
+ * ============================================================ */
+
+#if defined(__x86_64__) || defined(__amd64__)
+static size_t kyuop_emit(uint8_t *code, const uint8_t *bytecode, size_t len);
+#endif
+
+/* ============================================================
+ * Create / Destroy
+ * ============================================================ */
+
+KyUopCache *kyuop_create(void)
+{
+    KyUopCache *c = (KyUopCache *)calloc(1, sizeof(KyUopCache));
+    if (!c) return NULL;
+
+    /* Allocate arena: RWX via mmap */
+    c->arena = (uint8_t *)mmap(NULL, KYUOP_ARENA_SIZE,
+                                PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (c->arena == MAP_FAILED) {
+        free(c);
+        return NULL;
+    }
+    c->arena_size = KYUOP_ARENA_SIZE;
+    c->arena_used = 0;
+
+    /* Allocate block metadata */
+    c->blocks = (KyUopBlock *)calloc(KYUOP_MAX_BLOCKS, sizeof(KyUopBlock));
+    if (!c->blocks) {
+        munmap(c->arena, KYUOP_ARENA_SIZE);
+        free(c);
+        return NULL;
+    }
+    c->block_capacity = KYUOP_MAX_BLOCKS;
+    c->block_count = 0;
+
+    /* Empty LRU list */
+    c->lru_head = KYUOP_INVALID;
+    c->lru_tail = KYUOP_INVALID;
+
+    return c;
+}
+
+void kyuop_destroy(KyUopCache *cache)
+{
+    if (!cache) return;
+    if (cache->arena) munmap(cache->arena, cache->arena_size);
+    if (cache->blocks) free(cache->blocks);
+    free(cache);
+}
+
+/* ============================================================
+ * Lookup (fast path, target < 5 ns)
+ * ============================================================ */
+
+KyUopBlock *kyuop_lookup(KyUopCache *cache, uint64_t pattern_hash)
+{
+    if (KYUOP_UNLIKELY(cache == NULL)) return NULL;
+    if (KYUOP_UNLIKELY(pattern_hash == 0)) return NULL;
+
+    /* Hash: top 10 bits → 1024 slots */
+    uint32_t idx = (uint32_t)(pattern_hash >> 54) & (KYUOP_HASH_SLOTS - 1);
+
+    /* Fast path: single compare */
+    if (KYUOP_LIKELY(cache->hash_keys[idx] == pattern_hash)) {
+        uint16_t blk = cache->hash_values[idx];
+        KyUopBlock *b = &cache->blocks[blk];
+        b->hit_count++;
+        b->last_used = kyuop_now_ns();
+        cache->hits++;
+        return b;
+    }
+
+    /* Linear probe (up to 4) */
+    for (int i = 1; i < 16; i++) {
+        uint32_t p = (idx + i) & (KYUOP_HASH_SLOTS - 1);
+        if (cache->hash_keys[p] == pattern_hash) {
+            uint16_t blk = cache->hash_values[p];
+            cache->hits++;
+            return &cache->blocks[blk];
+        }
+    }
+
+    cache->misses++;
+    return NULL;
+}
+
+/* ============================================================
+ * Execute
+ * ============================================================ */
+
+typedef int64_t (*KyUopFn)(int64_t, int64_t);
+
+int64_t kyuop_execute(KyUopCache *cache, uint64_t pattern_hash,
+                      int64_t a, int64_t b)
+{
+    KyUopBlock *b_block = kyuop_lookup(cache, pattern_hash);
+    if (!b_block) return 0;
+    KyUopFn fn = (KyUopFn)b_block->native_code;
+    return fn(a, b);
+}
+
+/* ============================================================
+ * Hash helper
+ * ============================================================ */
+
+uint64_t kyuop_hash_pattern(const uint8_t *bytecode, size_t len)
+{
+    /* FNV-1a 64-bit */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= bytecode[i];
+        h *= 0x100000001b3ULL;
+    }
+    /* Final avalanche (splitmix64 finalizer) for better distribution */
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    if (h == 0) h = 1;
+    return h;
+}
+
+/* ============================================================
+ * Compile (uses x86-64 emitter)
+ * ============================================================ */
+
+KyUopBlock *kyuop_compile(KyUopCache *cache, uint64_t pattern_hash,
+                          const uint8_t *bytecode, size_t len)
+{
+    if (!cache || !pattern_hash || !bytecode || len == 0) return NULL;
+    if (cache->block_count >= cache->block_capacity) return NULL;
+
+    /* Reserve space in arena */
+    size_t max_bytes = len * 16 + 16;
+    if (max_bytes > KYUOP_MAX_BLOCK_SIZE) max_bytes = KYUOP_MAX_BLOCK_SIZE;
+    if (cache->arena_used + max_bytes > cache->arena_size) return NULL;
+
+    uint8_t *code = cache->arena + cache->arena_used;
+
+#if defined(__x86_64__) || defined(__amd64__)
+    size_t emitted = kyuop_emit(code, bytecode, len);
+#else
+    /* Fallback: stub returning a+b */
+    code[0] = 0x48; code[1] = 0x89; code[2] = 0xF8;
+    code[3] = 0x48; code[4] = 0x01; code[5] = 0xF0;
+    code[6] = 0xC3;
+    size_t emitted = 7;
+#endif
+
+    /* Pad to 16-byte boundary */
+    size_t padded = (emitted + 15) & ~15u;
+    for (size_t j = emitted; j < padded; j++) code[j] = 0x90;
+    cache->arena_used += padded;
+
+    /* Allocate block metadata */
+    uint32_t blk_idx = cache->block_count++;
+    KyUopBlock *b = &cache->blocks[blk_idx];
+    b->pattern_hash = pattern_hash;
+    b->native_code = code;
+    b->native_size = (uint16_t)emitted;
+    b->bytecode_size = (uint16_t)len;
+    b->hit_count = 0;
+    b->last_used = kyuop_now_ns();
+    b->prev_lru = KYUOP_INVALID;
+    b->next_lru = KYUOP_INVALID;
+
+    /* Insert into hash table */
+    uint32_t idx = (uint32_t)(pattern_hash >> 54) & (KYUOP_HASH_SLOTS - 1);
+    while (cache->hash_keys[idx] != 0) {
+        idx = (idx + 1) & (KYUOP_HASH_SLOTS - 1);
+    }
+    cache->hash_keys[idx] = pattern_hash;
+    cache->hash_values[idx] = (uint16_t)blk_idx;
+    cache->hash_count++;
+
+    /* Add to LRU list */
+    b->next_lru = cache->lru_head;
+    b->prev_lru = KYUOP_INVALID;
+    if (cache->lru_head != KYUOP_INVALID) {
+        cache->blocks[cache->lru_head].prev_lru = (uint16_t)blk_idx;
+    }
+    cache->lru_head = (uint16_t)blk_idx;
+    if (cache->lru_tail == KYUOP_INVALID) {
+        cache->lru_tail = (uint16_t)blk_idx;
+    }
+
+    cache->compilations++;
+    return b;
+}
+
+/* ============================================================
+ * Stats
+ * ============================================================ */
+
+uint32_t kyuop_count(const KyUopCache *cache)
+{
+    return cache ? cache->block_count : 0;
+}
+
+size_t kyuop_size(const KyUopCache *cache)
+{
+    return cache ? cache->arena_used : 0;
+}
+
+void kyuop_get_stats(const KyUopCache *cache, KyUopStats *out)
+{
+    if (!cache || !out) return;
+    out->hits = cache->hits;
+    out->misses = cache->misses;
+    out->compilations = cache->compilations;
+    out->evictions = cache->evictions;
+    out->block_count = cache->block_count;
+    out->arena_used = cache->arena_used;
+}
+
+/* ============================================================
+ * x86-64 μOp emitter
+ * ============================================================ */
+
+#if defined(__x86_64__) || defined(__amd64__)
+
+static size_t kyuop_emit(uint8_t *code, const uint8_t *bytecode, size_t len)
+{
+    uint8_t *p = code;
+    size_t i = 0;
+
+    while (i < len) {
+        uint8_t op = bytecode[i];
+
+        if (op == UOP_ADD_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;   /* mov rax, rdi */
+            p[0]=0x48; p[1]=0x01; p[2]=0xF0; p += 3;   /* add rax, rsi */
+            i++;
+        } else if (op == UOP_SUB_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;
+            p[0]=0x48; p[1]=0x29; p[2]=0xF0; p += 3;
+            i++;
+        } else if (op == UOP_MUL_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;
+            p[0]=0x48; p[1]=0x0F; p[2]=0xAF; p[3]=0xC6; p += 4;   /* imul rax, rsi */
+            i++;
+        } else if (op == UOP_DIV_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;   /* mov rax, rdi */
+            p[0]=0x48; p[1]=0x99; p += 2;              /* cqo */
+            p[0]=0x48; p[1]=0xF7; p[2]=0xFE; p += 3;   /* idiv rsi */
+            i++;
+        } else if (op == UOP_INC_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;
+            p[0]=0x48; p[1]=0xFF; p[2]=0xC0; p += 3;   /* inc rax */
+            i++;
+        } else if (op == UOP_DEC_I64) {
+            p[0]=0x48; p[1]=0x89; p[2]=0xF8; p += 3;
+            p[0]=0x48; p[1]=0xFF; p[2]=0xC8; p += 3;   /* dec rax */
+            i++;
+        } else if (op == UOP_LOAD_FIELD && i + 5 <= len) {
+            uint32_t off; memcpy(&off, bytecode + i + 1, 4);
+            p[0]=0x48; p[1]=0x8B; p[2]=0x87;           /* mov rax, [rdi + disp32] */
+            memcpy(p + 3, &off, 4);
+            p += 7;
+            i += 5;
+        } else if (op == UOP_STORE_FIELD && i + 5 <= len) {
+            uint32_t off; memcpy(&off, bytecode + i + 1, 4);
+            p[0]=0x48; p[1]=0x89; p[2]=0xB7;           /* mov [rdi + disp32], rsi */
+            memcpy(p + 3, &off, 4);
+            p += 7;
+            p[0]=0x48; p[1]=0x89; p[2]=0xF0; p += 3;   /* mov rax, rsi */
+            i += 5;
+        } else if (op == UOP_LOAD_CONST && i + 9 <= len) {
+            int64_t v; memcpy(&v, bytecode + i + 1, 8);
+            p[0]=0x48; p[1]=0xB8;                      /* mov rax, imm64 */
+            memcpy(p + 2, &v, 8);
+            p += 10;
+            i += 9;
+        } else if (op == UOP_CMP_EQ) {
+            p[0]=0x48; p[1]=0x39; p[2]=0xF7; p += 3;   /* cmp rdi, rsi */
+            p[0]=0x0F; p[1]=0x94; p[2]=0xC0; p += 3;   /* sete al */
+            p[0]=0x48; p[1]=0x0F; p[2]=0xB6; p[3]=0xC0; p += 4;  /* movzx rax, al */
+            i++;
+        } else if (op == UOP_RETURN) {
+            p[0]=0xC3; p += 1;
+            i++;
+        } else {
+            i++;
+        }
+    }
+
+    if (p == code || p[-1] != 0xC3) {
+        *p++ = 0xC3;
+    }
+
+    __builtin___clear_cache((char *)code, (char *)p);
+    return (size_t)(p - code);
+}
+
+#else /* not x86-64 */
+
+static size_t kyuop_emit(uint8_t *code, const uint8_t *bytecode, size_t len)
+{
+    /* Stub: returns a + b */
+    (void)bytecode; (void)len;
+    code[0]=0x48; code[1]=0x89; code[2]=0xF8;
+    code[3]=0x48; code[4]=0x01; code[5]=0xF0;
+    code[6]=0xC3;
+    return 7;
+}
+
+#endif
+
+/* ============================================================
+ * LRU eviction
+ * ============================================================ */
+
+static void kyuop_lru_push(KyUopCache *cache, uint16_t blk_idx)
+{
+    KyUopBlock *b = &cache->blocks[blk_idx];
+    b->prev_lru = KYUOP_INVALID;
+    b->next_lru = cache->lru_head;
+    if (cache->lru_head != KYUOP_INVALID) {
+        cache->blocks[cache->lru_head].prev_lru = blk_idx;
+    }
+    cache->lru_head = blk_idx;
+    if (cache->lru_tail == KYUOP_INVALID) {
+        cache->lru_tail = blk_idx;
+    }
+}
+
+static void kyuop_lru_remove(KyUopCache *cache, uint16_t blk_idx)
+{
+    KyUopBlock *b = &cache->blocks[blk_idx];
+    if (b->prev_lru != KYUOP_INVALID) {
+        cache->blocks[b->prev_lru].next_lru = b->next_lru;
+    } else {
+        cache->lru_head = b->next_lru;
+    }
+    if (b->next_lru != KYUOP_INVALID) {
+        cache->blocks[b->next_lru].prev_lru = b->prev_lru;
+    } else {
+        cache->lru_tail = b->prev_lru;
+    }
+    b->prev_lru = KYUOP_INVALID;
+    b->next_lru = KYUOP_INVALID;
+}
+
+/* Evict 25% of least-recently-used blocks */
+int kyuop_evict(KyUopCache *cache)
+{
+    if (!cache) return 0;
+    uint32_t to_evict = cache->block_count / 4;
+    if (to_evict == 0) to_evict = 1;
+
+    uint32_t evicted = 0;
+    uint32_t remaining = cache->block_count;
+
+    while (evicted < to_evict && cache->lru_tail != KYUOP_INVALID) {
+        uint16_t victim = cache->lru_tail;
+        KyUopBlock *b = &cache->blocks[victim];
+
+        /* Remove from hash table */
+        uint32_t idx = (uint32_t)(b->pattern_hash >> 54) & (KYUOP_HASH_SLOTS - 1);
+        for (uint32_t probe = 0; probe < 32; probe++) {
+            if (cache->hash_keys[idx] == b->pattern_hash) {
+                cache->hash_keys[idx] = 0;
+                cache->hash_values[idx] = 0;
+                if (cache->hash_count > 0) cache->hash_count--;
+                break;
+            }
+            idx = (idx + 1) & (KYUOP_HASH_SLOTS - 1);
+        }
+
+        /* Remove from LRU list */
+        kyuop_lru_remove(cache, victim);
+
+        /* Mark block as free */
+        b->pattern_hash = 0;
+        b->native_code = NULL;
+        b->hit_count = 0;
+        evicted++;
+        remaining--;
+    }
+
+    /* Compact: shift remaining blocks down (skip for now, simpler to leave gaps) */
+
+    cache->evictions += evicted;
+    return (int)evicted;
+}
+
+uint64_t kyuop_evictions(const KyUopCache *cache)
+{
+    return cache ? cache->evictions : 0;
+}

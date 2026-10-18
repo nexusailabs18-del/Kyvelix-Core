@@ -1,0 +1,16 @@
+{
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/include",
+        "/usr/include",
+        "/usr/include/x86_64-linux-gnu"
+    ],
+    "C_Cpp.default.defines": [
+        "_POSIX_C_SOURCE=200112L",
+        "_DEFAULT_SOURCE"
+    ],
+    "C_Cpp.default.cStandard": "c11",
+    "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+    "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+    "C_Cpp.errorSquiggles": "enabled"
+}

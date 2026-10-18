@@ -1,0 +1,837 @@
+/*
+ * test_ops.c — functional test for Batch 1 ops:
+ *   SHL, SHR, SAR, NEG, NOT
+ *
+ * Each test builds IR, compiles to x86-64, executes the resulting
+ * function, and verifies the return value matches the expected
+ * arithmetic result.
+ */
+
+#include "kyjit_ir.h"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <stdint.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+/* Build IR: return <binop>(param0, const shift); */
+static KyGraph *build_shift(KyIROpcode op, int64_t shift) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *arg = kyir_node_create(g, IR_PARAMETER);
+    arg->constant.i64 = 0;
+    arg->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, arg);
+
+    KyNode *amt = kyir_const_i64(g, shift);
+    kyir_block_add_node(b0, amt);
+
+    KyNode *res = NULL;
+    switch (op) {
+        case IR_SHL: res = kyir_shl(g, arg, amt); break;
+        case IR_SHR: res = kyir_shr(g, arg, amt); break;
+        case IR_SAR: res = kyir_sar(g, arg, amt); break;
+        default: break;
+    }
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+
+    return g;
+}
+
+/* Build IR: return <unop>(param0); */
+static KyGraph *build_unop(KyIROpcode op) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *arg = kyir_node_create(g, IR_PARAMETER);
+    arg->constant.i64 = 0;
+    arg->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, arg);
+
+    KyNode *res = NULL;
+    switch (op) {
+        case IR_NEG_I64: res = kyir_neg(g, arg); break;
+        case IR_NOT:     res = kyir_not(g, arg); break;
+        default: break;
+    }
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+
+    return g;
+}
+
+/* Build IR: return <binop>(param0, param1); */
+static KyGraph *build_binop_params(KyIROpcode op) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0;
+    a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+
+    KyNode *c = kyir_node_create(g, IR_PARAMETER);
+    c->constant.i64 = 1;
+    c->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, c);
+
+    KyNode *res = NULL;
+    switch (op) {
+        case IR_DIV_I64: res = kyir_div(g, a, c); break;
+        case IR_MOD_I64: res = kyir_mod(g, a, c); break;
+        case IR_CMP_EQ:  res = kyir_cmp_eq(g, a, c); break;
+        case IR_CMP_NE:  res = kyir_cmp_ne(g, a, c); break;
+        case IR_CMP_LT:  res = kyir_cmp_lt(g, a, c); break;
+        case IR_CMP_LE:  res = kyir_cmp_le(g, a, c); break;
+        case IR_CMP_GT:  res = kyir_cmp_gt(g, a, c); break;
+        case IR_CMP_GE:  res = kyir_cmp_ge(g, a, c); break;
+        default: break;
+    }
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+
+    return g;
+}
+
+/* Compile + execute f(int64_t) -> int64_t */
+static int64_t run1(KyGraph *g, int64_t arg, int *ok) {
+    *ok = 0;
+    if (!g) return 0;
+    void *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return 0;
+
+    size_t len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &len);
+    if (rc != 0 || len == 0) { munmap(code, 4096); return 0; }
+
+    typedef int64_t (*Fn1)(int64_t);
+    Fn1 f = (Fn1)code;
+    int64_t r = f(arg);
+
+    munmap(code, 4096);
+    *ok = 1;
+    return r;
+}
+
+/* Compile + execute f(int64_t, int64_t) -> int64_t */
+static int64_t run2(KyGraph *g, int64_t a, int64_t c, int *ok) {
+    *ok = 0;
+    if (!g) return 0;
+    void *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return 0;
+
+    size_t len = 0;
+    int rc = kyx64_compile(g, (uint8_t *)code, 4096, &len);
+    if (rc != 0 || len == 0) { munmap(code, 4096); return 0; }
+
+    typedef int64_t (*Fn2)(int64_t, int64_t);
+    Fn2 f = (Fn2)code;
+    int64_t r = f(a, c);
+
+    munmap(code, 4096);
+    *ok = 1;
+    return r;
+}
+
+int test_batch4(void);
+int test_batch5(void);
+
+int main(void) {
+    printf("KYJIT Op Functional Test — Batch 1 v%s\n", KYIR_VERSION_STRING);
+    printf("========================================\n");
+
+    KyGraph *g;
+    int64_t r;
+    int ok;
+
+    /* ------------ SHL ------------ */
+    printf("\n[SHL: param0 << 4]\n");
+    g = build_shift(IR_SHL, 4);
+    r = run1(g, 16, &ok);
+    printf("  16 << 4 = %ld (expect 256)\n", (long)r);
+    TEST("shl compiled and ran", ok);
+    TEST("shl(16, 4) == 256", r == 256);
+    kyir_graph_destroy(g);
+
+    g = build_shift(IR_SHL, 1);
+    r = run1(g, 1, &ok);
+    printf("  1 << 1 = %ld (expect 2)\n", (long)r);
+    TEST("shl(1, 1) == 2", r == 2);
+    kyir_graph_destroy(g);
+
+    /* ------------ SHR ------------ */
+    printf("\n[SHR: param0 >> 4 (logical)]\n");
+    g = build_shift(IR_SHR, 4);
+    r = run1(g, 256, &ok);
+    printf("  256 >> 4 = %ld (expect 16)\n", (long)r);
+    TEST("shr compiled and ran", ok);
+    TEST("shr(256, 4) == 16", r == 16);
+    kyir_graph_destroy(g);
+
+    g = build_shift(IR_SHR, 1);
+    /* 0x8000000000000000 >> 1 should be 0x4000000000000000 (logical, no sign) */
+    r = run1(g, (int64_t)0x8000000000000000LL, &ok);
+    printf("  0x8000000000000000 >> 1 = 0x%016lx (expect 0x4000000000000000)\n",
+           (unsigned long)r);
+    TEST("shr is logical (no sign fill)", r == (int64_t)0x4000000000000000LL);
+    kyir_graph_destroy(g);
+
+    /* ------------ SAR ------------ */
+    printf("\n[SAR: param0 >> 2 (arithmetic)]\n");
+    g = build_shift(IR_SAR, 2);
+    r = run1(g, -16, &ok);
+    printf("  -16 >> 2 = %ld (expect -4)\n", (long)r);
+    TEST("sar compiled and ran", ok);
+    TEST("sar(-16, 2) == -4", r == -4);
+    kyir_graph_destroy(g);
+
+    g = build_shift(IR_SAR, 1);
+    r = run1(g, (int64_t)0x8000000000000000LL, &ok);
+    printf("  0x8000000000000000 >>arith 1 = 0x%016lx (expect 0xC000000000000000)\n",
+           (unsigned long)r);
+    TEST("sar sign-extends", r == (int64_t)0xC000000000000000LL);
+    kyir_graph_destroy(g);
+
+    /* ------------ NEG ------------ */
+    printf("\n[NEG: -param0]\n");
+    g = build_unop(IR_NEG_I64);
+    r = run1(g, 42, &ok);
+    printf("  -42 = %ld (expect -42)\n", (long)r);
+    TEST("neg compiled and ran", ok);
+    TEST("neg(42) == -42", r == -42);
+    kyir_graph_destroy(g);
+
+    g = build_unop(IR_NEG_I64);
+    r = run1(g, -100, &ok);
+    printf("  -(-100) = %ld (expect 100)\n", (long)r);
+    TEST("neg(-100) == 100", r == 100);
+    kyir_graph_destroy(g);
+
+    /* ------------ NOT ------------ */
+    printf("\n[NOT: ~param0]\n");
+    g = build_unop(IR_NOT);
+    r = run1(g, 0, &ok);
+    printf("  ~0 = %ld (expect -1)\n", (long)r);
+    TEST("not compiled and ran", ok);
+    TEST("not(0) == -1", r == -1);
+    kyir_graph_destroy(g);
+
+    g = build_unop(IR_NOT);
+    r = run1(g, (int64_t)0xF0F0F0F0F0F0F0F0LL, &ok);
+    printf("  ~0xF0...F0 = 0x%016lx (expect 0x0F0F0F0F0F0F0F0F)\n",
+           (unsigned long)r);
+    TEST("not alternates bits", r == (int64_t)0x0F0F0F0F0F0F0F0FLL);
+    kyir_graph_destroy(g);
+
+    /* ------------ DIV ------------ */
+    printf("\n[DIV: param0 / param1 (signed)]\n");
+    g = build_binop_params(IR_DIV_I64);
+    r = run2(g, 100, 7, &ok);
+    printf("  100 / 7 = %ld (expect 14)\n", (long)r);
+    TEST("div compiled and ran", ok);
+    TEST("100 / 7 == 14", r == 14);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_DIV_I64);
+    r = run2(g, -100, 7, &ok);
+    printf("  -100 / 7 = %ld (expect -14)\n", (long)r);
+    TEST("signed: -100 / 7 == -14", r == -14);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_DIV_I64);
+    r = run2(g, 100, -7, &ok);
+    printf("  100 / -7 = %ld (expect -14)\n", (long)r);
+    TEST("signed: 100 / -7 == -14", r == -14);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_DIV_I64);
+    r = run2(g, -100, -7, &ok);
+    printf("  -100 / -7 = %ld (expect 14)\n", (long)r);
+    TEST("signed: -100 / -7 == 14", r == 14);
+    kyir_graph_destroy(g);
+
+    /* ------------ MOD ------------ */
+    printf("\n[MOD: param0 %% param1 (signed)]\n");
+    g = build_binop_params(IR_MOD_I64);
+    r = run2(g, 100, 7, &ok);
+    printf("  100 %% 7 = %ld (expect 2)\n", (long)r);
+    TEST("mod compiled and ran", ok);
+    TEST("100 %% 7 == 2", r == 2);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_MOD_I64);
+    r = run2(g, -100, 7, &ok);
+    printf("  -100 %% 7 = %ld (expect -2, signed)\n", (long)r);
+    TEST("signed: -100 %% 7 == -2", r == -2);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_MOD_I64);
+    r = run2(g, 100, -7, &ok);
+    printf("  100 %% -7 = %ld (expect 2, signed)\n", (long)r);
+    TEST("signed: 100 %% -7 == 2", r == 2);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_MOD_I64);
+    r = run2(g, 17, 5, &ok);
+    printf("  17 %% 5 = %ld (expect 2)\n", (long)r);
+    TEST("17 %% 5 == 2", r == 2);
+    kyir_graph_destroy(g);
+
+    /* ------------ Combined: (a / b) + (a % b) ------------ */
+    printf("\n[Combined: (a/b) + (a%%b)]\n");
+    {
+        KyGraph *gc = kyir_graph_create();
+        KyBlock *bc = kyir_block_create(gc);
+        KyNode *pa = kyir_node_create(gc, IR_PARAMETER);
+        pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pa);
+        KyNode *pb = kyir_node_create(gc, IR_PARAMETER);
+        pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pb);
+        KyNode *q = kyir_div(gc, pa, pb);
+        KyNode *rem = kyir_mod(gc, pa, pb);
+        KyNode *sum = kyir_add(gc, q, rem);
+        kyir_block_add_node(bc, q);
+        kyir_block_add_node(bc, rem);
+        kyir_block_add_node(bc, sum);
+        KyNode *ret = kyir_node_create(gc, IR_RETURN);
+        kyir_node_add_value_input(ret, sum);
+        kyir_node_add_use(sum, ret);
+        kyir_block_add_node(bc, ret);
+
+        r = run2(gc, 100, 7, &ok);
+        printf("  (100/7) + (100%%7) = %ld (expect 16)\n", (long)r);
+        TEST("combined graph compiles", ok);
+        TEST("(100/7)+(100%7) == 16", r == 16);
+
+        r = run2(gc, 255, 16, &ok);
+        printf("  (255/16) + (255%%16) = %ld (expect 30)\n", (long)r);
+        TEST("(255/16)+(255%16) == 30", r == 30);
+        kyir_graph_destroy(gc);
+    }
+
+    /* ------------ CMP EQ ------------ */
+    printf("\n[CMP_EQ: param0 == param1]\n");
+    g = build_binop_params(IR_CMP_EQ);
+    r = run2(g, 5, 5, &ok);
+    printf("  5 == 5 -> %ld (expect 1)\n", (long)r);
+    TEST("cmp_eq compiled and ran", ok);
+    TEST("5 == 5", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_EQ);
+    r = run2(g, 5, 6, &ok);
+    printf("  5 == 6 -> %ld (expect 0)\n", (long)r);
+    TEST("5 == 6", r == 0);
+    kyir_graph_destroy(g);
+
+    /* ------------ CMP NE ------------ */
+    printf("\n[CMP_NE: param0 != param1]\n");
+    g = build_binop_params(IR_CMP_NE);
+    r = run2(g, 5, 6, &ok);
+    printf("  5 != 6 -> %ld (expect 1)\n", (long)r);
+    TEST("5 != 6", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_NE);
+    r = run2(g, 5, 5, &ok);
+    printf("  5 != 5 -> %ld (expect 0)\n", (long)r);
+    TEST("5 != 5", r == 0);
+    kyir_graph_destroy(g);
+
+    /* ------------ CMP LT (signed) ------------ */
+    printf("\n[CMP_LT: param0 < param1 (signed)]\n");
+    g = build_binop_params(IR_CMP_LT);
+    r = run2(g, 3, 7, &ok);
+    printf("  3 < 7 -> %ld (expect 1)\n", (long)r);
+    TEST("3 < 7", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_LT);
+    r = run2(g, 7, 3, &ok);
+    printf("  7 < 3 -> %ld (expect 0)\n", (long)r);
+    TEST("7 < 3", r == 0);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_LT);
+    r = run2(g, -1, 0, &ok);
+    printf("  -1 < 0 -> %ld (expect 1, signed)\n", (long)r);
+    TEST("-1 < 0 (signed, not unsigned)", r == 1);
+    kyir_graph_destroy(g);
+
+    /* ------------ CMP LE ------------ */
+    printf("\n[CMP_LE: param0 <= param1]\n");
+    g = build_binop_params(IR_CMP_LE);
+    r = run2(g, 5, 5, &ok);
+    printf("  5 <= 5 -> %ld (expect 1)\n", (long)r);
+    TEST("5 <= 5", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_LE);
+    r = run2(g, 6, 5, &ok);
+    printf("  6 <= 5 -> %ld (expect 0)\n", (long)r);
+    TEST("6 <= 5", r == 0);
+    kyir_graph_destroy(g);
+
+    /* ------------ CMP GT ------------ */
+    printf("\n[CMP_GT: param0 > param1 (signed)]\n");
+    g = build_binop_params(IR_CMP_GT);
+    r = run2(g, 7, 3, &ok);
+    printf("  7 > 3 -> %ld (expect 1)\n", (long)r);
+    TEST("7 > 3", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_GT);
+    r = run2(g, 3, 7, &ok);
+    printf("  3 > 7 -> %ld (expect 0)\n", (long)r);
+    TEST("3 > 7", r == 0);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_GT);
+    r = run2(g, 1, -1, &ok);
+    printf("  1 > -1 -> %ld (expect 1, signed)\n", (long)r);
+    TEST("1 > -1 (signed)", r == 1);
+    kyir_graph_destroy(g);
+
+    /* ------------ CMP GE ------------ */
+    printf("\n[CMP_GE: param0 >= param1]\n");
+    g = build_binop_params(IR_CMP_GE);
+    r = run2(g, 5, 5, &ok);
+    printf("  5 >= 5 -> %ld (expect 1)\n", (long)r);
+    TEST("5 >= 5", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_binop_params(IR_CMP_GE);
+    r = run2(g, 4, 5, &ok);
+    printf("  4 >= 5 -> %ld (expect 0)\n", (long)r);
+    TEST("4 >= 5", r == 0);
+    kyir_graph_destroy(g);
+
+    /* ------------ Combined: (a < b) + (a == b)  ==  (a <= b) ------------ */
+    printf("\n[Combined: (a<b) + (a==b) == (a<=b)]\n");
+    {
+        KyGraph *gc = kyir_graph_create();
+        KyBlock *bc = kyir_block_create(gc);
+        KyNode *pa = kyir_node_create(gc, IR_PARAMETER);
+        pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pa);
+        KyNode *pb = kyir_node_create(gc, IR_PARAMETER);
+        pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pb);
+
+        KyNode *lt = kyir_cmp_lt(gc, pa, pb);
+        KyNode *eq = kyir_cmp_eq(gc, pa, pb);
+        KyNode *sum = kyir_add(gc, lt, eq);
+        kyir_block_add_node(bc, lt);
+        kyir_block_add_node(bc, eq);
+        kyir_block_add_node(bc, sum);
+
+        KyNode *ret = kyir_node_create(gc, IR_RETURN);
+        kyir_node_add_value_input(ret, sum);
+        kyir_node_add_use(sum, ret);
+        kyir_block_add_node(bc, ret);
+
+        r = run2(gc, 3, 7, &ok);
+        printf("  (3<7)+(3==7) = %ld (expect 1)\n", (long)r);
+        TEST("combined (3<7)+(3==7) == 1", r == 1);
+
+        r = run2(gc, 5, 5, &ok);
+        printf("  (5<5)+(5==5) = %ld (expect 1)\n", (long)r);
+        TEST("combined (5<5)+(5==5) == 1", r == 1);
+
+        r = run2(gc, 7, 3, &ok);
+        printf("  (7<3)+(7==3) = %ld (expect 0)\n", (long)r);
+        TEST("combined (7<3)+(7==3) == 0", r == 0);
+
+        kyir_graph_destroy(gc);
+    }
+
+    test_batch4();
+    test_batch5();
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+    return (tests_run == tests_passed) ? 0 : 1;
+}
+
+/* ============================================================
+ * Batch 4 tests: IMM AND/OR/XOR + ZEXT/SEXT
+ * These are appended after main() — declared as separate functions.
+ * We call them from a Batch 4 runner below.
+ * ============================================================ */
+
+/* --- Build "return op(param0, const);" for immediate AND/OR/XOR --- */
+static KyGraph *build_binop_const(KyIROpcode op, int64_t k) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0; a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+
+    KyNode *c = kyir_const_i64(g, k);
+    kyir_block_add_node(b0, c);
+
+    KyNode *res = NULL;
+    switch (op) {
+        case IR_AND: res = kyir_and(g, a, c); break;
+        case IR_OR:  res = kyir_or (g, a, c); break;
+        case IR_XOR: res = kyir_xor(g, a, c); break;
+        default: break;
+    }
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+    return g;
+}
+
+/* --- Build "return <op>(param0, src_bits);" for zext/sext --- */
+static KyGraph *build_extend(KyIROpcode op, int32_t src_bits) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0; a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+
+    KyNode *res = (op == IR_ZEXT) ? kyir_zext(g, a, src_bits)
+                                  : kyir_sext(g, a, src_bits);
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+    return g;
+}
+
+int test_batch4(void);
+int test_batch4(void) {
+    KyGraph *g;
+    int64_t r;
+    int ok;
+    int save_run = tests_run, save_pass = tests_passed;
+
+    /* ---------- Imm AND ---------- */
+    printf("\n[AND_IMM: param0 & 0x3C]\n");
+    g = build_binop_const(IR_AND, 0x3C);
+    r = run1(g, 0xF0, &ok);
+    printf("  0xF0 & 0x3C = %ld (expect %d)\n", (long)r, 0xF0 & 0x3C);
+    TEST("and_imm compiled and ran", ok);
+    TEST("0xF0 & 0x3C", r == (0xF0 & 0x3C));
+    kyir_graph_destroy(g);
+
+    g = build_binop_const(IR_AND, 0xFFFF);
+    r = run1(g, 0x12345678, &ok);
+    printf("  0x12345678 & 0xFFFF = 0x%lx (expect 0x5678)\n", (unsigned long)r);
+    TEST("mask low 16 bits", r == 0x5678);
+    kyir_graph_destroy(g);
+
+    /* ---------- Imm OR ---------- */
+    printf("\n[OR_IMM: param0 | 0x0F]\n");
+    g = build_binop_const(IR_OR, 0x0F);
+    r = run1(g, 0xF0, &ok);
+    printf("  0xF0 | 0x0F = 0x%lx (expect 0xFF)\n", (unsigned long)r);
+    TEST("0xF0 | 0x0F == 0xFF", r == 0xFF);
+    kyir_graph_destroy(g);
+
+    /* ---------- Imm XOR ---------- */
+    printf("\n[XOR_IMM: param0 ^ 0x0F]\n");
+    g = build_binop_const(IR_XOR, 0x0F);
+    r = run1(g, 0xFF, &ok);
+    printf("  0xFF ^ 0x0F = 0x%lx (expect 0xF0)\n", (unsigned long)r);
+    TEST("0xFF ^ 0x0F == 0xF0", r == 0xF0);
+    kyir_graph_destroy(g);
+
+    g = build_binop_const(IR_XOR, 0xFF);
+    r = run1(g, 0xFF, &ok);
+    printf("  0xFF ^ 0xFF = %ld (expect 0)\n", (long)r);
+    TEST("x ^ x == 0", r == 0);
+    kyir_graph_destroy(g);
+
+    /* ---------- ZEXT / SEXT byte ---------- */
+    printf("\n[ZEXT/SEXT byte (8-bit)]\n");
+    g = build_extend(IR_ZEXT, 8);
+    r = run1(g, 0xFF, &ok);
+    printf("  zext8(0xFF) = %ld (expect 255)\n", (long)r);
+    TEST("zext8(0xFF) == 255", r == 255);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_SEXT, 8);
+    r = run1(g, 0xFF, &ok);
+    printf("  sext8(0xFF) = %ld (expect -1)\n", (long)r);
+    TEST("sext8(0xFF) == -1", r == -1);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_ZEXT, 8);
+    r = run1(g, 0x80, &ok);
+    printf("  zext8(0x80) = %ld (expect 128)\n", (long)r);
+    TEST("zext8(0x80) == 128", r == 128);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_SEXT, 8);
+    r = run1(g, 0x80, &ok);
+    printf("  sext8(0x80) = %ld (expect -128)\n", (long)r);
+    TEST("sext8(0x80) == -128", r == -128);
+    kyir_graph_destroy(g);
+
+    /* ---------- ZEXT / SEXT word ---------- */
+    printf("\n[ZEXT/SEXT word (16-bit)]\n");
+    g = build_extend(IR_ZEXT, 16);
+    r = run1(g, 0xFFFF, &ok);
+    printf("  zext16(0xFFFF) = %ld (expect 65535)\n", (long)r);
+    TEST("zext16(0xFFFF) == 65535", r == 65535);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_SEXT, 16);
+    r = run1(g, 0xFFFF, &ok);
+    printf("  sext16(0xFFFF) = %ld (expect -1)\n", (long)r);
+    TEST("sext16(0xFFFF) == -1", r == -1);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_SEXT, 16);
+    r = run1(g, 0x8000, &ok);
+    printf("  sext16(0x8000) = %ld (expect -32768)\n", (long)r);
+    TEST("sext16(0x8000) == -32768", r == -32768);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_ZEXT, 16);
+    r = run1(g, 0x8000, &ok);
+    printf("  zext16(0x8000) = %ld (expect 32768)\n", (long)r);
+    TEST("zext16(0x8000) == 32768", r == 32768);
+    kyir_graph_destroy(g);
+
+    /* ---------- ZEXT dword (32-bit) ---------- */
+    printf("\n[ZEXT dword (32-bit)]\n");
+    g = build_extend(IR_ZEXT, 32);
+    r = run1(g, 0xFFFFFFFFL, &ok);
+    printf("  zext32(0xFFFFFFFF) = 0x%lx (expect 0xFFFFFFFF)\n",
+           (unsigned long)r);
+    TEST("zext32(0xFFFFFFFF) preserves low 32", r == 0xFFFFFFFFL);
+    kyir_graph_destroy(g);
+
+    g = build_extend(IR_ZEXT, 32);
+    r = run1(g, 0x12345678ABCDEF12L, &ok);
+    printf("  zext32(0x12345678ABCDEF12) = 0x%lx (expect 0xABCDEF12)\n",
+           (unsigned long)r);
+    TEST("zext32 masks to low 32", r == 0xABCDEF12L);
+    kyir_graph_destroy(g);
+
+    /* ---------- Combined: pack two bytes ---------- */
+    printf("\n[Combined: (a & 0xFF) | ((b & 0xFF) << 8)]\n");
+    {
+        KyGraph *gc = kyir_graph_create();
+        KyBlock *bc = kyir_block_create(gc);
+        KyNode *pa = kyir_node_create(gc, IR_PARAMETER);
+        pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pa);
+        KyNode *pb = kyir_node_create(gc, IR_PARAMETER);
+        pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pb);
+
+        KyNode *mask = kyir_const_i64(gc, 0xFF);
+        KyNode *mask_lo = kyir_and(gc, pa, mask);
+        KyNode *mask_hi = kyir_and(gc, pb, mask);
+        KyNode *shift   = kyir_const_i64(gc, 8);
+        KyNode *shifted = kyir_shl(gc, mask_hi, shift);
+        KyNode *packed  = kyir_or(gc, mask_lo, shifted);
+        kyir_block_add_node(bc, mask_lo);
+        kyir_block_add_node(bc, mask_hi);
+        kyir_block_add_node(bc, shifted);
+        kyir_block_add_node(bc, packed);
+
+        KyNode *ret = kyir_node_create(gc, IR_RETURN);
+        kyir_node_add_value_input(ret, packed);
+        kyir_node_add_use(packed, ret);
+        kyir_block_add_node(bc, ret);
+
+        r = run2(gc, 0xAB, 0xCD, &ok);
+        printf("  pack(0xAB, 0xCD) = 0x%lx (expect 0xCDAB)\n",
+               (unsigned long)r);
+        TEST("combined pack == 0xCDAB", r == 0xCDAB);
+        kyir_graph_destroy(gc);
+    }
+
+    (void)save_run; (void)save_pass;
+    return 0;
+}
+
+/* ============================================================
+ * Batch 5: Variable shifts (SHL/SHR/SAR by CL)
+ *
+ * These build IR with a runtime shift amount (param1) instead of a
+ * constant, exercising the CL-path in kyx64_select.
+ * ============================================================ */
+
+/* Build "return <shiftop>(param0, param1)" — both are parameters. */
+static KyGraph *build_shift_runtime(KyIROpcode op) {
+    KyGraph *g = kyir_graph_create();
+    KyBlock *b0 = kyir_block_create(g);
+
+    KyNode *a = kyir_node_create(g, IR_PARAMETER);
+    a->constant.i64 = 0; a->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, a);
+
+    KyNode *s = kyir_node_create(g, IR_PARAMETER);
+    s->constant.i64 = 1; s->type = KYIR_TYPE_INT64;
+    kyir_block_add_node(b0, s);
+
+    KyNode *res = NULL;
+    switch (op) {
+        case IR_SHL: res = kyir_shl(g, a, s); break;
+        case IR_SHR: res = kyir_shr(g, a, s); break;
+        case IR_SAR: res = kyir_sar(g, a, s); break;
+        default: break;
+    }
+    if (!res) { kyir_graph_destroy(g); return NULL; }
+    kyir_block_add_node(b0, res);
+
+    KyNode *ret = kyir_node_create(g, IR_RETURN);
+    kyir_node_add_value_input(ret, res);
+    kyir_node_add_use(res, ret);
+    kyir_block_add_node(b0, ret);
+    return g;
+}
+
+int test_batch5(void) {
+    KyGraph *g;
+    int64_t r;
+    int ok;
+
+    /* ---------- SHL by runtime ---------- */
+    printf("\n[SHL_CL: param0 << param1]\n");
+    g = build_shift_runtime(IR_SHL);
+    r = run2(g, 16, 4, &ok);
+    printf("  16 << 4 = %ld (expect 256)\n", (long)r);
+    TEST("shl_cl compiled and ran", ok);
+    TEST("16 << 4 == 256", r == 256);
+    kyir_graph_destroy(g);
+
+    g = build_shift_runtime(IR_SHL);
+    r = run2(g, 1, 8, &ok);
+    printf("  1 << 8 = %ld (expect 256)\n", (long)r);
+    TEST("1 << 8 == 256", r == 256);
+    kyir_graph_destroy(g);
+
+    g = build_shift_runtime(IR_SHL);
+    r = run2(g, 1, 0, &ok);
+    printf("  1 << 0 = %ld (expect 1)\n", (long)r);
+    TEST("1 << 0 == 1 (shift by 0)", r == 1);
+    kyir_graph_destroy(g);
+
+    g = build_shift_runtime(IR_SHL);
+    r = run2(g, 1, 63, &ok);
+    printf("  1 << 63 = 0x%lx (expect 0x8000000000000000)\n",
+           (unsigned long)r);
+    TEST("1 << 63 == INT64_MIN", r == (int64_t)0x8000000000000000LL);
+    kyir_graph_destroy(g);
+
+    /* ---------- SHR by runtime (logical) ---------- */
+    printf("\n[SHR_CL: param0 >> param1 (logical)]\n");
+    g = build_shift_runtime(IR_SHR);
+    r = run2(g, 256, 4, &ok);
+    printf("  256 >> 4 = %ld (expect 16)\n", (long)r);
+    TEST("shr_cl compiled and ran", ok);
+    TEST("256 >> 4 == 16", r == 16);
+    kyir_graph_destroy(g);
+
+    g = build_shift_runtime(IR_SHR);
+    r = run2(g, (int64_t)0x8000000000000000LL, 1, &ok);
+    printf("  0x8000000000000000 >> 1 = 0x%lx (expect 0x4000000000000000)\n",
+           (unsigned long)r);
+    TEST("shr_cl logical (no sign fill)", r == (int64_t)0x4000000000000000LL);
+    kyir_graph_destroy(g);
+
+    /* ---------- SAR by runtime (arithmetic) ---------- */
+    printf("\n[SAR_CL: param0 >> param1 (arithmetic)]\n");
+    g = build_shift_runtime(IR_SAR);
+    r = run2(g, -16, 2, &ok);
+    printf("  -16 >> 2 = %ld (expect -4)\n", (long)r);
+    TEST("sar_cl compiled and ran", ok);
+    TEST("sar_cl(-16, 2) == -4", r == -4);
+    kyir_graph_destroy(g);
+
+    g = build_shift_runtime(IR_SAR);
+    r = run2(g, (int64_t)0x8000000000000000LL, 1, &ok);
+    printf("  0x8000000000000000 >>arith 1 = 0x%lx (expect 0xC000000000000000)\n",
+           (unsigned long)r);
+    TEST("sar_cl sign-extends", r == (int64_t)0xC000000000000000LL);
+    kyir_graph_destroy(g);
+
+    /* ---------- Combined: variable shift inside an expression ---------- */
+    printf("\n[Combined: (1 << a) | (1 << b)]\n");
+    {
+        KyGraph *gc = kyir_graph_create();
+        KyBlock *bc = kyir_block_create(gc);
+
+        KyNode *pa = kyir_node_create(gc, IR_PARAMETER);
+        pa->constant.i64 = 0; pa->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pa);
+        KyNode *pb = kyir_node_create(gc, IR_PARAMETER);
+        pb->constant.i64 = 1; pb->type = KYIR_TYPE_INT64;
+        kyir_block_add_node(bc, pb);
+
+        KyNode *one1 = kyir_const_i64(gc, 1);
+        KyNode *sh1 = kyir_shl(gc, one1, pa);
+        kyir_block_add_node(bc, sh1);
+
+        KyNode *one2 = kyir_const_i64(gc, 1);
+        KyNode *sh2 = kyir_shl(gc, one2, pb);
+        kyir_block_add_node(bc, sh2);
+
+        KyNode *combined = kyir_or(gc, sh1, sh2);
+        kyir_block_add_node(bc, combined);
+
+        KyNode *ret = kyir_node_create(gc, IR_RETURN);
+        kyir_node_add_value_input(ret, combined);
+        kyir_node_add_use(combined, ret);
+        kyir_block_add_node(bc, ret);
+
+        r = run2(gc, 3, 5, &ok);
+        printf("  (1<<3) | (1<<5) = 0x%lx (expect 0x28 = 8|32)\n",
+               (unsigned long)r);
+        TEST("combined shift graph == 0x28", r == 0x28);
+
+        r = run2(gc, 0, 63, &ok);
+        printf("  (1<<0) | (1<<63) = 0x%lx (expect 0x8000000000000001)\n",
+               (unsigned long)r);
+        TEST("combined shift (0, 63)", r == (int64_t)0x8000000000000001LL);
+        kyir_graph_destroy(gc);
+    }
+
+    return 0;
+}

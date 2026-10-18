@@ -1,0 +1,10 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 8, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "index_kind": { "Recurrence": { "initial": [0, 1], "coeffs": [1, 1] } } },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "index_kind": { "Recurrence": { "initial": [0, 1], "coeffs": [1, 1] } } }
+  ]
+}

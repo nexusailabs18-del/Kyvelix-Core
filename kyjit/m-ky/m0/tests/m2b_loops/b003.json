@@ -1,0 +1,10 @@
+{
+  "depth": 1,
+  "ivs": [{ "name": "i", "lower": 0, "upper": 64, "step": 1 }],
+  "body": [
+    { "kind": "write", "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "range": { "Min": { "iv": 0, "cap": 32 } } },
+    { "kind": "read",  "base": "A", "index": [0], "elem_size": 8, "offset": 0,
+      "range": { "Min": { "iv": 0, "cap": 32 } } }
+  ]
+}

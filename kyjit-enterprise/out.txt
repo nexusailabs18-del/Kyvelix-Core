@@ -1,0 +1,34 @@
+KYJIT Branch Test v1.0.0
+========================================
+
+[Test 1: IR_LABEL emits a label]
+  PASS: label node created
+  PASS: label is IR_LABEL
+  PASS: return created
+  PASS: mmap
+  compile rc=0, code_len=14
+  PASS: compiled
+  PASS: label got a KyX64Label assigned
+  label id = 0
+
+[Test 2: jump skips code]
+  compile rc=0, len=19
+  PASS: compiled with jump
+
+[Test 3: if-else picks correct branch]
+  compile rc=0, len=49
+  PASS: compiled with if-else
+
+[Test 4: execute if-else with runtime condition]
+  compile rc=0, len=52
+  PASS: compiled
+  f(1) = 42 (expect 42)
+  f(0) = 42 (expect 99)
+  PASS: f(1) == 42
+  FAIL: f(0) == 99 (line 204)
+
+========================================
+Tests run:    11
+Tests passed: 10
+Tests failed: 1
+========================================

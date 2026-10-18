@@ -1,0 +1,11 @@
+{
+  "depth": 2,
+  "ivs": [
+    {"name": "i", "lower": 0, "upper": "N", "step": 1},
+    {"name": "j", "lower": 0, "upper": "M", "step": 1}
+  ],
+  "body": [
+    {"kind": "write", "base": "A", "index": [100, 1], "elem_size": 8, "offset": 0},
+    {"kind": "read",  "base": "A", "index": [100, 1], "elem_size": 8, "offset": {"Div": [{"Param": "n"}, 2]}}
+  ]
+}

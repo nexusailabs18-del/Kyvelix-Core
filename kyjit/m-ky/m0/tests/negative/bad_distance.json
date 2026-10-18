@@ -1,0 +1,729 @@
+[
+  {
+    "level": "M0",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "Exact",
+      "value": [
+        999
+      ]
+    },
+    "witness": {
+      "type": "IntSolution",
+      "i": [
+        4
+      ],
+      "j": [
+        0
+      ]
+    },
+    "checker": "m0-check-v1"
+  },
+  {
+    "level": "M0",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      1,
+      0
+    ],
+    "claim": {
+      "kind": "Exact",
+      "value": [
+        4
+      ]
+    },
+    "witness": {
+      "type": "IntSolution",
+      "i": [
+        0
+      ],
+      "j": [
+        4
+      ]
+    },
+    "checker": "m0-check-v1"
+  },
+  {
+    "level": "M0",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "TripCount",
+      "value": {
+        "count": 1000,
+        "exit_value": 1000
+      }
+    },
+    "witness": {
+      "type": "TripCountEvidence",
+      "cfg": {
+        "vars": [
+          {
+            "name": "i",
+            "ty": "I64"
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "preds": [],
+            "succs": [
+              1
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [],
+                "defs": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0,
+                    "rhs": {
+                      "Const": 0
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "preds": [
+              0,
+              3
+            ],
+            "succs": [
+              2,
+              4
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0
+                  }
+                ],
+                "defs": []
+              }
+            ],
+            "phi": [
+              {
+                "var": 0,
+                "block": 1
+              }
+            ],
+            "guards": [
+              {
+                "iv": 0,
+                "op": "lt",
+                "bound": 1000
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "preds": [
+              1
+            ],
+            "succs": [
+              3
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [],
+                "defs": []
+              },
+              {
+                "id": 1,
+                "uses": [],
+                "defs": []
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "preds": [
+              2
+            ],
+            "succs": [
+              1
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0
+                  }
+                ],
+                "defs": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0,
+                    "rhs": {
+                      "Add": [
+                        {
+                          "Var": 0
+                        },
+                        {
+                          "Const": 1
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": 4,
+            "preds": [
+              1
+            ],
+            "succs": [],
+            "stmts": []
+          }
+        ],
+        "entry": 0,
+        "exit": 4
+      },
+      "iv_var": 0,
+      "loop_": 1,
+      "bound": 1000,
+      "bound_step": 0,
+      "companion_step": null
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "SCALARDD",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "ScalarDependence",
+      "value": {
+        "def": 1,
+        "use_": 0,
+        "distance": "One"
+      }
+    },
+    "witness": {
+      "type": "ScalarDependenceEvidence",
+      "cfg": {
+        "vars": [
+          {
+            "name": "i",
+            "ty": "I64"
+          }
+        ],
+        "blocks": [
+          {
+            "id": 0,
+            "preds": [],
+            "succs": [
+              1
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [],
+                "defs": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0,
+                    "rhs": {
+                      "Const": 0
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": 1,
+            "preds": [
+              0,
+              3
+            ],
+            "succs": [
+              2,
+              4
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0
+                  }
+                ],
+                "defs": []
+              }
+            ],
+            "phi": [
+              {
+                "var": 0,
+                "block": 1
+              }
+            ],
+            "guards": [
+              {
+                "iv": 0,
+                "op": "lt",
+                "bound": 1000
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "preds": [
+              1
+            ],
+            "succs": [
+              3
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [],
+                "defs": []
+              },
+              {
+                "id": 1,
+                "uses": [],
+                "defs": []
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "preds": [
+              2
+            ],
+            "succs": [
+              1
+            ],
+            "stmts": [
+              {
+                "id": 0,
+                "uses": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0
+                  }
+                ],
+                "defs": [
+                  {
+                    "var": 0,
+                    "stmt": 0,
+                    "order": 0,
+                    "rhs": {
+                      "Add": [
+                        {
+                          "Var": 0
+                        },
+                        {
+                          "Const": 1
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": 4,
+            "preds": [
+              1
+            ],
+            "succs": [],
+            "stmts": []
+          }
+        ],
+        "entry": 0,
+        "exit": 4
+      },
+      "asserted_def": 1,
+      "asserted_use": 0
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "REGION",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "ArrayRegion",
+      "value": {
+        "access": 0,
+        "region": {
+          "dims": [
+            [
+              0,
+              999
+            ]
+          ]
+        }
+      }
+    },
+    "witness": {
+      "type": "ArrayRegionEvidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "REGION",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "ArrayRegion",
+      "value": {
+        "access": 1,
+        "region": {
+          "dims": [
+            [
+              4,
+              1003
+            ]
+          ]
+        }
+      }
+    },
+    "witness": {
+      "type": "ArrayRegionEvidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "REGION",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "FunctionSummary",
+      "value": {
+        "func": "loop:b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+        "may_use": [
+          {
+            "dims": [
+              [
+                0,
+                1003
+              ]
+            ]
+          }
+        ],
+        "may_mod": [
+          {
+            "dims": [
+              [
+                0,
+                999
+              ]
+            ]
+          }
+        ],
+        "kill": [
+          {
+            "dims": [
+              [
+                0,
+                999
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    "witness": {
+      "type": "ArrayRegionEvidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "REDUCTION",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "Reduction",
+      "value": {
+        "var": 0,
+        "loop_": 1,
+        "kind": {
+          "kind": "count"
+        }
+      }
+    },
+    "witness": {
+      "type": "Phase5Evidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "LOOPKIND",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "LoopKind",
+      "value": "forall"
+    },
+    "witness": {
+      "type": "Phase5Evidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  },
+  {
+    "level": "ALIGN",
+    "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+    "pair": [
+      0,
+      1
+    ],
+    "claim": {
+      "kind": "Aligned",
+      "value": [
+        {
+          "stmt": 0,
+          "shift": 4
+        },
+        {
+          "stmt": 1,
+          "shift": 0
+        }
+      ]
+    },
+    "witness": {
+      "type": "Phase5Evidence",
+      "loop_": {
+        "depth": 1,
+        "ivs": [
+          {
+            "name": "i",
+            "lower": 0,
+            "upper": 1000,
+            "step": 1,
+            "bound_op": "lt"
+          }
+        ],
+        "body": [
+          {
+            "kind": "write",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 0
+          },
+          {
+            "kind": "read",
+            "base": "A",
+            "index": [
+              1
+            ],
+            "elem_size": 8,
+            "offset": 4
+          }
+        ]
+      }
+    },
+    "checker": "m0-check"
+  }
+]

@@ -1,0 +1,1268 @@
+**Short answer: it depends on which reading you hold, and this note says which.**
+Phase 4's analysis layer (§4.1), certificate vocabulary and checker arms (§4.3),
+and fuzz/seed harness (§4.4) are complete and verified — and since the Phase 9a
+integration the two new claim kinds also have **real production producers**:
+`m0-decide` emits `TripCount`/`ScalarDependence` certificates and `m0-check`
+verifies every certificate in the file. Of the three §4.2 rewirings, **M3 is
+done** (its IV now comes from `induct` over the loop's own CFG) and **M5 and M8
+are not**: M5's chase recurrence is a table lookup this IR cannot express until
+the Phase 9 frontend emits indexed loads, and M8's linear recurrence over
+*values* is not something `induct` computes at all — §4.2's M8 snippet asks for a
+solver that is not in Phase 4's spec. Read strictly ("Phase 4 complete" requires
+M3/M5/M8 to consume `induct`), Phase 4 is **not** complete. Read as "build and
+certify the analysis layer", it is. Full reasoning — including which numbers in
+the earlier version of this note were wrong — is in
+`/home/kumarr/kyjit/m-ky/PHASE4_STATUS.md`.
+
+## What is complete and verified
+
+| Spec section | Status | Evidence |
+|---|---|---|
+| §4.1 — four analyses (`induct`, `constant_prop`, `scalar_dd`, `trip_count`) | Done | 54 `fud::*` unit tests + 9 `phase4_scalardd` tests |
+| §4.3 — 2 new claims, 2 witnesses, 2 checker arms | Done, checker side | 15 `phase4_e2e` tests driving the real `m0-check` binary |
+| §4.3 producer side (Phase 9a) | Done | `decide_evidence` + `certificate/emit.rs`; 20 `phase9a_evidence` tests incl. an 87-loop (1,640 wide) production sweep at 0 rejects |
+| §4.4 — differential fuzz + seed/revert harness | Done | 11 `phase4_fuzz` tests; 4 seeds fire, all revert byte-identical |
+| §4.2 — M3 rewiring | Done | `derive_iv` runs `build_cfg_from_loop` → `build_fud_chains` → `induct` and refuses a non-`LinearIv`; `run_m3_tests.sh` 8/0 |
+
+Full suite: **497 passed, 0 failed** (Phase 3 baseline 362; the Phase 4 analysis
+layer alone was 453). No regression: the 1,001-loop corpus gives 601 EXACT /
+400 NONE / 0 UNKNOWN with **1001 certificate files ACCEPT, 0 REJECT**;
+`run_negative.sh` 11/0; `fuzz.sh 3000` clean.
+
+## What is not complete: §4.2 for M5 and M8
+
+`grep -rl crate::fud src/decide/` → **`src/decide/m3.rs` only**.
+
+- **M5**: `PointerChase` carries a literal `table: Vec<i64>` and the step is
+  `p ← table[p]`. `ScalarExpr` is `Iv | Scalar | Const | Add | Mul` — there is no
+  indexed load, so the chase step cannot be lowered into the CFG at all, and
+  `induct` sends `ScalarRhs::Call(_)` to `Class::Complex` anyway. The spec's own
+  "fall back to the literal-chain enumeration" branch is the only one that can
+  execute today. Blocked on the Phase 9 frontend.
+- **M8**: `induct` proves *index variables* linear in the loop counter; M8's
+  object is `x[k] = Σ coeffs[j]·x[k-1-j]`, a linear recurrence over values. Its
+  IV is already in `loop_.ivs`, so `induct` has nothing to discover, and
+  `trip_count` yields the wrong quantity for a value-collision decision.
+  Unblocking M8 needs a linear-recurrence solver, which is not a Phase 9 item and
+  not among §4.1's four analyses.
+
+Before Phase 9a none of §4.2 was writable: `build_cfg_from_loop` yielded **3
+blocks with no back edge and zero scalar uses/defs**, so `induct.ivs` was `[]` on
+every input. The five-block loop CFG is what made the M3 rewire real.
+
+## Caveats still standing
+
+1. M3's rewiring keeps the guard's **bound** from the recursion metadata — the
+   CFG guard carries only the IV, so that operand is not a scalar use any
+   analysis can read.
+2. `constant_prop` has **no caller** outside its own re-export in `fud/mod.rs`:
+   built, tested, and unused in production.
+3. `induct` and `scalardd` have **no in-file `mod tests`** (0 `#[test]` each),
+   unlike `cfg`/`chain`/`constprop`/`tripcount`. A divergence from house style.
+4. §4.5's ~4,700-line estimate is not met: the four analysis files total 2,169
+   lines and the Phase 4/9a test files 3,027 — chiefly because the estimate's
+   900 lines of M3/M5/M8 rewiring were only about 600 lines writable.
+5. The two claims this note used to make — "no production emitter for
+   `ScalarDependenceEvidence` / `TripCountEvidence`" and "`grep -rn fud
+   src/decide/` → 0 matches" — are **stale and removed**: the emitters exist, are
+   wired through `src/main.rs`, and are exercised on the whole shipped corpus.
+   The earlier "453 tests / 601 ACCEPT / run_negative 8/0" figures are corrected
+   too: 601 was the EXACT verdict count (the checker tally is 1001 files, 0
+   rejects), and `run_negative.sh`'s 8/0 was **vacuous** — its inline python
+   patch scripts died on the new certificate-array shape, so the checker rejected
+   stale artifacts and every case "passed" without testing its own corruption. It
+   is now a real 11/0 with three evidence tampers added (`tests/neg_tamper.py`).
+   See PHASE4_STATUS.md §8.
+
+# Phase 9a — Complete Frontend Specification
+
+Everything below is the full, final spec for Phase 9a. No minimal version, no reduced scope, no "9b." This is what gets built.
+
+**What Phase 9a is:** the IR extension and CFG construction that gives UDDP scalar statements, a loop back edge, and real use/def sets — so the FUD chain machinery (Phase 3) and the four scalar analyses (Phase 4 §4.1) have actual inputs to consume. It unblocks §4.2 and every downstream phase.
+
+**What Phase 9a is NOT:** a JavaScript frontend. It reads the existing `Loop` JSON. No closures, no destructuring, no for-of, no object property accesses, no points-to, no interprocedural anything. Those belong to a separate project that no phase in the current plan requires.
+
+---
+
+## 9a.0 Scope and success criteria
+
+**Input:** the tree after Phase 4's commit. `Loop` has `depth`, `ivs`, `body`, `recursion`, `chase`, `assertions`. The IR has `Access`. The FUD chain machinery in `src/fud/` is complete and unit-tested but starved — every `build_cfg_from_loop` call yields a 3-block DAG with zero scalar uses/defs.
+
+**Output:** a `Loop` that carries a scalar table and an optional statement body; a `build_cfg_from_loop` that emits the standard 5-block loop CFG with a back edge; `induct` returns a real `LinearIv` on real loops; M3/M5/M8 consume `induct`; and the two new claim kinds (`ScalarDependence`, `TripCount`) gain production emitters.
+
+**Success criteria (all must hold at commit):**
+
+1. `cargo test --release` — the current 453 tests still pass, plus the ~30 new Phase 9a tests. Target: **≥480 passed, 0 failed.**
+2. `bash tests/run_m3_tests.sh` — **8/8**, unchanged from before.
+3. `bash tests/run_m5_tests.sh` — **8/8**, unchanged.
+4. `bash tests/run_m8_tests.sh` — **3/3**, unchanged.
+5. `bash tests/run_real.sh` — **1001 loops, 100% coverage, 0 checker rejects.**
+6. `bash tests/run_phase_features.sh` — **3/3** (Phases 1/2/3 regression).
+7. `bash tests/seed_revert_phase9a.sh` — every new fuzzer fires on every seed, reverts byte-identical.
+8. `bash tests/fuzz.sh 3000` — **RESULT: fuzz clean.**
+9. `m0-decide` on a recursion-bearing loop emits a `TripCount` claim that `m0-check` accepts.
+10. `git diff` clean after all tests, no untracked artifacts.
+
+If any of the ten fails, Phase 9a is not done.
+
+---
+
+## 9a.1 The IR extensions
+
+### 9a.1.1 New file `src/ir/stmt.rs`
+
+```rust
+//! Phase 9a: scalar statements and expressions.
+//!
+//! Before Phase 9a, the IR modelled array accesses only — `Access` in
+//! `src/ir/mod.rs`. The CFG builder (`src/fud/cfg.rs`) converted those
+//! into blocks with no scalar uses or defs, so the FUD chain machinery
+//! had nothing to link and `induct` had nothing to classify.
+//!
+//! Phase 9a adds three statement kinds — array accesses, scalar
+//! assignments, and guards — plus a small expression tree for scalar
+//! arithmetic. This is enough to model the loop IV (`i = i + step`),
+//! the loop guard (`i < upper`), and any scalar computation whose
+//! value flows into an array index.
+
+use serde::{Deserialize, Serialize};
+
+/// A statement in a loop body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum StmtKind {
+    /// An array access, read or write. Wraps the existing `Access` type.
+    Array(crate::ir::Access),
+
+    /// A scalar assignment: `target := expr`.
+    Assign {
+        target: usize,          // index into `Loop::scalars`
+        expr: ScalarExpr,
+    },
+
+    /// A guard: execution continues only if `cond` is nonzero.
+    /// Phase 9a emits at most one guard per loop, at the header.
+    Guard {
+        cond: ScalarExpr,
+    },
+}
+
+/// A scalar expression over IVs, scalars, and constants.
+///
+/// `Iv(k)` reads the k-th IV of the enclosing loop. `Scalar(k)` reads
+/// the k-th scalar from the loop's scalar table. The tree is small by
+/// design — Phase 9a needs only what a loop IV requires, and the
+/// frontend that would emit more (division, modulo, comparisons) is a
+/// separate project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ScalarExpr {
+    Iv(usize),
+    Scalar(usize),
+    Const(i64),
+    Add(Box<ScalarExpr>, Box<ScalarExpr>),
+    Mul(Box<ScalarExpr>, Box<ScalarExpr>),
+}
+
+impl ScalarExpr {
+    /// Evaluate the expression against concrete IV and scalar values.
+    /// Returns `None` on an out-of-range index or arithmetic overflow.
+    pub fn eval(&self, ivs: &[i64], scalars: &[i64]) -> Option<i64> {
+        match self {
+            ScalarExpr::Iv(k) => ivs.get(*k).copied(),
+            ScalarExpr::Scalar(k) => scalars.get(*k).copied(),
+            ScalarExpr::Const(c) => Some(*c),
+            ScalarExpr::Add(a, b) => a.eval(ivs, scalars)?.checked_add(b.eval(ivs, scalars)?),
+            ScalarExpr::Mul(a, b) => a.eval(ivs, scalars)?.checked_mul(b.eval(ivs, scalars)?),
+        }
+    }
+
+    /// Collect the scalar variables this expression reads.
+    pub fn scalars_read(&self, out: &mut Vec<usize>) {
+        match self {
+            ScalarExpr::Iv(_) | ScalarExpr::Const(_) => {}
+            ScalarExpr::Scalar(k) => {
+                if !out.contains(k) { out.push(*k); }
+            }
+            ScalarExpr::Add(a, b) | ScalarExpr::Mul(a, b) => {
+                a.scalars_read(out);
+                b.scalars_read(out);
+            }
+        }
+    }
+}
+
+/// A statement in a loop body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Stmt {
+    pub id: usize,
+    pub kind: StmtKind,
+}
+
+impl Stmt {
+    /// The scalar variables this statement reads.
+    pub fn uses(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        match &self.kind {
+            StmtKind::Array(_) => {}
+            StmtKind::Assign { expr, .. } => expr.scalars_read(&mut out),
+            StmtKind::Guard { cond } => cond.scalars_read(&mut out),
+        }
+        out
+    }
+
+    /// The scalar variables this statement writes.
+    pub fn defs(&self) -> Vec<usize> {
+        match &self.kind {
+            StmtKind::Array(_) => Vec::new(),
+            StmtKind::Assign { target, .. } => vec![*target],
+            StmtKind::Guard { .. } => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_const() {
+        assert_eq!(ScalarExpr::Const(7).eval(&[], &[]), Some(7));
+    }
+
+    #[test]
+    fn eval_iv() {
+        assert_eq!(ScalarExpr::Iv(0).eval(&[42], &[]), Some(42));
+        assert_eq!(ScalarExpr::Iv(1).eval(&[42], &[]), None);
+    }
+
+    #[test]
+    fn eval_scalar() {
+        assert_eq!(ScalarExpr::Scalar(0).eval(&[], &[13]), Some(13));
+        assert_eq!(ScalarExpr::Scalar(1).eval(&[], &[13]), None);
+    }
+
+    #[test]
+    fn eval_add_mul() {
+        // (2 * i) + 3 with i = 5 → 13
+        let e = ScalarExpr::Add(
+            Box::new(ScalarExpr::Mul(
+                Box::new(ScalarExpr::Const(2)),
+                Box::new(ScalarExpr::Iv(0)),
+            )),
+            Box::new(ScalarExpr::Const(3)),
+        );
+        assert_eq!(e.eval(&[5], &[]), Some(13));
+    }
+
+    #[test]
+    fn eval_overflow_returns_none() {
+        let e = ScalarExpr::Mul(
+            Box::new(ScalarExpr::Const(i64::MAX)),
+            Box::new(ScalarExpr::Const(2)),
+        );
+        assert_eq!(e.eval(&[], &[]), None);
+    }
+
+    #[test]
+    fn scalars_read_dedupes() {
+        // (s0 + s1) * s0 → [0, 1]
+        let e = ScalarExpr::Mul(
+            Box::new(ScalarExpr::Add(
+                Box::new(ScalarExpr::Scalar(0)),
+                Box::new(ScalarExpr::Scalar(1)),
+            )),
+            Box::new(ScalarExpr::Scalar(0)),
+        );
+        let mut out = Vec::new();
+        e.scalars_read(&mut out);
+        assert_eq!(out, vec![0, 1]);
+    }
+
+    #[test]
+    fn stmt_uses_defs() {
+        let assign = Stmt {
+            id: 0,
+            kind: StmtKind::Assign {
+                target: 2,
+                expr: ScalarExpr::Add(
+                    Box::new(ScalarExpr::Scalar(0)),
+                    Box::new(ScalarExpr::Scalar(1)),
+                ),
+            },
+        };
+        assert_eq!(assign.uses(), vec![0, 1]);
+        assert_eq!(assign.defs(), vec![2]);
+
+        let guard = Stmt {
+            id: 1,
+            kind: StmtKind::Guard { cond: ScalarExpr::Iv(0) },
+        };
+        assert!(guard.uses().is_empty());
+        assert!(guard.defs().is_empty());
+    }
+
+    #[test]
+    fn stmt_serde_roundtrip_assign() {
+        let s = Stmt {
+            id: 5,
+            kind: StmtKind::Assign {
+                target: 1,
+                expr: ScalarExpr::Add(
+                    Box::new(ScalarExpr::Scalar(1)),
+                    Box::new(ScalarExpr::Const(1)),
+                ),
+            },
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Stmt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn stmt_serde_roundtrip_guard() {
+        let s = Stmt {
+            id: 6,
+            kind: StmtKind::Guard { cond: ScalarExpr::Iv(0) },
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Stmt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn stmt_serde_roundtrip_array() {
+        let access = crate::ir::Access {
+            kind: crate::ir::AccessKind::Write,
+            base: "A".into(),
+            index: vec![1],
+            elem_size: 8,
+            offset: crate::ir::OffsetValue::Const(0),
+            expr: None,
+            indirect: None,
+            guard: None,
+            range: None,
+            index_kind: crate::ir::IndexKind::Affine,
+        };
+        let s = Stmt {
+            id: 7,
+            kind: StmtKind::Array(access),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Stmt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+}
+```
+
+### 9a.1.2 Extend `src/ir/mod.rs`
+
+Add `scalars: Vec<ScalarVar>` and `stmts: Option<Vec<Stmt>>` to `Loop`, and add `ScalarVar` and `ScalarTy`:
+
+```rust
+// At the top of src/ir/mod.rs:
+pub mod stmt;
+pub use stmt::{ScalarExpr, Stmt, StmtKind};
+
+/// A scalar variable declared in the loop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScalarVar {
+    pub name: String,
+    pub ty: ScalarTy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScalarTy {
+    I64,
+    F64,
+    Bool,
+    Unknown,
+}
+
+impl Default for ScalarTy {
+    fn default() -> Self { ScalarTy::Unknown }
+}
+
+// Extend `Loop` (the struct is somewhere in src/ir/mod.rs).
+// Add two new fields, both optional via serde(default):
+
+pub struct Loop {
+    pub depth: usize,
+    pub ivs: Vec<IV>,
+    pub body: Vec<Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recursion: Option<Recursion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chase: Option<PointerChase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<crate::certificate::Assertion>,
+
+    /// Phase 9a: scalar variables declared in the loop. The loop's IVs
+    /// are always registered as scalars 0..depth, so `scalars` normally
+    /// begins with one entry per IV.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scalars: Vec<ScalarVar>,
+
+    /// Phase 9a: the statement body. When `Some`, this is the CFG
+    /// source of truth. When `None`, `build_cfg_from_loop` synthesises
+    /// a minimal body: one `i = i + step` at the latch per IV, and the
+    /// existing `body: Vec<Access>` converted to `StmtKind::Array`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stmts: Option<Vec<Stmt>>,
+}
+```
+
+**Backward-compatibility guarantee:** both new fields default. Every existing JSON parses unchanged. Every existing `Loop { ... }` construction site in the codebase must add `scalars: vec![], stmts: None` — but the compiler names each one.
+
+### 9a.1.3 Extend the `Loop` impl
+
+Add a helper to `Loop`:
+
+```rust
+impl Loop {
+    /// Register the IVs as scalars 0..depth, if they aren't already.
+    /// Returns the same loop with `scalars` populated.
+    pub fn with_iv_scalars(mut self) -> Loop {
+        for iv in &self.ivs {
+            self.scalars.push(ScalarVar {
+                name: iv.name.clone(),
+                ty: ScalarTy::I64,
+            });
+        }
+        self
+    }
+
+    /// Does this loop carry scalar statements (explicit or synthesizable)?
+    pub fn has_scalars(&self) -> bool {
+        !self.ivs.is_empty() || !self.scalars.is_empty()
+    }
+
+    /// The scalar index of the k-th IV. By convention, IVs are
+    /// registered first.
+    pub fn iv_scalar_index(&self, k: usize) -> usize {
+        k
+    }
+}
+```
+
+---
+
+## 9a.2 The CFG builder — full rewrite
+
+### 9a.2.1 The 5-block shape
+
+The loop CFG has five blocks:
+
+```
+entry (0):     i := lower                      — initialise IVs
+header (1):    φ_i := φ(entry.i, latch.i)      — IV φ-terms, loop header
+               guard: i < upper                — loop guard
+body (2):      user statements                 — the loop body
+latch (3):     i := i + step                   — IV increment
+exit (4):      (nothing)                       — where the guard falls through
+```
+
+Edges:
+- `entry → header`
+- `header → body` (guard true)
+- `header → exit` (guard false)
+- `body → latch`
+- `latch → header` (back edge)
+
+### 9a.2.2 Full `build_cfg_from_loop`
+
+```rust
+// src/fud/cfg.rs — REPLACE the existing build_cfg_from_loop.
+
+use crate::ir::{Loop, Stmt, StmtKind, ScalarExpr, ScalarVar, ScalarTy};
+
+/// Build the standard 5-block loop CFG from a `Loop`.
+///
+/// Block layout:
+///   0. entry  — IV initialisation
+///   1. header — IV φ-terms + guard (loop header)
+///   2. body   — user statements
+///   3. latch  — IV increment
+///   4. exit   — after the loop
+///
+/// The back edge is `3 → 1`. Without it, `induct` finds no IVs.
+pub fn build_cfg_from_loop(loop_: &Loop) -> Option<CFG> {
+    if loop_.ivs.is_empty() {
+        return None;
+    }
+
+    let mut builder = CFGBuilder::new();
+
+    // Register the IVs as scalars 0..depth.
+    for iv in &loop_.ivs {
+        builder.register_scalar(ScalarVar {
+            name: iv.name.clone(),
+            ty: ScalarTy::I64,
+        });
+    }
+    // Register any additional scalars the loop declares.
+    for s in &loop_.scalars {
+        builder.register_scalar(s.clone());
+    }
+
+    // Block 0: entry — initialise the IVs.
+    let entry = builder.new_block("entry");
+    for (k, iv) in loop_.ivs.iter().enumerate() {
+        builder.add_stmt(entry, StmtKind::Assign {
+            target: k,
+            expr: ScalarExpr::Const(iv.lower),
+        });
+    }
+
+    // Block 1: header — IV φ-terms, then the loop guard.
+    let header = builder.new_block("header");
+    // The IV φ-terms: one incoming from entry, one from latch.
+    // We record the incoming slot as "pending" — the latch id isn't known
+    // yet — and fill it once latch is created.
+    let mut pending_phis: Vec<(usize, usize)> = Vec::new(); // (header_block, scalar_idx)
+    for k in 0..loop_.ivs.len() {
+        let phi_id = builder.add_phi(header, k, 2);
+        pending_phis.push((k, phi_id));
+    }
+    // The loop guard: i < upper for each IV.
+    for (k, iv) in loop_.ivs.iter().enumerate() {
+        builder.add_stmt(header, StmtKind::Guard {
+            cond: ScalarExpr::Iv(k),
+        });
+        // The guard's comparison `i < upper` is implicit — the IV's
+        // `upper` field carries it. The Stmt records the IV as used.
+    }
+
+    // Block 2: body — user statements.
+    let body = builder.new_block("body");
+    let stmts: Vec<Stmt> = match &loop_.stmts {
+        Some(s) => s.clone(),
+        None => synth_stmts_from_body(loop_),
+    };
+    for s in stmts {
+        builder.add_stmt(body, s.kind);
+    }
+
+    // Block 3: latch — the IV increment.
+    let latch = builder.new_block("latch");
+    for (k, iv) in loop_.ivs.iter().enumerate() {
+        builder.add_stmt(latch, StmtKind::Assign {
+            target: k,
+            expr: ScalarExpr::Add(
+                Box::new(ScalarExpr::Iv(k)),
+                Box::new(ScalarExpr::Const(iv.step)),
+            ),
+        });
+    }
+
+    // Block 4: exit.
+    let exit = builder.new_block("exit");
+
+    // Fill in the φ incoming slots now that we know the latch.
+    for (k, phi_id) in pending_phis {
+        builder.set_phi_incoming(phi_id, 0, entry, k); // from entry
+        builder.set_phi_incoming(phi_id, 1, latch, k); // from latch (back edge)
+    }
+
+    // Edges.
+    builder.add_edge(entry, header);
+    builder.add_edge(header, body);      // guard true
+    builder.add_edge(header, exit);      // guard false
+    builder.add_edge(body, latch);
+    builder.add_edge(latch, header);     // BACK EDGE — the critical one
+
+    builder.set_entry(entry);
+    builder.set_exit(exit);
+
+    let cfg = builder.finish();
+    cfg.validate().ok()?;
+    Some(cfg)
+}
+
+/// When `loop_.stmts` is `None`, synthesise a body from the existing
+/// `body: Vec<Access>`. Each access becomes `StmtKind::Array`.
+fn synth_stmts_from_body(loop_: &Loop) -> Vec<Stmt> {
+    loop_.body.iter().enumerate().map(|(id, a)| Stmt {
+        id,
+        kind: StmtKind::Array(a.clone()),
+    }).collect()
+}
+```
+
+### 9a.2.3 The `CFGBuilder` helper
+
+The existing CFG construction code in `src/fud/cfg.rs` may already have a builder. If not, add one:
+
+```rust
+pub struct CFGBuilder {
+    blocks: Vec<Block>,
+    scalars: Vec<ScalarVar>,
+    stmts: Vec<Stmt>,
+    phis: Vec<PhiDef>,
+    edges: Vec<(usize, usize)>,
+    entry: Option<usize>,
+    exit: Option<usize>,
+}
+
+pub struct PhiDef {
+    pub block: usize,
+    pub scalar: usize,
+    pub incoming: Vec<(usize, usize)>, // (predecessor block, scalar idx from that block)
+}
+
+impl CFGBuilder {
+    pub fn new() -> Self { /* ... */ }
+    pub fn register_scalar(&mut self, s: ScalarVar) { self.scalars.push(s); }
+    pub fn new_block(&mut self, _name: &str) -> usize {
+        let id = self.blocks.len();
+        self.blocks.push(Block { id, preds: vec![], succs: vec![], stmts: vec![] });
+        id
+    }
+    pub fn add_stmt(&mut self, block: usize, kind: StmtKind) {
+        let id = self.stmts.len();
+        let stmt = Stmt { id, kind };
+        self.stmts.push(stmt.clone());
+        self.blocks[block].stmts.push(id);
+    }
+    pub fn add_phi(&mut self, block: usize, scalar: usize, arity: usize) -> usize {
+        let id = self.phis.len();
+        self.phis.push(PhiDef { block, scalar, incoming: vec![(0, 0); arity] });
+        id
+    }
+    pub fn set_phi_incoming(&mut self, phi_id: usize, slot: usize, pred: usize, scalar: usize) {
+        self.phis[phi_id].incoming[slot] = (pred, scalar);
+    }
+    pub fn add_edge(&mut self, from: usize, to: usize) {
+        self.blocks[from].succs.push(to);
+        self.blocks[to].preds.push(from);
+        self.edges.push((from, to));
+    }
+    pub fn set_entry(&mut self, b: usize) { self.entry = Some(b); }
+    pub fn set_exit(&mut self, b: usize) { self.exit = Some(b); }
+    pub fn finish(self) -> CFG { /* assemble */ }
+}
+```
+
+---
+
+## 9a.3 Wire M3, M5, M8 to `induct`
+
+### 9a.3.1 M3 — replace `recursion_to_iv`
+
+```rust
+// src/decide/m3.rs — REPLACED transform.
+
+use crate::fud::{build_cfg_from_loop, build_fud_chains, induct, Class};
+
+pub fn transform(loop_: &Loop) -> Option<Loop> {
+    let r = loop_.recursion.as_ref()?;
+
+    // Build the CFG with the Phase 9a builder.
+    let cfg = build_cfg_from_loop(loop_)?;
+
+    // Build the FUD chains.
+    let (chains, _) = build_fud_chains(&cfg).ok()?;
+
+    // Run induct.
+    let induct = induct(&cfg, &chains);
+
+    // Find the IV for the recursion's variable.
+    let iv = induct.ivs.iter().find(|v| v.var == r.iv_name_idx)?;
+    let Class::LinearIv { a, b } = induct.class.get(&iv.op).copied()? else {
+        return None;
+    };
+
+    // The IV's closed form is `a + b·k` over the loop's trip count.
+    let lower = a;
+    let step = b;
+    let upper = r.iv_bound;
+
+    // Validate the sign of the step (must match the recursion's direction).
+    if step == 0 { return None; }
+    if (step > 0) != (r.iv_step > 0) { return None; }
+
+    // Build the transformed loop.
+    // ... same normalisation as the hand-coded version, but with `lower`,
+    // `step`, `upper` from `induct` instead of from `recursion_to_iv`.
+    Some(build_transformed(loop_, lower, upper, step))
+}
+```
+
+**Verification:** `bash tests/run_m3_tests.sh` must stay 8/8. If it drops, the CFG builder or the `induct` consumption is wrong.
+
+### 9a.3.2 M5 — replace `chase_chain` for arithmetic chains
+
+```rust
+// src/decide/m5.rs — EXTENDED.
+
+pub fn decide(loop_: &Loop, p: usize, q: usize) -> (Decision, Option<Certificate>) {
+    let chase = match &loop_.chase { Some(c) => c, None => return Unknown };
+
+    // Phase 9a: try the inductive path first.
+    if let Some(cfg) = build_cfg_from_loop(loop_) {
+        if let Ok((chains, _)) = build_fud_chains(&cfg) {
+            let induct = induct(&cfg, &chains);
+            if let Some(iv) = induct.ivs.iter().find(|v| v.var == chase.var_idx) {
+                if let Some(Class::LinearIv { a, b }) = induct.class.get(&iv.op).copied() {
+                    // Arithmetic chain: p_k = a + b·k.
+                    // The fixed point is computable in closed form.
+                    return decide_arithmetic_chase(loop_, p, q, a, b, chase);
+                }
+            }
+        }
+    }
+
+    // Fall back to the literal-table path (Phase 2's version).
+    decide_literal_chase(loop_, p, q)
+}
+```
+
+### 9a.3.3 M8 — replace `recurrence_to_iv`
+
+Same shape. Use `induct` to detect the recurrence variable as an IV; use `trip_count` to compute the count.
+
+### 9a.3.4 Certificate producers
+
+After the M3/M5/M8 rewires, the two claim kinds have production emitters:
+
+```rust
+// In M3's decision path, after a successful transform:
+if let Some(cfg) = build_cfg_from_loop(loop_) {
+    if let Ok((chains, _)) = build_fud_chains(&cfg) {
+        let induct = induct(&cfg, &chains);
+        if let Some(iv) = induct.ivs.iter().find(|v| v.var == r.iv_name_idx) {
+            let Class::LinearIv { a, b } = induct.class.get(&iv.op).copied()? else { return None; };
+            let tc = trip_count(a, b, r.iv_bound, 0);
+            if let TripCount { count: Some(n), exit_value: Some(v) } = tc {
+                cert.claim = Claim::TripCount { count: n, exit_value: v };
+                cert.witness = Witness::TripCountEvidence {
+                    cfg: Box::new(cfg),
+                    iv_var: iv.var,
+                    loop_: 0,
+                    bound: r.iv_bound,
+                    bound_step: 0,
+                };
+            }
+        }
+    }
+}
+```
+
+---
+
+## 9a.4 The extended `Loop` JSON format
+
+Phase 9a extends the JSON format. Every existing loop parses unchanged (both new fields default). New loops may carry:
+
+```json
+{
+  "depth": 1,
+  "ivs": [{"name": "i", "lower": 0, "upper": 64, "step": 1}],
+  "body": [ /* existing array accesses */ ],
+  "scalars": [
+    {"name": "i", "ty": "i64"},
+    {"name": "sum", "ty": "i64"}
+  ],
+  "stmts": [
+    {"id": 0, "kind": {"kind": "Assign", "target": 1, "expr": {"Add": [{"Scalar": 1}, {"Iv": 0}]}}},
+    {"id": 1, "kind": {"kind": "Array", "kind": "write", "base": "A", "index": [1], "elem_size": 8, "offset": {"Const": 0}}}
+  ]
+}
+```
+
+**When `stmts` is present**, the CFG builder uses it verbatim.
+**When `stmts` is absent**, the CFG builder synthesizes it: the IV is registered as scalar 0, the latch emits `i = i + step`, and the `body` accesses become `StmtKind::Array` statements at the body block.
+
+**This is the entire frontend.** No JavaScript parser. The existing `m0-decide` JSON format is extended.
+
+---
+
+## 9a.5 Tests
+
+### 9a.5.1 Unit tests
+
+**`src/ir/stmt.rs`** — 10 tests (see §9a.1.1).
+
+**`src/fud/cfg.rs`** — 8 tests:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::*;
+
+    fn mk_loop_1d(lower: i64, upper: i64, step: i64) -> Loop {
+        Loop {
+            depth: 1,
+            ivs: vec![IV { name: "i".into(), lower, upper, step }],
+            body: vec![],
+            recursion: None, chase: None, assertions: vec![],
+            scalars: vec![], stmts: None,
+        }
+    }
+
+    #[test]
+    fn cfg_has_five_blocks() {
+        let l = mk_loop_1d(0, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        assert_eq!(cfg.blocks.len(), 5);
+    }
+
+    #[test]
+    fn cfg_has_back_edge() {
+        let l = mk_loop_1d(0, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        // header (1) and latch (3) — the back edge is latch → header.
+        assert!(cfg.blocks[3].succs.contains(&1));
+        assert!(cfg.blocks[1].preds.contains(&3));
+    }
+
+    #[test]
+    fn cfg_registers_iv_as_scalar() {
+        let l = mk_loop_1d(0, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        assert!(!cfg.scalars.is_empty());
+        assert_eq!(cfg.scalars[0].name, "i");
+    }
+
+    #[test]
+    fn cfg_emits_phi_for_iv() {
+        let l = mk_loop_1d(0, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        // At the header (block 1), there must be a φ for scalar 0.
+        assert!(cfg.phis.iter().any(|p| p.block == 1 && p.scalar == 0));
+    }
+
+    #[test]
+    fn cfg_emits_guard() {
+        let l = mk_loop_1d(0, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        // The header must contain a Guard statement.
+        let header_stmts: Vec<Stmt> = cfg.blocks[1].stmts.iter()
+            .map(|id| cfg.stmts[*id].clone())
+            .collect();
+        assert!(header_stmts.iter().any(|s| matches!(s.kind, StmtKind::Guard { .. })));
+    }
+
+    #[test]
+    fn cfg_entry_initialises_iv() {
+        let l = mk_loop_1d(7, 64, 1);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        let entry_stmts: Vec<Stmt> = cfg.blocks[0].stmts.iter()
+            .map(|id| cfg.stmts[*id].clone())
+            .collect();
+        assert!(entry_stmts.iter().any(|s| matches!(
+            &s.kind,
+            StmtKind::Assign { target: 0, expr: ScalarExpr::Const(7) }
+        )));
+    }
+
+    #[test]
+    fn cfg_latch_increments_iv() {
+        let l = mk_loop_1d(0, 64, 3);
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        let latch_stmts: Vec<Stmt> = cfg.blocks[3].stmts.iter()
+            .map(|id| cfg.stmts[*id].clone())
+            .collect();
+        assert!(latch_stmts.iter().any(|s| matches!(
+            &s.kind,
+            StmtKind::Assign { target: 0, expr: ScalarExpr::Add(_, _) }
+        )));
+    }
+
+    #[test]
+    fn cfg_synth_body_from_accesses() {
+        let mut l = mk_loop_1d(0, 64, 1);
+        l.body = vec![Access {
+            kind: AccessKind::Write,
+            base: "A".into(),
+            index: vec![1],
+            elem_size: 8,
+            offset: OffsetValue::Const(0),
+            expr: None, indirect: None, guard: None, range: None,
+            index_kind: IndexKind::Affine,
+        }];
+        let cfg = build_cfg_from_loop(&l).unwrap();
+        // The body block (2) must contain an Array statement.
+        let body_stmts: Vec<Stmt> = cfg.blocks[2].stmts.iter()
+            .map(|id| cfg.stmts[*id].clone())
+            .collect();
+        assert!(body_stmts.iter().any(|s| matches!(s.kind, StmtKind::Array(_))));
+    }
+
+    #[test]
+    fn cfg_empty_ivs_returns_none() {
+        let mut l = mk_loop_1d(0, 64, 1);
+        l.ivs.clear();
+        assert!(build_cfg_from_loop(&l).is_none());
+    }
+}
+```
+
+### 9a.5.2 Integration tests — `tests/phase9a_e2e.rs`
+
+```rust
+// 8 tests. Each drives the public API of `m0::fud` and `m0::decide`.
+
+#[test]
+fn induct_finds_iv_on_synth_cfg() {
+    // Build a basic loop, get the CFG, run induct, expect LinearIv { a: 0, b: 1 }.
+}
+
+#[test]
+fn induct_finds_iv_on_explicit_cfg() {
+    // Same, but with `stmts` provided in the Loop.
+}
+
+#[test]
+fn m3_transform_uses_induct_and_still_works() {
+    // A recursion-bearing loop. M3's transform must produce the same
+    // result as before the rewire. Regression check.
+}
+
+#[test]
+fn m5_chase_uses_induct_and_still_works() {
+    // Same for M5.
+}
+
+#[test]
+fn m8_recurrence_uses_induct_and_still_works() {
+    // Same for M8.
+}
+
+#[test]
+fn m0_decide_emits_trip_count_claim() {
+    // Run m0-decide on a recursion loop. The emitted certificate must
+    // contain a Claim::TripCount. Then run m0-check and expect ACCEPT.
+}
+
+#[test]
+fn m0_decide_emits_scalar_dependence_claim() {
+    // Same for ScalarDependence on a loop with a scalar recurrence.
+}
+
+#[test]
+fn cfg_round_trips_through_checker() {
+    // A certificate carrying a CFG must be accepted by m0-check with a
+    // matching claim, and rejected with a mismatched one. This exercises
+    // the FudChainEvidence and TripCountEvidence checker arms on a real
+    // emitted CFG.
+}
+```
+
+### 9a.5.3 Fuzz tests — `tests/phase9a_fuzz.rs`
+
+```rust
+// 3 tests, using the same xorshift PRNG convention as every other fuzzer.
+
+#[test]
+fn fuzz_build_cfg_well_formed() {
+    // Generate 3000 random loops. For each, build the CFG and assert:
+    //   - it has ≥5 blocks
+    //   - the header has ≥1 pred and ≥1 succ
+    //   - the back edge latch→header exists
+    //   - every statement's uses/defs are within scalar bounds
+}
+
+#[test]
+fn fuzz_induct_finds_iv() {
+    // Generate 3000 random loops with random IV bounds and steps.
+    // For each, run induct on the CFG. Assert:
+    //   - induct.ivs is non-empty
+    //   - the IV's Class is LinearIv { a: lower, b: step }
+}
+
+#[test]
+fn fuzz_trip_count_matches_enumeration() {
+    // Generate 3000 random loops. For each, compute trip_count via
+    // the analysis and via brute-force iteration. Assert they agree.
+}
+```
+
+### 9a.5.4 Seed-and-revert — `tests/seed_revert_phase9a.sh`
+
+```bash
+#!/usr/bin/env bash
+# Validates the Phase 9a fuzzers by injecting a bug into the CFG
+# builder, confirming the fuzzers fire, reverting, and confirming
+# they go quiet.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+CFG_FILE="src/fud/cfg.rs"
+BACKUP="$(mktemp)"
+cp "$CFG_FILE" "$BACKUP"
+trap 'cp "$BACKUP" "$CFG_FILE"; rm -f "$BACKUP"' EXIT
+
+# Seed the bug: skip the back edge.
+python3 - <<'PYEOF'
+p = "src/fud/cfg.rs"
+s = open(p).read()
+old = "builder.add_edge(latch, header);     // BACK EDGE — the critical one"
+new = "// SEEDED BUG: back edge removed\n    // builder.add_edge(latch, header);"
+if old not in s:
+    print("ERROR: anchor not found")
+    raise SystemExit(1)
+s = s.replace(old, new, 1)
+open(p, "w").write(s)
+print("OK: back edge removed")
+PYEOF
+
+# Run the fuzzers with the seed in place.
+echo "=== fuzzer with seeded bug (must fire) ==="
+cargo test --release --test phase9a_fuzz 2>&1 | grep -E "test result|FAILED" | head -5
+
+# The trap restores the file on exit. Verify byte-identical.
+python3 -c "
+import sys
+a = open('$BACKUP', 'rb').read()
+b = open('$CFG_FILE', 'rb').read()
+print('byte-identical:', a == b)
+sys.exit(0 if a == b else 1)
+"
+```
+
+**Expected:** with the back edge removed, `fuzz_induct_finds_iv` and `fuzz_trip_count_matches_enumeration` report thousands of failures; the derivation fuzz also fails. After revert, all three pass.
+
+---
+
+## 9a.6 File-by-file breakdown
+
+| File | Lines | Purpose |
+|---|---|---|
+| `src/ir/stmt.rs` | 200 | `Stmt`, `StmtKind`, `ScalarExpr`, `ScalarVar`, `ScalarTy` + 10 unit tests |
+| `src/ir/mod.rs` (extended) | +80 | `Loop` gains `scalars` and `stmts`; `ScalarVar`/`ScalarTy` defined; `with_iv_scalars` helper |
+| `src/fud/cfg.rs` (rewritten) | +250 | `build_cfg_from_loop` 5-block shape + `synth_stmts_from_body` + `CFGBuilder` |
+| `src/fud/cfg.rs` unit tests | +150 | 8 tests |
+| `src/decide/m3.rs` (rewired) | +150 | `induct`-based transform |
+| `src/decide/m5.rs` (rewired) | +150 | `induct`-based chase |
+| `src/decide/m8.rs` (rewired) | +150 | `induct`-based recurrence |
+| Certificate producers | +200 | `TripCount` and `ScalarDependence` emitters |
+| `tests/phase9a_e2e.rs` | 400 | 8 integration tests through the real binary |
+| `tests/phase9a_fuzz.rs` | 300 | 3 fuzz tests |
+| `tests/seed_revert_phase9a.sh` | 60 | Seed-and-revert validation |
+| **Total** | **~2,100** | |
+
+Multiply by 1.5–2× for reality: **3,100–4,200 lines / 9–12 weeks**.
+
+---
+
+## 9a.7 Execution order
+
+**Week 1 — IR extension and CFG builder.**
+
+1. Write `src/ir/stmt.rs` (the new module with `Stmt`, `StmtKind`, `ScalarExpr`, `ScalarVar`, `ScalarTy`).
+2. Extend `src/ir/mod.rs` with the two new `Loop` fields and the `ScalarVar` type.
+3. **Compile.** The compiler names every `Loop { ... }` site that needs `scalars: vec![], stmts: None`. Fix each.
+4. Rewrite `src/fud/cfg.rs::build_cfg_from_loop` with the 5-block shape and the back edge. Add `CFGBuilder` if needed.
+5. Write the 8 unit tests in `src/fud/cfg.rs`.
+6. **Run `cargo test --release`.** Every new test passes. No existing test breaks.
+
+**Week 2 — `induct` on real CFGs and M3 rewire.**
+
+1. Write a throwaway probe test that runs `induct` on the CFG from `build_cfg_from_loop` for a basic loop. Confirm it returns `LinearIv { a: 0, b: 1 }`. Delete the probe.
+2. Rewrite `src/decide/m3.rs::transform` to use `induct`. Delete `recursion_to_iv`.
+3. **Run `bash tests/run_m3_tests.sh`.** Must stay 8/8.
+4. If it drops, the bug is in one of three places. Check each: (a) does the CFG builder emit the φ correctly? (b) does `induct` classify the φ as `LinearIv`? (c) does M3's closed-form extraction read the class correctly?
+5. Fix and re-verify. Commit M3.
+
+**Week 3 — M5, M8, certificate producers.**
+
+1. Rewrite M5's `decide` to try `induct` first, fall back to the literal path.
+2. Rewrite M8 similarly.
+3. Add the certificate producers in M3's decision path.
+4. Write the 8 integration tests.
+5. Write the 3 fuzz tests.
+6. Write `seed_revert_phase9a.sh`.
+7. **Run all 10 success criteria.**
+
+**Week 4 — verification and commit.**
+
+1. `cargo test --release` — target ≥480 passed.
+2. `bash tests/run_m3_tests.sh` — 8/8.
+3. `bash tests/run_m5_tests.sh` — 8/8.
+4. `bash tests/run_m8_tests.sh` — 3/3.
+5. `bash tests/run_real.sh` — 601/0.
+6. `bash tests/run_phase_features.sh` — 3/3.
+7. `bash tests/seed_revert_phase9a.sh` — clean.
+8. `bash tests/fuzz.sh 3000` — clean.
+9. `m0-decide` emits a `TripCount` claim; `m0-check` accepts it.
+10. `git diff` clean.
+
+**Then commit:**
+
+```
+feat(frontend): Phase 9a — scalar IR, 5-block loop CFG, induct consumption
+
+Extends the IR with scalar statements:
+
+- src/ir/stmt.rs: Stmt, StmtKind (Array | Assign | Guard), ScalarExpr
+  (Iv | Scalar | Const | Add | Mul), ScalarVar, ScalarTy
+- src/ir/mod.rs: Loop gains scalars: Vec<ScalarVar> and
+  stmts: Option<Vec<Stmt>>, both serde-default for backward compat
+- Loop::with_iv_scalars() registers IVs as scalars 0..depth
+
+Rewrites build_cfg_from_loop to emit the standard 5-block loop CFG:
+
+  entry (0): i := lower
+  header (1): φ_i := φ(entry.i, latch.i); guard: i < upper
+  body (2): user statements
+  latch (3): i := i + step
+  exit (4): (after the loop)
+
+  Edges: entry → header, header → body (true), header → exit (false),
+  body → latch, latch → header (back edge).
+
+  The back edge is the critical addition. Without it, the SCC
+  algorithm finds no loop header and induct returns [] on every input
+  (the Phase 4 §4.2 block).
+
+Rewires M3, M5, M8 to consume induct instead of hand-coded
+recursion handling. Adds production emitters for TripCount and
+ScalarDependence certificates — the two new claim kinds introduced
+by Phase 4 §4.3 now have real producers.
+
+Unblocks Phase 4 §4.2 and Phases 5–8.
+
+Tests: ~30 new (10 in stmt.rs, 8 in cfg.rs, 8 e2e, 3 fuzz, 1 seed/
+revert harness). Target ≥480 total passing.
+
+Success criteria (all verified before commit):
+- cargo test --release ≥480
+- run_m3_tests.sh 8/8
+- run_m5_tests.sh 8/8
+- run_m8_tests.sh 3/3
+- run_real.sh 601/0
+- run_phase_features.sh 3/3
+- seed_revert_phase9a.sh clean
+- fuzz.sh 3000 clean
+- m0-decide emits TripCount, m0-check accepts
+- git diff clean
+```
+
+---
+
+## 9a.8 What Phase 9a unlocks
+
+After Phase 9a:
+
+| Unblocked | Why |
+|---|---|
+| Phase 4 §4.2 (M3/M5/M8 rewire) | Now complete. `induct` consumes real CFGs. |
+| Phase 5 (subsystems) | Reduction detection, alignment, cross-loop distance all need real CFGs. |
+| Phase 6 (array regions) | `MayUse`/`MayMod`/`Kill` dataflow needs the CFG. |
+| Phase 7 (points-to) | Alias analysis needs the CFG. |
+| Phase 8 (interprocedural) | Call graph construction needs the CFG. |
+| Two claim kinds gain producers | `TripCount` and `ScalarDependence` now emit from real decision paths. |
+
+**Nothing else in the plan is blocked after Phase 9a.**
+
+---
+
+## 9a.9 The one-paragraph summary
+
+---
+
+# Phase 5 & 6 — completion record
+
+Status: **complete and verified** (2026-10-03), for everything except §5.1.2,
+which is a documented stub. Full narrative: `PHASE4_STATUS.md` §10–§15.
+
+## What was built
+
+**Phase 5 (§5.1, eleven subsystems).** Eight new analysis modules plus three
+extended deciding levels, each consumed by a certificate claim that `m0-check`
+re-derives:
+
+- `src/ir/layout.rs` — §5.1.1 storage association: row/column-major
+  `linear_index`/`linearize`, `EquivalenceClass` and `linearize_with_equivalence`
+  for Fortran `EQUIVALENCE`.
+- `src/ir/effect.rs` — §5.1.3 I/O dependence: `Effect`, an explicit `IoChannels`
+  device table (`.standard()` is a documented convention, not a hidden global),
+  `effect_of`, `io_dependences`, `must_serialize`, `Access::io_effect`.
+- `src/ir/purity.rs` — §5.1.4 purity lattice: `ParamMode`, `Function`, `Purity`
+  (`Pure`/`PureSubroutine`/`Impure`), `PureSet`, `classify_purity`.
+- `src/decide/m5.rs` — §5.1.5 `decide_symbolic_chase`: when the chase variable is
+  a loop IV, strip the chase metadata and delegate to the affine decider, wrapping
+  the result in `Witness::WithLoop` relabelled with the original hash; the literal
+  table path stays as the fallback.
+- `src/decide/m12.rs` — §5.1.6 `decide_dynamic`, the spec's name for the existing
+  `decide_with_env`.
+- `src/decide/m6.rs` — §5.1.7 `MAX_DEGREE` raised 4 → 8 with
+  `CUBIC_PLUS_MIN_DEGREE = 5`.
+- `src/ir/reduction.rs` — §5.1.8 `ReductionKind`, `Reduction`, `classify_rhs`,
+  `detect_reductions` (recognises Sum/Product/Max/Min/MaxWithIndex/Count).
+- `src/fud/alignment.rs` — §5.1.9 weighted `ShiftDsu`, `compute_alignment`,
+  `is_alignable`: a loop aligns iff every cycle in the alignment graph has
+  accumulated distance zero.
+- `src/fud/crossloop.rs` — §5.1.10 `compute_cross_loop_distance` and the literal
+  `cross_loop_vectors` arithmetic.
+- `src/ir/loopkind.rs` — §5.1.11 `LoopKind`
+  (`Sequential`/`Forall`/`Dopar`/`Doall`/`Dosingle`), `classify_loop_kind`.
+- `src/ir/dependence.rs` — the shared `Dependence` vocabulary, including
+  `Dependence::unknown` so an undecided pair becomes a conservative carried edge
+  (the loop is then classified `Sequential` rather than over-claiming parallelism).
+- `src/runtime/mod.rs` — §5.1.2 vocabulary stub (see "the one blocked item").
+
+**Phase 6 (§6.1, four analyses).** `src/region/` — `bounds` (simple bounds with
+union/intersection), `triplet` (exact `[l:u:s]` regions, three-argument gcd union
+and Diophantine intersection), `kill` (access-matrix rank + coverage, `Fullness`),
+`dataflow` (`MayUse`/`MayMod`/`Kill`, with `RegionProgram` as the array-aware flow
+graph and `loop_summary` as the graph-free triple).
+
+**Certificate layer.** New claims `ArrayRegion`, `FunctionSummary`,
+`Reduction { var, loop_, kind }`, `Aligned(Vec<Alignment>)`, `LoopKind(_)`; new
+witnesses `ArrayRegionEvidence` and `Phase5Evidence`; producers in
+`src/certificate/emit.rs`; checker arms in `src/checker/main.rs` that rebuild the
+loop and re-run each analysis. `src/main.rs::write_certs` was fixed to emit a bare
+object when there is exactly one certificate.
+
+## The one blocked item: §5.1.2
+
+`RuntimeCheckKind` (`DisjointArrays`, `NoDistanceK`, `GuardCheck`) is declared so
+the vocabulary exists, but nothing constructs one and no checker arm accepts one.
+Emitting a runtime check honestly needs (a) a static sufficiency proof, (b) a
+replay channel so `m0-check` can verify the emitted check, and (c) a backend —
+none of which is in this phase, and a check without (a) would be a claim the
+checker cannot re-derive. Left as a documented stub, not faked.
+
+## Known limitation (stated, not hidden)
+
+`src/fud`'s `CFG` models scalars only: an array access lowers to a statement with
+no uses and no defs, so the §6.1.1 region dataflow cannot run over a bare `CFG`
+(it would report empty sets that look like a proved kill). `RegionProgram` is the
+array-aware flow graph that fixes this; `loop_summary` covers the graph-free case.
+
+## Verification
+
+- `cargo test --release` — **611 passing, 0 failed** (was 497 before Phase 5/6).
+- New standalone suites: `tests/phase5_features.rs` (15),
+  `tests/phase5_fuzz.rs` (6), `tests/phase5_e2e.rs` (8),
+  `tests/phase6_features.rs` (14), `tests/phase6_fuzz.rs` (4),
+  `tests/phase6_e2e.rs` (5).
+- `tests/run_phase5_6_tests.sh` — 11 PASS / 0 FAIL.
+- `tests/run_m6c5_tests.sh` — 2 PASS / 0 FAIL (degree-6 Product-index fixtures,
+  M6 certificates, checker ACCEPT).
+- `tests/run_all.sh`, `tests/run_negative.sh`, `tests/run_real.sh` and every
+  `tests/run_m*_tests.sh` — no regression.
+- `tests/fuzz.sh 3000` — `RESULT: fuzz clean`.
+
+## The one-paragraph summary
+
+> **Phase 5 implements the eleven §5.1 subsystems — storage association, I/O
+> dependence, purity, symbolic chase, dynamic bounds, cubic-plus degrees,
+> reduction detection, alignment, cross-loop distance and loop-kind
+> classification — as eight new analysis modules plus three extended deciding
+> levels, each feeding a certificate claim that the real `m0-check` re-derives
+> from the carried loop. Phase 6 implements the four §6.1 array-region analyses —
+> simple bounds, triplet notation, the kill analysis and the `MayUse`/`MayMod`/
+> `Kill` dataflow — in `src/region/`, with `RegionProgram` as the array-aware flow
+> graph the scalar CFG cannot be. Every claim is derived by an analyzer and
+> re-derived by the checker; soundness is kept by making an undecided dependence a
+> conservative carried edge. §5.1.2 is a documented stub because a runtime check
+> needs a sufficiency proof and a replay channel this layer does not have. `cargo
+> test --release` is 611 passing / 0 failed, with six new standalone feature,
+> fuzz and e2e suites and two new harness scripts; the shipped corpus, negative
+> suite and 3,000-loop fuzz show no regression.**
+> **Phase 9a is the IR extension and CFG construction that gives UDDP scalar statements, a loop back edge, and real use/def sets. It adds `src/ir/stmt.rs` (`Stmt`, `StmtKind`, `ScalarExpr`, `ScalarVar`, `ScalarTy`), extends `Loop` with `scalars` and `stmts` (both serde-default for backward compat), rewrites `build_cfg_from_loop` to emit the standard 5-block loop CFG — `entry → header → body → latch → header` with a back edge and a fall-through to `exit` — and rewires M3, M5, M8 to consume `induct` instead of hand-coded recursion handling. It adds production emitters for the `TripCount` and `ScalarDependence` claim kinds so they are no longer test-only. ~2,100 lines ideal, ~3,100–4,200 realistic, ~9–12 weeks. It unblocks Phase 4 §4.2 and every subsequent phase. Ten success criteria must all hold at commit: `cargo test --release` ≥480 passing, M3 8/8, M5 8/8, M8 3/3, real corpus 601/0, Phase 1/2/3 regression 3/3, seed-and-revert clean, fuzz.sh 3000 clean, `m0-decide` emits a `TripCount` claim that `m0-check` accepts, and `git diff` clean. It is not a JavaScript frontend — it reads the existing `Loop` JSON and does not touch closures, destructuring, for-of, object property accesses, or interprocedural anything.**  

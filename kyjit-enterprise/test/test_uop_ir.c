@@ -1,0 +1,72 @@
+#include "kyjit_uop_cache.h"
+#include "kyjit_ir.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <stdlib.h>
+
+static int tests_run = 0;
+static int tests_passed = 0;
+
+#define TEST(name, cond) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", name); } \
+    else { printf("  FAIL: %s (line %d)\n", name, __LINE__); } \
+} while(0)
+
+int main(void) {
+    printf("KYJIT μOp-IR Integration Test v%s\n", KYUOP_VERSION_STRING);
+    printf("========================================\n\n");
+
+    /* Test 1: bytecode → IR */
+    printf("[Test] bytecode → IR\n");
+    const uint8_t bc[] = { UOP_ADD_I64, UOP_RETURN };
+    KyGraph *g = kyuop_bytecode_to_ir(bc, sizeof(bc));
+    TEST("IR graph created", g != NULL);
+    TEST("has nodes", g && g->node_count > 0);
+    if (g) {
+        kyir_graph_print(g);
+        kyir_graph_destroy(g);
+    }
+
+    /* Test 2: compile via IR */
+    printf("\n[Test] compile via IR\n");
+    void *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST("mmap", code != MAP_FAILED);
+
+    size_t code_len = 0;
+    int rc = kyuop_compile_ir(bc, sizeof(bc), (uint8_t *)code, 4096, &code_len);
+    printf("    rc=%d, code_len=%zu\n", rc, code_len);
+    TEST("compile succeeds", rc == 0);
+    TEST("emitted real code (>4 bytes)", code_len > 4);
+
+    if (code_len > 0) {
+        printf("    bytes: ");
+        for (size_t i = 0; i < code_len && i < 32; i++)
+            printf("%02X ", ((uint8_t *)code)[i]);
+        printf("\n");
+
+        /* Execute: add5_7() should return 12 if args are wired correctly.
+         * Signature: int64_t f(int64_t a, int64_t b) -> a + b */
+        typedef int64_t (*add_fn)(int64_t, int64_t);
+        add_fn f = (add_fn)code;
+        int64_t got = f(5, 7);
+        printf("    exec f(5,7) = %ld (expected 12)\n", (long)got);
+        TEST("executes to 12", got == 12);
+
+        int64_t got2 = f(100, 200);
+        printf("    exec f(100,200) = %ld (expected 300)\n", (long)got2);
+        TEST("executes to 300", got2 == 300);
+    }
+
+    munmap(code, 4096);
+
+    printf("\n========================================\n");
+    printf("Tests run:    %d\n", tests_run);
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_run - tests_passed);
+    printf("========================================\n");
+
+    return (tests_run == tests_passed) ? 0 : 1;
+}

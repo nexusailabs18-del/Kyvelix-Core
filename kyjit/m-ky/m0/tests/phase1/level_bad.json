@@ -1,0 +1,22 @@
+{
+  "level": "P1",
+  "loop_hash": "b9e16f28ae391c75a32b37ccb42157d8e4e176c350f15a211a5de4ed7acc1db9",
+  "pair": [
+    0,
+    1
+  ],
+  "claim": {
+    "kind": "Level",
+    "value": 1
+  },
+  "witness": {
+    "type": "IntSolution",
+    "i": [
+      4
+    ],
+    "j": [
+      0
+    ]
+  },
+  "checker": "m0-check-v1"
+}

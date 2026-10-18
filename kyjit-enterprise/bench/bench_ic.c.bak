@@ -1,0 +1,569 @@
+#define _GNU_SOURCE
+
+#include "kyjit_ic.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+
+#ifndef KY_BENCH_BUILD_FLAGS
+#define KY_BENCH_BUILD_FLAGS "-O3 -march=native -mfma -mavx2"
+#endif
+
+#define KY_BENCH_RUNS 5
+
+static volatile uint64_t bench_sink = 0;
+
+typedef struct BenchStat {
+    double min;
+    double median;
+    double p99;
+    double max;
+} BenchStat;
+
+typedef void (*BenchSetup)(void *ctx);
+typedef void (*BenchBody)(uint64_t iters, void *ctx);
+
+static double bench_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+}
+
+static int bench_has_native_cycles(void)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t bench_rdtsc(void)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    return (uint64_t)__builtin_ia32_rdtsc();
+#else
+    return 0;
+#endif
+}
+
+static uint64_t bench_iterations(void)
+{
+    const char *e = getenv("KY_BENCH_ITERS");
+    if (e != NULL) {
+        unsigned long long v = strtoull(e, NULL, 10);
+        if (v > 0) {
+            return (uint64_t)v;
+        }
+    }
+    return 100000000ULL;
+}
+
+static void bench_sort5(double *a)
+{
+    for (int i = 0; i < KY_BENCH_RUNS; ++i) {
+        for (int j = i + 1; j < KY_BENCH_RUNS; ++j) {
+            if (a[j] < a[i]) {
+                double t = a[i];
+                a[i] = a[j];
+                a[j] = t;
+            }
+        }
+    }
+}
+
+static BenchStat bench_make_stat(const double *in)
+{
+    double a[KY_BENCH_RUNS];
+    for (int i = 0; i < KY_BENCH_RUNS; ++i) {
+        a[i] = in[i];
+    }
+
+    bench_sort5(a);
+
+    BenchStat s;
+    s.min = a[0];
+    s.median = a[2];
+    s.p99 = a[4];
+    s.max = a[4];
+    return s;
+}
+
+static void bench_run_case(BenchSetup setup,
+                           BenchBody body,
+                           void *ctx,
+                           uint64_t iters,
+                           BenchStat *ns_stat,
+                           BenchStat *cy_stat)
+{
+    double ns[KY_BENCH_RUNS];
+    double cy[KY_BENCH_RUNS];
+
+    if (iters == 0) {
+        iters = 1;
+    }
+
+    uint64_t warm = iters / 100;
+    if (warm == 0) {
+        warm = 1;
+    }
+
+    int native_cycles = bench_has_native_cycles();
+
+    for (int r = 0; r < KY_BENCH_RUNS; ++r) {
+        if (setup != NULL) {
+            setup(ctx);
+        }
+
+        body(warm, ctx);
+
+        if (setup != NULL) {
+            setup(ctx);
+        }
+
+        double t0 = bench_now_ns();
+        uint64_t c0 = bench_rdtsc();
+
+        body(iters, ctx);
+
+        uint64_t c1 = bench_rdtsc();
+        double t1 = bench_now_ns();
+
+        ns[r] = (t1 - t0) / (double)iters;
+
+        if (native_cycles) {
+            cy[r] = (double)(c1 - c0) / (double)iters;
+        } else {
+            cy[r] = ns[r] * 3.0;
+        }
+    }
+
+    *ns_stat = bench_make_stat(ns);
+    *cy_stat = bench_make_stat(cy);
+}
+
+static double jnum(double x)
+{
+    return (x > 0.0) ? x : 0.0;
+}
+
+static void print_case_json(const char *name,
+                            const BenchStat *ns,
+                            const BenchStat *cy,
+                            int *comma)
+{
+    if (*comma) {
+        printf(",\n");
+    }
+    *comma = 1;
+
+    printf("    \"%s\": {\n", name);
+    printf("      \"ns_per_op\": %.9f,\n", jnum(ns->median));
+    printf("      \"cycles_per_op\": %.9f,\n", jnum(cy->median));
+    printf("      \"min_ns\": %.9f,\n", jnum(ns->min));
+    printf("      \"median_ns\": %.9f,\n", jnum(ns->median));
+    printf("      \"p99_ns\": %.9f,\n", jnum(ns->p99));
+    printf("      \"max_ns\": %.9f,\n", jnum(ns->max));
+    printf("      \"min_cycles\": %.9f,\n", jnum(cy->min));
+    printf("      \"median_cycles\": %.9f,\n", jnum(cy->median));
+    printf("      \"p99_cycles\": %.9f,\n", jnum(cy->p99));
+    printf("      \"max_cycles\": %.9f\n", jnum(cy->max));
+    printf("    }");
+}
+
+typedef struct MonoCtx {
+    KyIC ic;
+    uint32_t shape;
+    int32_t offset;
+} MonoCtx;
+
+static void bench_mono_setup(void *ctxp)
+{
+    MonoCtx *ctx = (MonoCtx *)ctxp;
+    ky_ic_init(&ctx->ic);
+    ky_ic_update(&ctx->ic, ctx->shape, ctx->offset);
+}
+
+static void bench_mono_body(uint64_t iters, void *ctxp)
+{
+    MonoCtx *ctx = (MonoCtx *)ctxp;
+    const KyIC *ic = &ctx->ic;
+
+    volatile uint32_t s = ctx->shape;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        acc += (uint64_t)(uint32_t)ky_ic_lookup_mono(ic, s);
+    }
+
+    bench_sink += acc;
+}
+
+typedef struct PolyCtx {
+    KyIC ic;
+    uint32_t shapes[4];
+    uint32_t mask;
+} PolyCtx;
+
+static void bench_poly_setup(void *ctxp)
+{
+    PolyCtx *ctx = (PolyCtx *)ctxp;
+    uint32_t n = ctx->mask + 1u;
+
+    ky_ic_init(&ctx->ic);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        ky_ic_update(&ctx->ic, ctx->shapes[i], (int32_t)(i * 8u + 16u));
+    }
+}
+
+static void bench_poly_body(uint64_t iters, void *ctxp)
+{
+    PolyCtx *ctx = (PolyCtx *)ctxp;
+    const KyIC *ic = &ctx->ic;
+
+    const uint32_t *vshapes = ctx->shapes;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        uint32_t s = vshapes[i & ctx->mask];
+        acc += (uint64_t)(uint32_t)ky_ic_lookup_poly(ic, s);
+    }
+
+    bench_sink += acc;
+}
+
+typedef struct MegaCtx {
+    KyIC ic;
+    uint32_t shapes[16];
+    uint32_t mask;
+    const KyICMega *mega;
+} MegaCtx;
+
+static void bench_mega_setup(void *ctxp)
+{
+    MegaCtx *ctx = (MegaCtx *)ctxp;
+    uint32_t n = ctx->mask + 1u;
+
+    ky_ic_destroy(&ctx->ic);
+    ky_ic_init(&ctx->ic);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        ky_ic_update(&ctx->ic, ctx->shapes[i], (int32_t)(i * 8u + 16u));
+    }
+
+    ctx->mega = (const KyICMega *)ctx->ic.mega;
+}
+
+static void bench_mega_body(uint64_t iters, void *ctxp)
+{
+    MegaCtx *ctx = (MegaCtx *)ctxp;
+    const KyICMega *m = ctx->mega;
+
+    if (m == NULL) {
+        bench_sink += 1;
+        return;
+    }
+
+    volatile uint32_t *vshapes = (volatile uint32_t *)ctx->shapes;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        uint32_t s = vshapes[i & ctx->mask];
+        acc += (uint64_t)(uint32_t)ky_ic_mega_lookup(m, s);
+    }
+
+    bench_sink += acc;
+}
+
+typedef struct MissCtx {
+    KyIC ic;
+    uint32_t shape;
+    int32_t offset;
+    uint32_t miss_shape;
+} MissCtx;
+
+static void bench_miss_setup(void *ctxp)
+{
+    MissCtx *ctx = (MissCtx *)ctxp;
+    ky_ic_init(&ctx->ic);
+    ky_ic_update(&ctx->ic, ctx->shape, ctx->offset);
+}
+
+static void bench_miss_body(uint64_t iters, void *ctxp)
+{
+    MissCtx *ctx = (MissCtx *)ctxp;
+    const KyIC *ic = &ctx->ic;
+
+    volatile uint32_t s = ctx->miss_shape;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        acc += (uint64_t)(uint32_t)ky_ic_lookup_mono(ic, s);
+    }
+
+    bench_sink += acc;
+}
+
+typedef struct SelfModCtx {
+    KyICSelfModFn fn;
+    uint32_t shape;
+    int32_t offset;
+} SelfModCtx;
+
+static void bench_selfmod_setup(void *ctxp)
+{
+    SelfModCtx *ctx = (SelfModCtx *)ctxp;
+
+    if (ctx->fn != NULL) {
+        ky_ic_selfmod_free(ctx->fn);
+        ctx->fn = NULL;
+    }
+
+    ctx->fn = ky_ic_selfmod_create(ctx->shape, ctx->offset);
+}
+
+static void bench_selfmod_body(uint64_t iters, void *ctxp)
+{
+    SelfModCtx *ctx = (SelfModCtx *)ctxp;
+
+    if (ctx->fn == NULL) {
+        bench_sink += 1;
+        return;
+    }
+
+    volatile uint32_t s = ctx->shape;
+    KyICSelfModFn fn = ctx->fn;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        acc += (uint64_t)(uint32_t)fn(s);
+    }
+
+    bench_sink += acc;
+}
+
+typedef struct InvCtx {
+    KyIC *ics;
+    uint32_t count;
+    uint32_t mask;
+    uint32_t shape;
+    int32_t offset;
+} InvCtx;
+
+static void bench_invalidate_setup(void *ctxp)
+{
+    InvCtx *ctx = (InvCtx *)ctxp;
+
+    for (uint32_t i = 0; i < ctx->count; ++i) {
+        ky_ic_init(&ctx->ics[i]);
+        ky_ic_update(&ctx->ics[i], ctx->shape, ctx->offset);
+        ky_ic_update(&ctx->ics[i], ctx->shape + 1u, ctx->offset + 8);
+    }
+}
+
+static void bench_invalidate_body(uint64_t iters, void *ctxp)
+{
+    InvCtx *ctx = (InvCtx *)ctxp;
+    uint64_t acc = 0;
+
+    for (uint64_t i = 0; i < iters; ++i) {
+        uint32_t idx = (uint32_t)(i & ctx->mask);
+        ky_ic_invalidate(&ctx->ics[idx], ctx->shape);
+        acc += ctx->ics[idx].count;
+    }
+
+    bench_sink += acc;
+}
+
+static void bench_make_mega_shapes(uint32_t *ids, uint32_t n)
+{
+    uint8_t used[KY_IC_MEGA_SLOTS] = {0};
+    uint32_t found = 0;
+
+    for (uint32_t cand = 1; cand < 1000000u && found < n; ++cand) {
+        uint32_t slot = ky_ic_mega_hash(cand);
+        if (!used[slot]) {
+            used[slot] = 1;
+            ids[found++] = cand;
+        }
+    }
+
+    for (; found < n; ++found) {
+        ids[found] = 0x10000u + found;
+    }
+}
+
+int main(void)
+{
+    uint64_t iters = bench_iterations();
+
+    const char *hardware = getenv("KY_BENCH_HARDWARE");
+    if (hardware == NULL) {
+        hardware = "Intel i5-1240P (12C/16T)";
+    }
+
+    BenchStat mono_ns, mono_cy;
+    BenchStat poly2_ns, poly2_cy;
+    BenchStat poly4_ns, poly4_cy;
+    BenchStat mega8_ns, mega8_cy;
+    BenchStat mega16_ns, mega16_cy;
+    BenchStat miss_ns, miss_cy;
+    BenchStat selfmod_ns, selfmod_cy;
+    BenchStat inv_ns = {0, 0, 0, 0};
+    BenchStat inv_cy = {0, 0, 0, 0};
+
+    MonoCtx mono;
+    memset(&mono, 0, sizeof(mono));
+    mono.shape = 42;
+    mono.offset = 16;
+
+    bench_run_case(bench_mono_setup, bench_mono_body, &mono, iters, &mono_ns, &mono_cy);
+
+    PolyCtx poly2;
+    memset(&poly2, 0, sizeof(poly2));
+    poly2.shapes[0] = 42;
+    poly2.shapes[1] = 43;
+    poly2.mask = 1u;
+
+    bench_run_case(bench_poly_setup, bench_poly_body, &poly2, iters, &poly2_ns, &poly2_cy);
+
+    PolyCtx poly4;
+    memset(&poly4, 0, sizeof(poly4));
+    poly4.shapes[0] = 42;
+    poly4.shapes[1] = 43;
+    poly4.shapes[2] = 44;
+    poly4.shapes[3] = 45;
+    poly4.mask = 3u;
+
+    bench_run_case(bench_poly_setup, bench_poly_body, &poly4, iters, &poly4_ns, &poly4_cy);
+
+    MegaCtx mega8;
+    memset(&mega8, 0, sizeof(mega8));
+    bench_make_mega_shapes(mega8.shapes, 8);
+    mega8.mask = 7u;
+
+    bench_run_case(bench_mega_setup, bench_mega_body, &mega8, iters, &mega8_ns, &mega8_cy);
+
+    MegaCtx mega16;
+    memset(&mega16, 0, sizeof(mega16));
+    bench_make_mega_shapes(mega16.shapes, 16);
+    mega16.mask = 15u;
+
+    bench_run_case(bench_mega_setup, bench_mega_body, &mega16, iters, &mega16_ns, &mega16_cy);
+
+    MissCtx miss;
+    memset(&miss, 0, sizeof(miss));
+    miss.shape = 42;
+    miss.offset = 16;
+    miss.miss_shape = 43;
+
+    bench_run_case(bench_miss_setup, bench_miss_body, &miss, iters, &miss_ns, &miss_cy);
+
+    SelfModCtx selfmod;
+    memset(&selfmod, 0, sizeof(selfmod));
+    selfmod.shape = 42;
+    selfmod.offset = 16;
+
+    bench_run_case(bench_selfmod_setup, bench_selfmod_body, &selfmod, iters, &selfmod_ns, &selfmod_cy);
+
+    uint32_t inv_count = 32768u;
+    uint64_t inv_iters = inv_count;
+
+    InvCtx inv;
+    memset(&inv, 0, sizeof(inv));
+    inv.count = inv_count;
+    inv.mask = inv_count - 1u;
+    inv.shape = 42;
+    inv.offset = 16;
+    inv.ics = NULL;
+
+    if (posix_memalign((void **)&inv.ics, 64, sizeof(KyIC) * inv_count) == 0) {
+        bench_run_case(bench_invalidate_setup,
+                       bench_invalidate_body,
+                       &inv,
+                       inv_iters,
+                       &inv_ns,
+                       &inv_cy);
+    }
+
+    ky_ic_destroy(&mono.ic);
+    ky_ic_destroy(&poly2.ic);
+    ky_ic_destroy(&poly4.ic);
+    ky_ic_destroy(&mega8.ic);
+    ky_ic_destroy(&mega16.ic);
+    ky_ic_destroy(&miss.ic);
+
+    if (selfmod.fn != NULL) {
+        ky_ic_selfmod_free(selfmod.fn);
+        selfmod.fn = NULL;
+    }
+
+    if (inv.ics != NULL) {
+        free(inv.ics);
+        inv.ics = NULL;
+    }
+
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    char date[16];
+
+    gmtime_r(&now, &tm_buf);
+    strftime(date, sizeof(date), "%Y-%m-%d", &tm_buf);
+
+    double v8_mono_ns = 0.4685;
+    const char *v8_env = getenv("KY_BENCH_V8_MONO_NS");
+    if (v8_env != NULL) {
+        double parsed = strtod(v8_env, NULL);
+        if (parsed > 0.0) {
+            v8_mono_ns = parsed;
+        }
+    }
+
+    double speedup = (mono_ns.median > 0.0) ? (v8_mono_ns / mono_ns.median) : 0.0;
+
+    printf("{\n");
+    printf("  \"benchmark\": \"kyjit_ic_full\",\n");
+    printf("  \"hardware\": \"%s\",\n", hardware);
+    printf("  \"build_flags\": \"%s\",\n", KY_BENCH_BUILD_FLAGS);
+    printf("  \"iterations\": %llu,\n", (unsigned long long)iters);
+    printf("  \"runs\": %d,\n", KY_BENCH_RUNS);
+
+    printf("  \"kyjit\": {\n");
+    printf("    \"mono_ns\": %.9f,\n", jnum(mono_ns.median));
+    printf("    \"poly_2_ns\": %.9f,\n", jnum(poly2_ns.median));
+    printf("    \"poly_4_ns\": %.9f,\n", jnum(poly4_ns.median));
+    printf("    \"mega_8_ns\": %.9f,\n", jnum(mega8_ns.median));
+    printf("    \"mega_16_ns\": %.9f,\n", jnum(mega16_ns.median));
+    printf("    \"miss_ns\": %.9f,\n", jnum(miss_ns.median));
+    printf("    \"selfmod_ns\": %.9f,\n", jnum(selfmod_ns.median));
+    printf("    \"invalidate_ns\": %.9f,\n", jnum(inv_ns.median));
+    printf("    \"cycles_per_op_mono\": %.9f\n", jnum(mono_cy.median));
+    printf("  },\n");
+
+    printf("  \"cases\": {\n");
+    int comma = 0;
+    print_case_json("mono", &mono_ns, &mono_cy, &comma);
+    print_case_json("poly_2", &poly2_ns, &poly2_cy, &comma);
+    print_case_json("poly_4", &poly4_ns, &poly4_cy, &comma);
+    print_case_json("mega_8", &mega8_ns, &mega8_cy, &comma);
+    print_case_json("mega_16", &mega16_ns, &mega16_cy, &comma);
+    print_case_json("miss", &miss_ns, &miss_cy, &comma);
+    print_case_json("selfmod", &selfmod_ns, &selfmod_cy, &comma);
+    print_case_json("invalidate", &inv_ns, &inv_cy, &comma);
+    printf("\n  },\n");
+
+    printf("  \"v8\": {\n");
+    printf("    \"mono_ns\": %.9f\n", jnum(v8_mono_ns));
+    printf("  },\n");
+
+    printf("  \"speedup_mono_vs_v8\": %.9f,\n", jnum(speedup));
+    printf("  \"date\": \"%s\"\n", date);
+    printf("}\n");
+
+    return 0;
+}

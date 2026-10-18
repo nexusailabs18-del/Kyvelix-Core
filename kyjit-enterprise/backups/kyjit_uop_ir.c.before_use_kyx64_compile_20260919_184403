@@ -1,0 +1,258 @@
+/*
+ * kyjit_uop_ir.c — μOp cache with IR compiler backend
+ *
+ * Translates bytecode patterns to Sea of Nodes IR, runs optimizations,
+ * and emits optimized x86-64 code.
+ */
+
+#define _GNU_SOURCE
+#include "kyjit_uop_cache.h"
+#include "kyjit_ir.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================
+ * Stage 1: Bytecode → IR graph
+ * ============================================================ */
+
+static KyNode *emit_const(KyGraph *g, int64_t val) {
+    KyNode *c = kyir_const_i64(g, val);
+    return c;
+}
+
+/* Build IR from a bytecode pattern.
+ * Pattern is: sequence of UOP_* opcodes.
+ * The IR computes a single value based on inputs (rdi=arg0, rsi=arg1).
+ */
+KyGraph *kyuop_bytecode_to_ir(const uint8_t *bc, size_t len) {
+    KyGraph *g = kyir_graph_create();
+    if (!g) return NULL;
+
+    KyBlock *block = kyir_block_create(g);
+
+    /* Create IR parameter nodes for inputs (rdi, rsi) */
+    KyNode *arg0 = kyir_node_create(g, IR_PARAMETER);
+    arg0->constant.i64 = 0;  /* arg 0 = rdi */
+    arg0->type = KYIR_TYPE_INT64;
+
+    KyNode *arg1 = kyir_node_create(g, IR_PARAMETER);
+    arg1->constant.i64 = 1;  /* arg 1 = rsi */
+    arg1->type = KYIR_TYPE_INT64;
+
+    /* Track the "current value" — starts as arg0 */
+    KyNode *current = arg0;
+    KyNode *current2 = arg1;  /* for 2-arg ops */
+
+    size_t i = 0;
+    while (i < len) {
+        uint8_t op = bc[i];
+
+        switch (op) {
+            case UOP_ADD_I64: {
+                KyNode *sum = kyir_add(g, current, current2);
+                current = sum;
+                i++;
+                break;
+            }
+            case UOP_SUB_I64: {
+                KyNode *diff = kyir_sub(g, current, current2);
+                current = diff;
+                i++;
+                break;
+            }
+            case UOP_MUL_I64: {
+                KyNode *prod = kyir_mul(g, current, current2);
+                current = prod;
+                i++;
+                break;
+            }
+            case UOP_LOAD_CONST: {
+                if (i + 9 > len) { i++; break; }
+                int64_t val;
+                memcpy(&val, bc + i + 1, 8);
+                current = emit_const(g, val);
+                i += 9;
+                break;
+            }
+            case UOP_INC_I64: {
+                KyNode *one = emit_const(g, 1);
+                KyNode *inc = kyir_add(g, current, one);
+                current = inc;
+                i++;
+                break;
+            }
+            case UOP_DEC_I64: {
+                KyNode *one = emit_const(g, 1);
+                KyNode *dec = kyir_sub(g, current, one);
+                current = dec;
+                i++;
+                break;
+            }
+            case UOP_RETURN: {
+                KyNode *ret = kyir_node_create(g, IR_RETURN);
+                kyir_node_add_value_input(ret, current);
+                kyir_node_add_use(current, ret);
+                kyir_block_add_node(block, ret);
+                i++;
+                break;
+            }
+            default:
+                /* Unknown opcode — skip */
+                i++;
+                break;
+        }
+    }
+
+    return g;
+}
+
+/* ============================================================
+ * Stage 2: Compile IR to native code
+ * ============================================================ */
+
+int kyuop_compile_ir(const uint8_t *bytecode, size_t bc_len,
+                     uint8_t *out_code, size_t out_size, size_t *out_len) {
+    if (!bytecode || !out_code || !out_len) return -1;
+
+    /* Build IR */
+    KyGraph *g = kyuop_bytecode_to_ir(bytecode, bc_len);
+    if (!g) return -1;
+
+    /* Optimize */
+    kyir_optimize(g);
+
+    /* Build dominator tree */
+    KyDomTree *dt = kyir_domtree_build(g);
+    if (!dt) { kyir_graph_destroy(g); return -1; }
+
+    /* Schedule */
+    KySchedule *s = kyir_schedule_build(g, dt);
+    if (!s) { kyir_domtree_destroy(dt); kyir_graph_destroy(g); return -1; }
+
+    /* Build backend */
+    KyX64Backend *b = kyx64_backend_create(g, s, dt);
+    if (!b) {
+        kyir_schedule_destroy(s);
+        kyir_domtree_destroy(dt);
+        kyir_graph_destroy(g);
+        return -1;
+    }
+
+    /* Emit instructions */
+    for (uint32_t i = 0; i < g->node_count; i++) {
+        KyNode *n = g->nodes[i];
+        if (!n || (n->flags & KYIR_FLAG_DEAD)) continue;
+
+        switch (n->opcode) {
+            case IR_PARAMETER: {
+                KyX64Ins *ins = add_insn(b, X64_MOV_REG_REG);
+                ins->src1 = NULL;  /* will be set by regalloc */
+                ins->imm = (n->constant.i64 == 0) ? X64_RDI : X64_RSI;
+                /* Create a vreg for this parameter */
+                /* Placeholder — full implementation would map parameters */
+                break;
+            }
+            case IR_CONST_I64: {
+                KyVReg *v = new_vreg(b, i);
+                KyX64Ins *ins = add_insn(b, X64_MOV_REG_IMM);
+                ins->dst = v;
+                ins->imm = n->constant.i64;
+                break;
+            }
+            case IR_ADD_I64:
+            case IR_SUB_I64:
+            case IR_MUL_I64: {
+                KyVReg *v = new_vreg(b, i);
+                KyX64Op op = (n->opcode == IR_ADD_I64) ? X64_ADD_REG_REG :
+                             (n->opcode == IR_SUB_I64) ? X64_SUB_REG_REG :
+                                                          X64_MUL_REG_REG;
+                KyX64Ins *ins = add_insn(b, op);
+                ins->dst = v;
+                /* src1, src2 filled from inputs later */
+                break;
+            }
+            case IR_RETURN: {
+                add_insn(b, X64_RET);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /* Register allocation */
+    kyregalloc_run(b);
+
+    /* Emit bytes */
+    int rc = kyx64_emit_with_calls(b, out_code, out_size, out_len);
+
+    /* Cleanup */
+    kyx64_backend_destroy(b);
+    kyir_schedule_destroy(s);
+    kyir_domtree_destroy(dt);
+    kyir_graph_destroy(g);
+
+    return rc;
+}
+
+/* ============================================================
+ * Stage 3: Add to μOp cache API
+ * ============================================================ */
+
+/* Compile a pattern using the IR compiler.
+ * Returns the cached block, or NULL on failure. */
+KyUopBlock *kyuop_compile_with_ir(KyUopCache *cache, uint64_t pattern_hash,
+                                   const uint8_t *bytecode, size_t len) {
+    if (!cache || !bytecode) return NULL;
+
+    /* Allocate space in arena */
+    size_t max_bytes = 512;  /* IR compiler can produce more */
+    if (cache->arena_used + max_bytes > cache->arena_size) return NULL;
+
+    uint8_t *code = cache->arena + cache->arena_used;
+
+    /* Compile via IR */
+    size_t emitted = 0;
+    int rc = kyuop_compile_ir(bytecode, len, code, max_bytes, &emitted);
+    if (rc != 0) return NULL;
+
+    /* Pad to 16-byte boundary */
+    size_t padded = (emitted + 15) & ~15u;
+    for (size_t j = emitted; j < padded; j++) code[j] = 0x90;
+    cache->arena_used += padded;
+
+    /* Create block metadata */
+    uint32_t blk_idx = cache->block_count++;
+    KyUopBlock *b = &cache->blocks[blk_idx];
+    b->pattern_hash = pattern_hash;
+    b->native_code = code;
+    b->native_size = (uint16_t)emitted;
+    b->bytecode_size = (uint16_t)len;
+    b->hit_count = 0;
+    b->last_used = 0;
+    b->prev_lru = KYUOP_INVALID;
+    b->next_lru = KYUOP_INVALID;
+
+    /* Insert into hash table */
+    uint32_t idx = (uint32_t)pattern_hash & (KYUOP_HASH_SLOTS - 1);
+    while (cache->hash_table[idx].pattern_hash != 0) {
+        idx = (idx + 1) & (KYUOP_HASH_SLOTS - 1);
+    }
+    cache->hash_table[idx].pattern_hash = pattern_hash;
+    cache->hash_table[idx].native_code = b->native_code;
+    cache->hash_table[idx].block_meta = b;
+    cache->hash_count++;
+
+    /* Add to LRU */
+    b->next_lru = cache->lru_head;
+    if (cache->lru_head != KYUOP_INVALID) {
+        cache->blocks[cache->lru_head].prev_lru = (uint16_t)blk_idx;
+    }
+    cache->lru_head = (uint16_t)blk_idx;
+    if (cache->lru_tail == KYUOP_INVALID) {
+        cache->lru_tail = (uint16_t)blk_idx;
+    }
+
+    cache->compilations++;
+    return b;
+}
